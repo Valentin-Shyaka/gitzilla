@@ -1,0 +1,556 @@
+#!/usr/bin/env bash
+# rotate check|gh|ssh — guided rotation (every 5 days) of the gh CLI token (fine-grained PAT) and the owner's
+# SSH authentication key (Secretive / Secure Enclave). Compatible with macOS bash 3.2.
+#
+#   check   daily (launchd): for gh and ssh whose `last` is >= 5 days old and `snooze_until` has passed, ask
+#           (Rotate now / Snooze 1 day). Rotate now opens Terminal running `rotate <which>`. Giving up = no action.
+#   gh      new token from the clipboard -> gh login -> old token revoked -> repos.txt refreshed and seeded
+#   ssh     new Secretive key -> added on GitHub (Authentication Key) -> ~/.ssh/github-auth.pub swapped -> tested ->
+#           old key removed on GitHub -> old Secretive secret deleted. github-auth.pub changes only after the new key is
+#           confirmed on GitHub; a signal between the swap and the passing test restores the old key (no lockout window).
+#
+# $STATE/rotation.json {"gh":{"last":<ts>,"step":"<last completed step>|null","snooze_until":<ts>},"ssh":{...,
+# "name","pub"}}: written atomically after every step; a rerun resumes after `step`. Tokens live only in shell
+# variables: never in rotation.json, logs or any argv (the revoke body goes to curl on stdin, the login token to
+# gh on stdin). known-keys.txt is never rebuilt from what GitHub shows: the new auth blob is appended at `export`,
+# the old one removed at `done`. One flow at a time ($STATE/rotate.lock; a lock older than 1 h is taken over). The signing key (~/.ssh/git-signing.pub) is never touched.
+#
+# Env overrides (tests): WATCHDOG_OPEN_CMD, WATCHDOG_PBPASTE_CMD, WATCHDOG_PBCOPY_CMD, WATCHDOG_GH_CMD,
+# WATCHDOG_CURL, WATCHDOG_DIALOG_CMD (<message> <buttons>; prints the button or TIMEOUT), WATCHDOG_TERMINAL_CMD
+# (<rotate-path> <gh|ssh>), WATCHDOG_SECRETIVE_DIR, WATCHDOG_SSH_CMD, WATCHDOG_SSH_ADD, WATCHDOG_NOTIFY_CMD,
+# WATCHDOG_NOW, WATCHDOG_POLL_INTERVAL (5), WATCHDOG_POLL_TIMEOUT (600), WATCHDOG_SEED_RETRY_SLEEP (20),
+# WATCHDOG_REMOTE_URL_TEMPLATE.
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SELF="$here/$(basename "${BASH_SOURCE[0]}")"
+. "$here/lib.sh"
+OPEN="${WATCHDOG_OPEN_CMD:-open}"
+PBPASTE="${WATCHDOG_PBPASTE_CMD:-pbpaste}"
+PBCOPY="${WATCHDOG_PBCOPY_CMD:-pbcopy}"
+GH="${WATCHDOG_GH_CMD:-gh}"
+CURL="${WATCHDOG_CURL:-curl}"
+SSH_CMD="${WATCHDOG_SSH_CMD:-ssh -o ConnectTimeout=15}"
+SSH_ADD="${WATCHDOG_SSH_ADD:-ssh-add}"
+SDIR="${WATCHDOG_SECRETIVE_DIR:-$HOME/Library/Containers/com.maxgoedjen.Secretive.SecretAgent/Data/PublicKeys}"
+REMOTE_TPL="${WATCHDOG_REMOTE_URL_TEMPLATE:-git@github.com:%s.git}"
+POLL_INTERVAL="${WATCHDOG_POLL_INTERVAL:-5}"
+POLL_TIMEOUT="${WATCHDOG_POLL_TIMEOUT:-600}"
+INTERVAL_SECS=$((5 * 86400))
+SNOOZE_SECS=86400
+RJ="$STATE/rotation.json"
+OWNER_LC="$(printf '%s' "${OWNER:-}" | tr '[:upper:]' '[:lower:]')"
+SSHDIR="$HOME/.ssh"
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR
+export GIT_TERMINAL_PROMPT=0
+
+now() { echo "${WATCHDOG_NOW:-$(date +%s)}"; }
+say() { printf '%s\n' "$*"; }
+die() { printf 'rotate: %s\n' "$*" >&2; wd_log "rotate: $*"; exit 1; }
+
+WORK=""; LOCKDIR=""
+cleanup() {
+  [ -n "$WORK" ] && rm -rf "$WORK"
+  # only the owner of the lock (pid file == this process) removes it
+  [ -n "$LOCKDIR" ] && [ "$(cat "$LOCKDIR/pid" 2>/dev/null)" = "$$" ] && rm -rf "$LOCKDIR"
+  return 0
+}
+trap cleanup EXIT
+mkwork() { [ -n "$WORK" ] || WORK="$(mktemp -d)" || die "no temp dir"; }
+# take_flow_lock: one rotate flow at a time. A lock is stale only when its pid is dead, or when it has no pid
+# and is older than an hour; a live flow waiting at a prompt keeps it however long it takes.
+take_flow_lock() {
+  local l="$STATE/rotate.lock" lp
+  mkdir -p "$STATE" || die "cannot create $STATE"
+  if ! mkdir "$l" 2>/dev/null; then
+    lp="$(cat "$l/pid" 2>/dev/null)"
+    case "$lp" in
+      ''|*[!0-9]*) [ -n "$(find "$l" -maxdepth 0 -mmin +60 2>/dev/null)" ] || die "another rotation is starting or running (lock $l); try again shortly" ;;
+      *) if kill -0 "$lp" 2>/dev/null; then die "another rotation is running (pid $lp, lock $l); try again shortly"; fi ;;
+    esac
+    # atomic takeover: only the process whose mv succeeds removes the old lock, then it must win the mkdir
+    if mv "$l" "$l.stale.$$" 2>/dev/null; then rm -rf "$l.stale.$$"; fi
+    mkdir "$l" 2>/dev/null || die "another rotation is running (lock $l); try again shortly"
+  fi
+  LOCKDIR="$l"; echo $$ > "$l/pid"
+}
+
+atomic_write() { # dest ; content on stdin
+  local tmp="$1.tmp.$$"
+  cat > "$tmp" && mv -f "$tmp" "$1"
+}
+
+# --- rotation.json ------------------------------------------------------------------------------------------
+rj_cur() { if [ -s "$RJ" ] && jq -e 'type == "object"' "$RJ" >/dev/null 2>&1; then cat "$RJ"; else echo '{}'; fi; }
+rj_get() { rj_cur | jq -r --arg k "$1" --arg f "$2" '.[$k][$f] // empty'; }
+rj_set() { # kind field json-value
+  mkdir -p "$STATE" || return 1
+  rj_cur | jq --arg k "$1" --arg f "$2" --argjson v "$3" '.[$k] = ((.[$k] // {}) + {($f): $v})' | atomic_write "$RJ"
+}
+rj_set_str() { rj_set "$1" "$2" "$(jq -n --arg s "$3" '$s')"; }
+rj_step() { rj_set_str "$1" step "$2"; }
+rj_done() { # kind: last = now, step = null, in one write
+  mkdir -p "$STATE" || return 1
+  rj_cur | jq --arg k "$1" --argjson n "$(now)" '.[$k] = ((.[$k] // {}) + {last: $n, step: null}) | .[$k] |= with_entries(select(.key | startswith("old_") | not))' | atomic_write "$RJ"
+}
+
+# --- terminal / dialog --------------------------------------------------------------------------------------
+# ask_enter <prompt>: wait for the owner; non-zero when stdin is closed
+ask_enter() { local a; printf '%s ' "$1"; read -r a || { echo; return 1; }; return 0; }
+
+# dialog <message> <button1,button2> -> prints the button, or TIMEOUT (gave up / failure)
+dialog() {
+  local out rc=0 b1 b2
+  b1="${2%%,*}"; b2="${2#*,}"
+  if [ -n "${WATCHDOG_DIALOG_CMD:-}" ]; then
+    out="$("$WATCHDOG_DIALOG_CMD" "$1" "$2" </dev/null 2>/dev/null)"
+  else
+    out="$(osascript -e 'on run argv' \
+      -e 'set r to display dialog (item 1 of argv) with title "Account watchdog" buttons {item 2 of argv, item 3 of argv} default button (item 2 of argv) giving up after 600' \
+      -e 'if gave up of r then return "TIMEOUT"' \
+      -e 'return button returned of r' -e 'end run' -- "$1" "$b1" "$b2" </dev/null 2>/dev/null)" || rc=$?
+    [ "$rc" -eq 0 ] || { wd_log "dialog failed (rc $rc)"; out=""; }
+  fi
+  case "$out" in "$b1"|"$b2") echo "$out" ;; *) echo TIMEOUT ;; esac
+}
+
+launch_terminal() { # gh|ssh
+  if [ -n "${WATCHDOG_TERMINAL_CMD:-}" ]; then
+    "$WATCHDOG_TERMINAL_CMD" "$SELF" "$1" </dev/null >/dev/null 2>&1 || wd_log "rotate: terminal launch failed"
+  else
+    osascript -e 'on run argv' -e 'tell application "Terminal" to do script (quoted form of item 1 of argv & " " & item 2 of argv)' \
+      -e 'end run' -- "$SELF" "$1" </dev/null >/dev/null 2>&1 || wd_log "rotate: terminal launch failed"
+  fi
+}
+
+# --- check --------------------------------------------------------------------------------------------------
+cmd_check() {
+  local which last snooze n ans
+  n="$(now)"
+  for which in gh ssh; do
+    last="$(rj_get "$which" last)"; snooze="$(rj_get "$which" snooze_until)"
+    case "$last" in ''|*[!0-9]*) last=0 ;; esac
+    case "$snooze" in ''|*[!0-9]*) snooze=0 ;; esac
+    [ $((n - last)) -ge "$INTERVAL_SECS" ] || continue
+    [ "$n" -ge "$snooze" ] || continue
+    ans="$(dialog "Time to rotate your $which credentials." "Rotate now,Snooze 1 day")"
+    case "$ans" in
+      "Rotate now") wd_log "rotate: $which rotation started from check"; launch_terminal "$which" ;;
+      "Snooze 1 day") rj_set "$which" snooze_until $((n + SNOOZE_SECS)) || wd_log "rotate: cannot write rotation.json"
+                      wd_log "rotate: $which snoozed" ;;
+      *) wd_log "rotate: $which dialog unanswered; asking again tomorrow" ;;
+    esac
+  done
+  return 0
+}
+
+# --- known-keys.txt (in $STATE; owned by rotation) ----------------------------------------------------------
+blob_of() { awk 'NF >= 2 {print $2; exit}' "$1" 2>/dev/null; }
+kk_add() { # pubfile: append "<type> <blob> [comment]" unless the blob is listed
+  local f="$STATE/known-keys.txt" blob
+  blob="$(blob_of "$1")"; [ -n "$blob" ] || return 1
+  if [ ! -f "$f" ]; then wd_log "rotate: known-keys.txt missing; not adding the new key"; return 0; fi
+  awk -v b="$blob" '$2 == b {f=1} END {exit !f}' "$f" && return 0
+  { awk 1 "$f"; head -n1 "$1"; } | atomic_write "$f"
+}
+kk_remove() { # blob
+  local f="$STATE/known-keys.txt"
+  [ -n "$1" ] && [ -f "$f" ] || return 0
+  awk -v b="$1" '$2 != b' "$f" | atomic_write "$f"
+}
+
+# --- polling ------------------------------------------------------------------------------------------------
+poll_attempts() { local i="$POLL_INTERVAL"; [ "$i" -ge 1 ] 2>/dev/null || i=1; echo $(((POLL_TIMEOUT + i - 1) / i)); }
+# keys_fetch -> 0 and $WORK/keys on HTTP 200, else 1 (no information)
+keys_fetch() {
+  local code
+  mkwork
+  code="$($CURL --max-time 10 -sS -o "$WORK/keys" -w '%{http_code}' "https://github.com/$OWNER_LC.keys" 2>/dev/null </dev/null)"
+  [ "$code" = 200 ]
+}
+# blob_in <blob> <file>: exact match on the key field
+blob_in() { awk -v b="$1" '$2 == b {f = 1} END {exit !f}' "$2"; }
+# keys_has <blob> -> 0 present, 1 absent (fetched), 2 no information
+keys_has() {
+  keys_fetch || return 2
+  blob_in "$1" "$WORK/keys" && return 0
+  return 1
+}
+signing_has() { # blob -> 0 when listed as a signing key
+  local code
+  mkwork
+  code="$($CURL --max-time 10 -sS -o "$WORK/signing" -w '%{http_code}' "https://api.github.com/users/$OWNER_LC/ssh_signing_keys?per_page=100" 2>/dev/null </dev/null)"
+  [ "$code" = 200 ] && grep -qF -- "$1" "$WORK/signing"
+}
+
+# --- gh -----------------------------------------------------------------------------------------------------
+repos_refresh() { # never fails the rotation
+  local json slug vis m url unseeded=0 tries=0 gone=0 old_slug old_vis
+  [ -n "${OWNER:-}" ] || { wd_log "rotate: no OWNER; repos not refreshed"; return 0; }
+  mkwork
+  if ! json="$($GH repo list "$OWNER" --limit 1000 --json nameWithOwner,visibility </dev/null 2>/dev/null)"; then
+    wd_log "rotate: gh repo list failed; repos.txt unchanged"; wd_notify "Account watchdog" "Could not refresh repos.txt - run rotate gh again"; return 0
+  fi
+  printf '%s' "$json" | wd_repos_from_gh "$OWNER_LC" > "$WORK/repos.new" 2>/dev/null
+  if [ ! -s "$WORK/repos.new" ]; then
+    wd_log "rotate: gh repo list returned no repos; repos.txt unchanged"
+    wd_notify "Account watchdog" "gh repo list returned no repos - repos.txt kept. Check the token's repository access" || true
+    return 0
+  fi
+  # repos we already watch that the new list lacks are kept (a narrow token must not shrink the watch list)
+  if [ -f "$STATE/repos.txt" ]; then
+    while read -r old_slug old_vis; do
+      [ -n "$old_slug" ] || continue
+      awk -v s="$old_slug" '$1 == s {f = 1} END {exit !f}' "$WORK/repos.new" && continue
+      echo "$old_slug ${old_vis:-private}" >> "$WORK/repos.new"; gone=$((gone + 1))
+    done < "$STATE/repos.txt"
+  fi
+  atomic_write "$STATE/repos.txt" < "$WORK/repos.new" || { wd_log "rotate: cannot write repos.txt"; return 0; }
+  if [ "$gone" -gt 0 ]; then
+    wd_log "rotate: $gone repos disappeared from gh repo list"
+    wd_notify "Account watchdog" "$gone repos disappeared from gh repo list — check the token's repository access" || true
+  fi
+  touch "$STATE/seeded.txt" 2>/dev/null
+  (
+    wd_ssh_env
+    while read -r slug vis; do
+      [ -n "$slug" ] || continue
+      m="$(mirror_path "$slug")"
+      if [ ! -d "$m" ]; then
+        mkdir -p "$(dirname "$m")"
+        url="$(printf "$REMOTE_TPL" "$slug")"
+        git -c credential.helper= clone --mirror "$url" "$m" </dev/null >/dev/null 2>&1 || { wd_log "rotate: clone failed for $slug"; rm -rf "$m"; continue; }
+        wd_mirror_harden "$m" || wd_log "rotate: mirror config failed for $slug"
+      elif ! grep -qxF -- "$slug" "$STATE/seeded.txt" 2>/dev/null; then
+        git -c credential.helper= -C "$m" fetch --prune </dev/null >/dev/null 2>&1 || wd_log "rotate: fetch failed for $slug"
+      fi
+    done < "$STATE/repos.txt"
+  )
+  while ! bash "$here/reconcile" seed </dev/null >/dev/null 2>&1; do
+    tries=$((tries + 1)); [ "$tries" -gt 3 ] && break
+    sleep "${WATCHDOG_SEED_RETRY_SLEEP:-20}"
+  done
+  while read -r slug vis; do
+    [ -n "$slug" ] || continue
+    grep -qxF -- "$slug" "$STATE/seeded.txt" 2>/dev/null || unseeded=$((unseeded + 1))
+  done < "$STATE/repos.txt"
+  if [ "$unseeded" -gt 0 ]; then
+    wd_log "rotate: $unseeded repos not yet seeded"
+    wd_notify "Account watchdog" "$unseeded repos not yet seeded — run reconcile seed" || true
+  fi
+  return 0
+}
+
+gh_login() { printf '%s' "$1" | $GH auth login --with-token >/dev/null 2>&1; }
+
+cmd_gh() {
+  set +x   # never trace: tokens live in variables here
+  local step next fresh=0 tok="" old="" who code ans
+  [ -n "${OWNER:-}" ] || die "no OWNER in config"
+  take_flow_lock
+  step="$(rj_get gh step)"
+  case "$step" in ""|null|done) fresh=1 ;; esac
+  case "$step" in
+    open-page|read-token|capture-old) next=read-token ;;  # the tokens do not survive a run: read them again
+    login) next=revoke-old ;;
+    revoke-old) next=done ;;
+    *) next=open-page ;;
+  esac
+
+  if [ "$next" = open-page ]; then
+    $OPEN "https://github.com/settings/personal-access-tokens/new" </dev/null >/dev/null 2>&1
+    cat <<'TXT'
+Create the new token with exactly these settings, then copy it (github_pat_...):
+  - Fine-grained personal access token, expiration 7 days
+  - Resource owner: you; Repository access: All repositories
+  - Contents: read; Metadata: read; Pull requests: read and write; Issues: read and write
+TXT
+    rj_step gh open-page || die "cannot write rotation.json"
+    next=read-token
+  fi
+  if [ "$next" = read-token ]; then
+    ask_enter "Press Enter once the token is on the clipboard:" || die "no input; run rotate gh again"
+    tok="$($PBPASTE </dev/null 2>/dev/null)"
+    case "$tok" in
+      github_pat_*) ;;
+      *) tok=""; die "clipboard does not hold a github_pat_ token; nothing changed. Run rotate gh again" ;;
+    esac
+    $PBCOPY </dev/null >/dev/null 2>&1   # clear the clipboard
+    rj_step gh read-token || die "cannot write rotation.json"
+    old="$($GH auth token </dev/null 2>/dev/null)" || old=""
+    if [ -n "$old" ] && [ "$old" = "$tok" ]; then
+      tok=""; old=""
+      die "that is the current token; create a new one"
+    fi
+    rj_step gh capture-old || die "cannot write rotation.json"
+    if ! gh_login "$tok"; then
+      [ -n "$old" ] && gh_login "$old"
+      die "gh auth login failed; previous login restored. Run rotate gh again"
+    fi
+    who="$($GH api user --jq .login </dev/null 2>/dev/null)"
+    if [ "$(printf '%s' "$who" | tr '[:upper:]' '[:lower:]')" != "$OWNER_LC" ]; then
+      [ -n "$old" ] && gh_login "$old"
+      die "new token belongs to '${who:-unknown}', not $OWNER; old token restored. Create it on the right account"
+    fi
+    rj_step gh login || die "cannot write rotation.json"
+    next=revoke-old
+  fi
+  if [ "$next" = revoke-old ]; then
+    code=""
+    if [ -n "$old" ]; then
+      code="$(printf '%s' "$old" | jq -Rc '{credentials: [.]}' | $CURL --max-time 15 -sS -o /dev/null -w '%{http_code}' -X POST \
+              -H 'Content-Type: application/json' --data-binary @- https://api.github.com/credentials/revoke 2>/dev/null)"
+    fi
+    if [ "$code" = 202 ] && [ "$fresh" -eq 1 ]; then
+      say "Old token revoked."
+    else
+      # a resumed run cannot be sure which token was revoked: the owner confirms the deletion
+      $OPEN "https://github.com/settings/personal-access-tokens" </dev/null >/dev/null 2>&1
+      if [ "$fresh" -eq 0 ]; then
+        say "This run resumed an earlier one. At https://github.com/settings/personal-access-tokens delete the OLD token (the one created before today) and keep the new one."
+      else
+        say "Delete the OLD token at https://github.com/settings/personal-access-tokens"
+      fi
+      printf 'Have you deleted it? [y/N] '
+      read -r ans || ans=""
+      case "$ans" in y|Y|yes|YES) ;; *) die "old token not confirmed deleted; run rotate gh again to resume" ;; esac
+    fi
+    tok=""; old=""
+    rj_step gh revoke-old || die "cannot write rotation.json"
+  fi
+  repos_refresh
+  rj_done gh || die "cannot write rotation.json"
+  wd_log "rotate: gh token rotated"
+  say "gh token rotation done."
+}
+
+# --- ssh ----------------------------------------------------------------------------------------------------
+# secretive_pubs <name> -> paths of every *.pub whose comment starts with name
+secretive_pubs() {
+  local f c
+  for f in "$SDIR"/*.pub; do
+    [ -f "$f" ] || continue
+    c="$(awk 'NR == 1 {$1 = ""; $2 = ""; sub(/^ +/, ""); print; exit}' "$f")"
+    case "$c" in "$1"*) echo "$f" ;; esac
+  done
+}
+
+ssh_test() { # 0 when `ssh -T` authenticates as the owner with the key now in use
+  local out lc
+  out="$($SSH_CMD -o ControlMaster=no -o ControlPath=none -T git@github.com 2>&1 </dev/null)"
+  lc="$(printf '%s' "$out" | tr '[:upper:]' '[:lower:]')"
+  case "$lc" in *"successfully authenticated"*"hi $OWNER_LC"*|*"hi $OWNER_LC"*"successfully authenticated"*) return 0 ;; esac
+  return 1
+}
+
+DELETE_HINT="If you already added the new key at github.com/settings/keys (Authentication or Signing), delete it there"
+
+# add_rollback: only known-keys changed so far (github-auth.pub is untouched until export)
+add_rollback() { kk_remove "$1"; rj_set ssh step null; }
+
+# export_rollback <newblob>: undo the swap, forget the new blob, resume point = add. github-auth.pub is touched
+# only while it still holds the new key; old_blob "none" = there was no previous key, "" = never recorded.
+export_rollback() {
+  local old cur prev="$SSHDIR/github-auth.prev.pub"
+  old="$(rj_get ssh old_blob)"
+  cur="$(blob_of "$SSHDIR/github-auth.pub")"
+  if [ "$cur" != "$1" ]; then
+    echo "rotate: ~/.ssh/github-auth.pub does not hold the new key; left as it is"
+  elif [ -z "$old" ]; then
+    echo "rotate: the previous key was not recorded; ~/.ssh/github-auth.pub left as it is - check it by hand"
+  elif [ "$old" = none ]; then
+    rm -f "$SSHDIR/github-auth.pub"; echo "rotate: removed the new key from ~/.ssh/github-auth.pub (there was no previous key)"
+  elif [ -f "$prev" ] && [ "$(blob_of "$prev")" = "$old" ]; then
+    mv -f "$prev" "$SSHDIR/github-auth.pub"; echo "rotate: previous key restored"
+  else
+    echo "rotate: could not restore the previous key automatically; restore ~/.ssh/github-auth.pub by hand"
+  fi
+  kk_remove "$1"
+  rj_step ssh add
+}
+
+PHASE=""; NEWB_G=""
+on_signal() {
+  trap - INT TERM HUP
+  case "$PHASE" in
+    add) add_rollback "$NEWB_G" ;;
+    export) export_rollback "$NEWB_G" ;;
+  esac
+  echo
+  case "$PHASE" in export) ;; *) echo "rotate: no ~/.ssh file was changed" ;; esac
+  echo "rotate: interrupted. Run rotate ssh again."
+  wd_log "rotate: ssh interrupted in phase '${PHASE:-none}'"
+  exit 130
+}
+
+cmd_ssh() {
+  local step next name pub newblob oldblob prev i attempts found fp nfp out ans rc cur n pubs
+  [ -n "${OWNER:-}" ] || die "no OWNER in config"
+  take_flow_lock
+  trap on_signal INT TERM HUP
+  prev="$SSHDIR/github-auth.prev.pub"
+  step="$(rj_get ssh step)"
+  case "$step" in
+    ""|null|done) next=create ;;
+    create) next=add ;;
+    add) next=export ;;
+    export) next=test ;;
+    test) next=remove-old ;;
+    remove-old) next=secretive-cleanup ;;
+    secretive-cleanup) next=done ;;
+    *) next=create ;;
+  esac
+
+  if [ "$next" = create ]; then
+    name="github-auth-$(date -u -d "@$(now)" +%F 2>/dev/null || date -u -r "$(now)" +%F)"
+    say "In Secretive, create a new key named exactly: $name"
+    say "(Secretive -> + -> name: $name, Require authentication: Touch ID). Waiting for it to appear in $SDIR ..."
+    attempts="$(poll_attempts)"; i=0; pubs=""
+    while [ "$i" -lt "$attempts" ]; do
+      pubs="$(secretive_pubs "$name")"
+      [ -n "$pubs" ] && break
+      i=$((i + 1)); sleep "$POLL_INTERVAL"
+    done
+    [ -n "$pubs" ] || die "no Secretive key named $name appeared; run rotate ssh again"
+    n="$(printf '%s\n' "$pubs" | wc -l | tr -d ' ')"
+    [ "$n" -eq 1 ] || die "$n Secretive keys are named $name*; keep exactly one and run rotate ssh again"
+    pub="$pubs"; newblob="$(blob_of "$pub")"
+    [ -n "$newblob" ] || die "cannot read $pub"
+    cur="$(blob_of "$SSHDIR/github-auth.pub")"
+    [ "$newblob" != "$cur" ] || die "$name is the key already in use as github-auth.pub; create a new key"
+    out="$(SSH_AUTH_SOCK="$SECRETIVE_SOCK" $SSH_ADD -L 2>/dev/null </dev/null)"
+    printf '%s\n' "$out" | blob_in "$newblob" /dev/stdin || die "the new key is not loaded in the Secretive agent; check Secretive and run rotate ssh again"
+    rj_set_str ssh name "$name" && rj_set_str ssh pub "$pub" && rj_set_str ssh old_blob "" && rj_step ssh create || die "cannot write rotation.json"
+    next=add
+  fi
+  pub="$(rj_get ssh pub)"
+  [ -f "$pub" ] || die "new Secretive public key not found ($pub); run rotate ssh again from a clean state"
+  newblob="$(blob_of "$pub")"; NEWB_G="$newblob"
+
+  if [ "$next" = add ]; then
+    PHASE=add
+    kk_add "$pub" || die "cannot update known-keys.txt"
+    head -n1 "$pub" | $PBCOPY >/dev/null 2>&1
+    $OPEN "https://github.com/settings/ssh/new" </dev/null >/dev/null 2>&1
+    say "The public key is on the clipboard. Paste it at https://github.com/settings/ssh/new"
+    say "and set Key type to: Authentication Key (not Signing Key). Waiting for it on github.com/$OWNER_LC.keys ..."
+    attempts="$(poll_attempts)"; i=0; found=0
+    while [ "$i" -lt "$attempts" ]; do
+      keys_has "$newblob" && { found=1; break; }
+      i=$((i + 1)); sleep "$POLL_INTERVAL"
+    done
+    if [ "$found" -ne 1 ]; then
+      add_rollback "$newblob"; PHASE=""
+      if signing_has "$newblob"; then
+        die "added as a Signing Key? Add it as an Authentication Key. $DELETE_HINT. Your SSH key is unchanged"
+      fi
+      die "the new key did not appear on github.com/$OWNER_LC.keys in time. $DELETE_HINT. Your SSH key is unchanged"
+    fi
+    PHASE=""
+    $PBCOPY </dev/null >/dev/null 2>&1
+    rj_step ssh add || die "cannot write rotation.json"
+    next=export
+  fi
+
+  if [ "$next" = export ]; then
+    # the new key must still be on GitHub: after a failed test the owner may have deleted it to abandon it
+    keys_has "$newblob"; rc=$?
+    if [ "$rc" -eq 1 ]; then
+      msg="~/.ssh is unchanged"
+      if [ "$(blob_of "$SSHDIR/github-auth.pub")" = "$newblob" ]; then
+        # an interrupted run had already swapped: undo it before forgetting the key
+        msg="$(export_rollback "$newblob")"
+      fi
+      kk_remove "$newblob"; rj_set ssh step null
+      die "the new key is no longer on github.com/$OWNER_LC.keys (abandoned); it was cleared. $msg. Run rotate ssh again from scratch"
+    elif [ "$rc" -ne 0 ]; then
+      if [ "$(blob_of "$SSHDIR/github-auth.pub")" = "$newblob" ]; then
+        die "cannot read github.com/$OWNER_LC.keys; ~/.ssh/github-auth.pub already holds the new key. Run rotate ssh again once github.com is reachable"
+      fi
+      die "cannot read github.com/$OWNER_LC.keys; nothing changed. Try again shortly"
+    fi
+    oldblob="$(rj_get ssh old_blob)"
+    cur="$(blob_of "$SSHDIR/github-auth.pub")"
+    mkdir -p "$SSHDIR" && chmod 700 "$SSHDIR" 2>/dev/null
+    if [ "$cur" != "$newblob" ]; then
+      if [ -n "$cur" ]; then
+        oldblob="$cur"
+        rj_set_str ssh old_blob "$oldblob" || die "cannot write rotation.json"
+        cp -f "$SSHDIR/github-auth.pub" "$prev" || die "cannot save the previous key"
+      else
+        oldblob=none
+        rj_set_str ssh old_blob none || die "cannot write rotation.json"
+        rm -f "$prev"
+      fi
+    fi
+    PHASE=export   # from here on a signal undoes the swap; old_blob is already recorded
+    head -n1 "$pub" | atomic_write "$SSHDIR/github-auth.pub" || { export_rollback "$newblob"; die "cannot write github-auth.pub"; }
+    kk_add "$pub" || { export_rollback "$newblob"; die "cannot update known-keys.txt"; }
+    rj_step ssh export || { export_rollback "$newblob"; die "cannot write rotation.json"; }
+    next=test
+  fi
+
+  if [ "$next" = test ]; then
+    PHASE=export
+    if ! ssh_test; then
+      export_rollback "$newblob"; PHASE=""
+      die "ssh -T git@github.com did not authenticate with the new key. Run rotate ssh again to retry, or $DELETE_HINT to abandon it"
+    fi
+    PHASE=""; trap - INT TERM HUP
+    rj_step ssh test || die "cannot write rotation.json"
+    next=remove-old
+  fi
+  oldblob="$(rj_get ssh old_blob)"; [ "$oldblob" = none ] && oldblob=""
+
+  if [ "$next" = remove-old ]; then
+    if [ -n "$oldblob" ]; then
+      [ -f "$prev" ] && [ "$(blob_of "$prev")" = "$oldblob" ] || die "the previous key file ($prev) is missing or changed; cannot continue safely"
+      fp="$(ssh-keygen -lf "$prev" 2>/dev/null | awk '{print $2}')"
+      nfp="$(ssh-keygen -lf "$pub" 2>/dev/null | awk '{print $2}')"
+      $OPEN "https://github.com/settings/keys" </dev/null >/dev/null 2>&1
+      say "Delete the OLD authentication key at https://github.com/settings/keys"
+      say "  delete: $fp (the previous key)"
+      say "  keep:   $nfp (the new key $(rj_get ssh name))"
+      say "Waiting for the old key to disappear while the new one stays ..."
+      attempts="$(poll_attempts)"; i=0; found=0
+      while [ "$i" -lt "$attempts" ]; do
+        if keys_fetch; then
+          if blob_in "$oldblob" "$WORK/keys"; then :
+          elif blob_in "$newblob" "$WORK/keys"; then found=1; break
+          else say "Both keys are gone from GitHub: add the NEW key ($nfp) again."; fi
+        fi
+        i=$((i + 1)); sleep "$POLL_INTERVAL"
+      done
+      [ "$found" -eq 1 ] || die "the old key is still on github.com/$OWNER_LC.keys, or the new key is missing; fix it, then run rotate ssh again"
+      ssh_test || die "ssh -T git@github.com no longer authenticates with the new key; nothing was cleaned up. Fix it, then run rotate ssh again"
+    fi
+    rj_step ssh remove-old || die "cannot write rotation.json"
+    next=secretive-cleanup
+  fi
+
+  if [ "$next" = secretive-cleanup ]; then
+    if [ -n "$oldblob" ]; then
+      fp="$(ssh-keygen -lf "$prev" 2>/dev/null | awk '{print $2}')"
+      [ -n "$fp" ] || die "cannot fingerprint the previous key"
+      while :; do
+        say "In Secretive, delete the OLD secret (fingerprint $fp)."
+        ask_enter "Press Enter to check:" || die "no input; run rotate ssh again to finish the cleanup"
+        out="$(SSH_AUTH_SOCK="$SECRETIVE_SOCK" $SSH_ADD -l 2>/dev/null </dev/null)"; rc=$?
+        if [ "$rc" -ge 2 ]; then say "Cannot reach the Secretive agent; try again."; continue; fi
+        case "$out" in *"$fp"*) say "The old key is still in Secretive." ;; *) break ;; esac
+      done
+    fi
+    rj_step ssh secretive-cleanup || die "cannot write rotation.json"
+  fi
+
+  kk_remove "$oldblob"
+  rm -f "$prev"
+  rj_done ssh || die "cannot write rotation.json"
+  wd_log "rotate: ssh key rotated"
+  say "ssh key rotation done."
+}
+
+case "${1:-}" in
+  check) cmd_check ;;
+  gh) cmd_gh ;;
+  ssh) cmd_ssh ;;
+  *) echo "usage: rotate check|gh|ssh" >&2; exit 2 ;;
+esac

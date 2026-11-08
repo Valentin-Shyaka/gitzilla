@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+# restore --prompt|--yes <incident-file> [<incident-file>...] (oldest first): put every push-affected ref back to its pre-incident state.
+# --prompt asks first (Restore / Details / Ignore); --yes does not. Writes <incident-file>.result.json
+# {restored:[{repo,ref}], skipped:[{repo,ref,reason}]}, shows a summary notification and sends the same
+# summary as a signed report to the Worker (/report -> ntfy + Slack; best effort, logged, never retried).
+# Per (repo, ref): earliest `before`, latest `after`, pushed to the URL (never `origin`) with
+# --force-with-lease so a ref that moved since the incident is left alone. After a successful push the
+# local mirror's own ref is updated to match (update-ref), so the next poll's exclusions are right.
+# With several incident files the push events are unioned (sorted by seq) so the chain check and the
+# earliest-before / latest-after span files; the result goes to the LAST file's .result.json and the
+# restored refs of every file's result.json are carried over.
+# Only refs with at least one critical push event are restored; a ref whose events do not chain
+# (before != previous after) was touched by the owner too and is left alone. A restore target (`before`, unless
+# all zeros) must be a commit with a good signature under ALLOWED_SIGNERS_FILE (%G? == G); otherwise the ref is
+# skipped with "restore target not verified — review manually" (an earlier attacker commit is never "restored").
+# A note must be sent
+# before each push; no note, no push. Dialog unanswered (timeout) exits 3 with no result written.
+# Double invocation: refs already in an existing result file are carried over and not touched again;
+# if nothing else remains there is no dialog and no push. Compatible with macOS bash 3.2.
+#
+# Env overrides (tests): WATCHDOG_DIALOG_CMD <message> <Restore,Details,Ignore> (prints the button, or
+# TIMEOUT to simulate give-up),
+# WATCHDOG_NOTIFY_CMD, WATCHDOG_REMOTE_URL_TEMPLATE, ALLOWED_SIGNERS_FILE.
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$here/lib.sh"
+REMOTE_TPL="${WATCHDOG_REMOTE_URL_TEMPLATE:-git@github.com:%s.git}"
+SIGNERS="${ALLOWED_SIGNERS_FILE:-$(wd_allowed_signers)}" # gpg.ssh.allowedSignersFile, else ~/.config/git/allowed_signers
+ZERO=0000000000000000000000000000000000000000
+REVOKE="$WD_REVOKE"
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR
+
+mode="${1:-}"
+case "$mode" in --prompt|--yes) ;; *) echo "usage: restore --prompt|--yes <incident-file>..." >&2; exit 2 ;; esac
+shift
+[ $# -ge 1 ] || { echo "usage: restore --prompt|--yes <incident-file>..." >&2; exit 2; }
+files=()
+for inc in "$@"; do
+  if [ -s "$inc" ] && jq -e 'type == "array"' "$inc" >/dev/null 2>&1; then files+=("$inc")
+  else wd_log "restore: unusable incident file skipped: $inc"; fi
+done
+[ "${#files[@]}" -gt 0 ] || { echo "restore: no usable incident file" >&2; exit 2; }
+set -- "${files[@]}"
+for inc in "$@"; do :; done   # inc = the newest (last) usable file
+result="$inc.result.json"
+
+notify() { # title message
+  if [ -n "${WATCHDOG_NOTIFY_CMD:-}" ]; then
+    "$WATCHDOG_NOTIFY_CMD" "$1" "$2" </dev/null >/dev/null 2>&1 || wd_log "notify command failed"
+  else
+    osascript -e 'on run argv' -e 'display notification (item 2 of argv) with title (item 1 of argv)' \
+      -e 'end run' -- "$1" "$2" </dev/null >/dev/null 2>&1 || wd_log "osascript notify failed"
+  fi
+}
+
+# dialog <message> <buttons> -> prints Restore, Details, Ignore, or TIMEOUT (gave up / failure)
+dialog() {
+  local out rc=0
+  if [ -n "${WATCHDOG_DIALOG_CMD:-}" ]; then
+    out="$("$WATCHDOG_DIALOG_CMD" "$1" "$2" </dev/null 2>/dev/null)"
+  else
+    out="$(osascript -e 'on run argv' \
+      -e 'set r to display dialog (item 1 of argv) with title "Account watchdog" buttons (words of (item 2 of argv)) default button "Details" giving up after 600' \
+      -e 'if gave up of r then return "TIMEOUT"' \
+      -e 'return button returned of r' -e 'end run' -- "$1" "$(printf '%s' "$2" | tr ',' ' ')" </dev/null 2>/dev/null)" || rc=$?
+    [ "$rc" -eq 0 ] || { wd_log "dialog failed (rc $rc)"; out=""; }
+  fi
+  case "$out" in Restore|Details|Ignore) echo "$out" ;; *) echo TIMEOUT ;; esac
+}
+
+tmp="$(mktemp -d)" || exit 1
+trap 'rm -rf "$tmp"' EXIT
+: > "$tmp/valid.tsv"; : > "$tmp/skipped.jsonl"; : > "$tmp/restored.jsonl"
+
+SLUG_RE='^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+SHA_RE='^[0-9a-f]{40}$'
+skip() { jq -cn --arg repo "$1" --arg ref "$2" --arg reason "$3" '{repo:$repo,ref:$ref,reason:$reason}' >> "$tmp/skipped.jsonl"; }
+
+# 1. validate every push event (fields are attacker-controlled); @tsv escapes tabs/newlines.
+jq -r -s '[.[][] | select(.kind == "push")] | sort_by(.seq)[]
+       | [(.seq|tostring), (.ts|tostring), (.repo|tostring), (.ref|tostring), (.before|tostring), (.after|tostring), (.level|tostring)] | @tsv' \
+  "$@" > "$tmp/events.tsv" || exit 1
+while IFS="$(printf '\t')" read -r seq ts repo ref before after level; do
+  ok=1
+  case "$seq" in ""|*[!0-9]*) ok=0 ;; esac
+  [[ "$repo" =~ $SLUG_RE ]] || ok=0
+  if [ "$ok" = 1 ]; then
+    case "${repo%%/*}" in .|..) ok=0 ;; esac; case "${repo#*/}" in .|..) ok=0 ;; esac
+  fi
+  [[ "$ref" == refs/* ]] && git check-ref-format "$ref" 2>/dev/null || ok=0
+  [[ "$before" =~ $SHA_RE ]] || ok=0
+  [[ "$after" =~ $SHA_RE ]] || ok=0
+  case "$ts" in ''|*[!0-9]*) ts=0 ;; esac
+  if [ "$ok" = 1 ]; then printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$seq" "$ts" "$repo" "$ref" "$before" "$after" "$level" >> "$tmp/valid.tsv"
+  else skip "$repo" "$ref" "invalid event"; fi
+done < "$tmp/events.tsv"
+
+# 2+3. Prior results (every given file's result.json) record {repo,ref,before,after,through_seq} per
+# restored ref. Group per (repo, ref): a ref is carried over only if no event has seq > through_seq;
+# otherwise the group is rebuilt from the newer events, the chain must start at the recorded `before`
+# (the commit we restored), and the target stays that `before`. Entries without a numeric through_seq are ignored.
+prior="$tmp/prior.jsonl"; : > "$prior"
+for f in "$@"; do
+  [ -s "$f.result.json" ] && jq -c '.restored[]? | select((.through_seq | type) == "number") | {repo,ref,before,after,through_seq}' "$f.result.json" >> "$prior" 2>/dev/null
+done
+jq -s . "$prior" > "$tmp/prior.json"
+jq -R -s -r --slurpfile P "$tmp/prior.json" '
+  split("\n") | map(select(length > 0) | split("\t") | {seq:(.[0]|tonumber), ts:(.[1]|tonumber), repo:.[2], ref:.[3], before:.[4], after:.[5], level:.[6]})
+  | group_by([.repo, .ref])
+  | map(sort_by(.seq) as $g0
+      | ($P[0] | map(select(.repo == $g0[0].repo and .ref == $g0[0].ref)) | max_by(.through_seq)) as $p
+      | ($g0 | map(.seq) | max) as $mx
+      | (if $p == null then $g0 else ($g0 | map(select(.seq > $p.through_seq))) end) as $g
+      | {repo:$g0[0].repo, ref:$g0[0].ref, mx:$mx, carry:($p != null and ($g|length) == 0),
+         before:(if $p == null then ($g[0].before // "-") else $p.before end), after:($g[-1].after // "-"),
+         ts:(if ($g|length) > 0 then ($g | map(.ts) | min) else 0 end),
+         crit:(any($g[]; .level == "critical")),
+         chain:(([range(1; $g|length) | select($g[.].before != $g[.-1].after)] | length == 0) and ($p == null or ($g|length) == 0 or $g[0].before == $p.before))})
+  | sort_by(.repo, .ref)[] | [.repo, .ref, .before, .after, (.ts|tostring), (.crit|tostring), (.chain|tostring), (.mx|tostring), (.carry|tostring)] | @tsv' "$tmp/valid.tsv" > "$tmp/groups.tsv" || exit 1
+
+: > "$tmp/todo.tsv"
+while IFS="$(printf '\t')" read -r repo ref before after ts crit chain mx carry; do
+  if [ "$carry" = true ]; then continue; fi
+  if [ "$crit" != true ]; then skip "$repo" "$ref" "not flagged critical — review manually"; continue; fi
+  if [ "$chain" != true ]; then skip "$repo" "$ref" "interleaved with your own pushes"; continue; fi
+  if [ "$before" = "$after" ]; then skip "$repo" "$ref" "no change"; continue; fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$repo" "$ref" "$before" "$after" "$ts" "$mx" >> "$tmp/todo.tsv"
+done < "$tmp/groups.tsv"
+
+write_result() {
+  jq -n --slurpfile p <(jq -s . "$prior") --slurpfile n <(jq -s . "$tmp/restored.jsonl") --slurpfile s <(jq -s . "$tmp/skipped.jsonl") \
+    '{restored: (($p[0] + $n[0]) | group_by([.repo, .ref]) | map(max_by(.through_seq))), skipped: $s[0]}' > "$result.tmp.$$" && mv -f "$result.tmp.$$" "$result"
+}
+
+N="$(wc -l < "$tmp/todo.tsv" | tr -d ' ')"
+M="$(cut -f1 "$tmp/todo.tsv" | sort -u | wc -l | tr -d ' ')"
+if [ "$N" -gt 0 ] && [ "$mode" = "--prompt" ]; then
+  first="$(cut -f5 "$tmp/todo.tsv" | sort -n | head -n1)"
+  if [ -n "${TZ_LOCAL:-}" ]; then export TZ="$TZ_LOCAL"; fi
+  hhmm="$(date -r "$first" +%H:%M 2>/dev/null || date -d "@$first" +%H:%M 2>/dev/null)"
+  msg="Restore $N refs in $M repos to their state at $hhmm?"
+  details="$(cut -f1,2 "$tmp/todo.tsv" | tr '\t' ' ')"
+  showing=0
+  while :; do
+    if [ "$showing" = 1 ]; then choice="$(dialog "$msg
+$details" "Restore,Details,Ignore")"; else choice="$(dialog "$msg" "Restore,Details,Ignore")"; fi
+    case "$choice" in
+      Details) showing=$((1 - showing)) ;;
+      Restore) break ;;
+      Ignore) wd_log "restore ignored for $inc"; exit 0 ;;
+      *) wd_log "restore dialog unanswered for $inc"; exit 3 ;;
+    esac
+  done
+fi
+
+# 4. restore: one ssh session, one note immediately before each push
+wd_ssh_env
+write_result
+while IFS="$(printf '\t')" read -r repo ref before after ts mx; do
+  mirror="$(mirror_path "$repo")"
+  # shellcheck disable=SC2059
+  url="$(printf "$REMOTE_TPL" "$repo")"
+  if [ ! -d "$mirror" ]; then skip "$repo" "$ref" "old commit not available locally"; continue; fi
+  if [ "$before" != "$ZERO" ] && ! git -C "$mirror" cat-file -e "$before" </dev/null 2>/dev/null; then
+    skip "$repo" "$ref" "old commit not available locally"; continue
+  fi
+  # the target must be the owner's signed commit: a chain that starts at an attacker commit is not a restore
+  if [ "$before" != "$ZERO" ] && \
+     [ "$(git -C "$mirror" -c gpg.ssh.allowedSignersFile="$SIGNERS" log -1 --format=%G? "$before^{commit}" </dev/null 2>/dev/null)" != G ]; then
+    wd_log "restore target $before for $repo $ref is not a verified signed commit"
+    skip "$repo" "$ref" "restore target not verified — review manually"; write_result; continue
+  fi
+  if [ "$before" = "$ZERO" ]; then
+    lease="--force-with-lease=$ref:$after"; spec=":$ref"
+  elif [ "$after" = "$ZERO" ]; then
+    lease="--force-with-lease=$ref:"; spec="$before:$ref"
+  else
+    lease="--force-with-lease=$ref:$after"; spec="$before:$ref"
+  fi
+  # old = what is on the remote now, new = what we are about to put there
+  # no note, no push: an un-noted restore would itself be classified critical
+  if ! wd_send_note "$repo" "$ref" "$after" "$before" </dev/null; then
+    wd_log "restore note failed for $repo $ref: $WD_REASON"
+    skip "$repo" "$ref" "could not send note${WD_REASON:+ ($WD_REASON)}"; write_result; continue
+  fi
+  if out="$(git -c push.followTags=false -c push.gpgSign=false -C "$mirror" push --no-verify --no-follow-tags "$lease" "$url" "$spec" </dev/null 2>&1)"; then
+    if [ "$before" = "$ZERO" ]; then git -C "$mirror" update-ref -d "$ref" </dev/null >/dev/null 2>&1
+    else git -C "$mirror" update-ref "$ref" "$before" </dev/null >/dev/null 2>&1; fi
+    jq -cn --arg repo "$repo" --arg ref "$ref" --arg b "$before" --arg a "$after" --argjson s "$mx" \
+      '{repo:$repo,ref:$ref,before:$b,after:$a,through_seq:$s}' >> "$tmp/restored.jsonl"
+    wd_log "restored $repo $ref to $before"
+  else
+    case "$out" in
+      *"stale info"*|*"[rejected]"*|*"remote ref does not exist"*) skip "$repo" "$ref" "ref moved since the incident" ;;
+      *) skip "$repo" "$ref" "push failed" ;;
+    esac
+    wd_log "restore skipped $repo $ref"
+  fi
+  write_result
+done < "$tmp/todo.tsv"
+
+write_result
+nr="$(jq '.restored|length' "$result")"; ns="$(jq '.skipped|length' "$result")"
+if [ "$N" -eq 0 ] && [ -s "$prior" ]; then exit 0; fi
+notify "Account watchdog: restore" "Restored $nr ref(s); $ns skipped. See $(basename "$result"). $REVOKE"
+# Same summary to the phone and Slack via the Worker. Best effort: logged on failure, never retried.
+if [ $((nr + ns)) -gt 0 ]; then
+  wd_send_report "$result" </dev/null || wd_log "restore report not sent: $WD_REASON"
+fi
+exit 0

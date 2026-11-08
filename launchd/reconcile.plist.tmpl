@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>@LABEL@</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-c</string>
+    <string>"@WATCHDOG_HOME@/bin/reconcile" public &amp;&amp; "@WATCHDOG_HOME@/bin/reconcile" all</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>WATCHDOG_STATE_DIR</key><string>@STATE@</string>
+    <key>WATCHDOG_CONFIG_DIR</key><string>@CONFIG@</string>
+  </dict>
+  <key>StartInterval</key><integer>3600</integer>
+  <key>StandardOutPath</key><string>@STATE@/log/reconcile.out</string>
+  <key>StandardErrorPath</key><string>@STATE@/log/reconcile.out</string>
+</dict>
+</plist>

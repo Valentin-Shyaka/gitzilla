@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+# reconcile public|all|seed — hourly backup check. Catches pushes whose webhooks never arrived (git ls-remote vs
+# the known heads) and new SSH authentication/signing keys on the GitHub account. Compatible with macOS bash 3.2.
+#
+#   public  hourly: public repos + account keys (no Touch ID)
+#   all     like public, plus private repos over one ssh session; runs only if reconcile-all-at is > 24 h old
+#   seed    install/rotation: for repos not yet listed in $STATE/seeded.txt, add the refs/heads/* and refs/tags/*
+#           of the repo's mirror that heads.json lacks (existing values never change), then list the repo in
+#           seeded.txt (the single trust point). reconcile only checks repos listed in seeded.txt; a seeded repo
+#           with no heads.json entry has an empty baseline.
+#
+# heads.json is the ONLY baseline (a mirror is fetched from GitHub, so it cannot be a trust anchor). reconcile
+# never writes heads.json (except `seed`, for unseeded repos) and never touches the mirrors.
+# All network happens before poll.lock is taken (except the alert itself); the lock covers heads.json reads,
+# incident/seen writes and sending the alerts whose success decides the "alerted" state.
+# Alerts go to the desktop (wd_notify) AND, signed, to the Worker's /alert (phone + Slack); a key or ref counts as
+# alerted when at least one of the two succeeded.
+# Dedupe: $STATE/reconcile-seen.json {"repo|ref": {sha, first, alerted}} (two strikes: a (repo,ref) alerts only once
+# it has mismatched for >= 600 s; a new sha keeps `first` but re-arms the alert), $STATE/reconcile-seen-keys.txt.
+# Env overrides (tests): WATCHDOG_GIT_LS_REMOTE, WATCHDOG_CURL, WATCHDOG_NOTIFY_CMD, WATCHDOG_SSH_PROBE, WATCHDOG_NOW.
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$here/lib.sh"
+LSR="${WATCHDOG_GIT_LS_REMOTE:-git -c credential.helper= -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 ls-remote}"
+CURL="${WATCHDOG_CURL:-curl}"
+ZERO=0000000000000000000000000000000000000000
+STRIKE_SECS=600
+KEY_RE='^(ssh-|ecdsa-|sk-)[^ ]+ [A-Za-z0-9+/=]+'
+export GIT_TERMINAL_PROMPT=0
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR
+
+TMP=""; LOCK=""; NOW=""
+cleanup() {
+  [ -n "$TMP" ] && rm -rf "$TMP"
+  if [ -n "$LOCK" ] && [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ]; then rm -f "$LOCK/pid" 2>/dev/null; rmdir "$LOCK" 2>/dev/null; fi
+  return 0
+}
+
+atomic_write() { # dest ; content on stdin
+  local tmp="$1.tmp.$$"
+  cat > "$tmp" && mv -f "$tmp" "$1"
+}
+
+# take_lock: same mkdir lock as the agent poll. Never takes over (busy or stale: caller retries later).
+take_lock() {
+  local l="$STATE/poll.lock"
+  if mkdir "$l" 2>/dev/null; then LOCK="$l"; echo $$ > "$l/pid"; return 0; fi
+  return 1
+}
+
+# stdin "sha<TAB>ref" -> only refs/heads/* and refs/tags/*, no peeled ^{} lines
+refs_only() { awk -F'\t' '$2 ~ /^refs\/(heads|tags)\// && $2 !~ /\^\{\}$/ {print $1"\t"$2}'; }
+
+# a JSON file that must be an object; anything else is treated as empty (and logged)
+object_or_empty() { # file label
+  [ -s "$1" ] || { echo '{}'; return 0; }
+  if jq -e 'type == "object"' "$1" >/dev/null 2>&1; then cat "$1"; else wd_log "reconcile: $2 is not a JSON object; treated as empty"; echo '{}'; fi
+}
+
+# --- keys -------------------------------------------------------------------------------------------------
+# fetch <url> <outfile> -> 0 only on HTTP 200; anything else is "no information"
+fetch() {
+  local code
+  code="$($CURL --max-time 10 -sS -o "$2" -w '%{http_code}' "$1" 2>/dev/null </dev/null)"
+  [ "$code" = "200" ] || { wd_log "reconcile: fetch $1 failed (HTTP ${code:-none})"; return 1; }
+}
+
+# keys_filter: stdin lines -> "<type> <base64>" for lines that look like public keys (whitespace trimmed, comment dropped)
+keys_filter() { sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -E "$KEY_RE" | awk '{print $1" "$2}'; }
+
+# Phase A (no lock): fetch both endpoints. Sets KEYS_BOTH_OK=1 when both answered; writes $TMP/cand.keys.
+fetch_keys() {
+  local owner
+  KEYS_BOTH_OK=0; KEYS_ON=0
+  owner="$(printf '%s' "${OWNER:-}" | tr '[:upper:]' '[:lower:]')"
+  [ -n "$owner" ] || { wd_log "reconcile: OWNER not set; key check skipped"; return 0; }
+  if [ ! -f "$STATE/known-keys.txt" ]; then wd_log "reconcile: $STATE/known-keys.txt missing; key check skipped"; return 0; fi
+  KEYS_ON=1
+  : > "$TMP/cand.keys"
+  local a=0 s=0
+  : > "$TMP/auth.keys"
+  if fetch "https://github.com/$owner.keys" "$TMP/auth.out"; then
+    a=1; keys_filter < "$TMP/auth.out" > "$TMP/auth.keys"; cat "$TMP/auth.keys" >> "$TMP/cand.keys"
+  fi
+  if fetch "https://api.github.com/users/$owner/ssh_signing_keys?per_page=100" "$TMP/sign.out"; then
+    if jq -e 'type == "array"' "$TMP/sign.out" >/dev/null 2>&1; then
+      s=1; jq -r '.[] | (.key // empty)' "$TMP/sign.out" 2>/dev/null | keys_filter >> "$TMP/cand.keys"
+    else
+      wd_log "reconcile: signing keys response is not a JSON array"
+    fi
+  fi
+  sort -u "$TMP/cand.keys" -o "$TMP/cand.keys"
+  [ "$a" = 1 ] && [ "$s" = 1 ] && KEYS_BOTH_OK=1
+  return 0
+}
+
+# Phase B: compare with known-keys.txt (owned by rotation, never modified). One alert per new blob, recorded in
+# seen-keys only after a successful notification. After a fully successful fetch, seen-keys := seen ∩ current.
+eval_keys() {
+  local seen="$STATE/reconcile-seen-keys.txt" blob fp type src sent
+  [ "$KEYS_ON" = 1 ] || return 0
+  keys_filter < "$STATE/known-keys.txt" | sort -u > "$TMP/known.keys"
+  touch "$seen"
+  if [ "$KEYS_BOTH_OK" = 1 ]; then
+    grep -xFf "$TMP/cand.keys" "$seen" 2>/dev/null | atomic_write "$seen" || true
+  fi
+  grep -vxFf "$TMP/known.keys" "$TMP/cand.keys" > "$TMP/new.keys" 2>/dev/null
+  [ -s "$TMP/new.keys" ] || return 0
+  while IFS= read -r blob; do
+    [ -n "$blob" ] || continue
+    grep -qxF -- "$blob" "$seen" 2>/dev/null && continue
+    type="${blob%% *}"
+    printf '%s\n' "$blob" > "$TMP/one.pub"
+    fp="$(ssh-keygen -lf "$TMP/one.pub" 2>/dev/null </dev/null | awk '{print $2}')"
+    if [ -z "$fp" ]; then wd_log "reconcile: unparseable key blob ($type); no alert"; continue; fi
+    if grep -qxF -- "$blob" "$TMP/auth.keys" 2>/dev/null; then src=auth; else src=signing; fi
+    sent=0
+    wd_notify "Account watchdog: CRITICAL" "New key on your GitHub account ($type $fp). Review keys: https://github.com/settings/keys $WD_REVOKE" && sent=1
+    if wd_send_alert new-key "$type" "$fp" "$src" </dev/null; then sent=1; else wd_log "reconcile: key alert not sent to the Worker: $WD_REASON"; fi
+    [ "$sent" = 1 ] && echo "$blob" >> "$seen"
+  done < "$TMP/new.keys"
+}
+
+# --- refs -------------------------------------------------------------------------------------------------
+# Phase B: events for one repo from $TMP/r/<n>.tsv vs heads.json (appends JSON lines to $TMP/events.jsonl).
+compare_repo() { # slug remote-tsv
+  local slug="$1"
+  jq -r --arg r "$slug" '(.[$r] // {}) | to_entries[] | "\(.value)\t\(.key)"' "$STATE/heads.json" 2>/dev/null | refs_only > "$TMP/base.tsv"
+  jq -cn --arg r "$slug" --arg z "$ZERO" --argjson ts "$NOW" \
+    --rawfile remote "$2" --rawfile base "$TMP/base.tsv" '
+    def tomap: [split("\n")[] | select(length > 0) | split("\t") | {key: .[1], value: .[0]}] | from_entries;
+    ($remote | tomap) as $R | ($base | tomap) as $B
+    | ([$R, $B] | map(keys) | add | unique)[]
+    | . as $ref | ($R[$ref] // $z) as $a | ($B[$ref] // $z) as $b
+    | select($a != $b)
+    | {seq: null, delivery: ("reconcile-" + ($ts | tostring)), ts: $ts, kind: "push", repo: $r, ref: $ref,
+       before: $b, after: $a, forced: false, level: "warning", flags: ["missed-webhook"]}' \
+    >> "$TMP/events.jsonl" 2>/dev/null || { wd_log "reconcile: compare failed for $slug"; return 1; }
+}
+
+# Two strikes. Per current mismatch: new or changed sha -> record first=now, no alert; same sha seen >= 600 s and
+# not yet alerted -> due. Entries of checked repos that no longer mismatch are dropped; other repos stay.
+report_refs() {
+  local seenf="$STATE/reconcile-seen.json" inc total repos sent
+  object_or_empty "$seenf" "reconcile-seen.json" > "$TMP/seen.in"
+  jq -s --slurpfile seen "$TMP/seen.in" --rawfile checked "$TMP/checked" --argjson now "$NOW" --argjson strike "$STRIKE_SECS" '
+    ($checked | split("\n") | map(select(length > 0))) as $C
+    | . as $ev | $seen[0] as $S
+    | ($S | with_entries(select((.key | split("|")[0]) as $r | ($C | index($r)) | not))) as $keep
+    | ([ $ev[] | (.repo + "|" + .ref) as $k
+         | ($S[$k] | if type == "object" then . else null end) as $e
+         | {key: $k, ev: ., value: (if $e == null then {sha: .after, first: $now, alerted: false}
+                                    elif $e.sha == .after then $e
+                                    else {sha: .after, first: $e.first, alerted: false} end)} ]) as $cur
+    | { due: [ $cur[] | select(.value.alerted | not) | select($now - .value.first >= $strike) | .ev ],
+        seen: ($keep + ($cur | map({key: .key, value: .value}) | from_entries)) }' \
+    "$TMP/events.jsonl" > "$TMP/dedupe.json" || return 1
+  total="$(jq '.due | length' "$TMP/dedupe.json")"
+  if [ "$total" -gt 0 ]; then
+    repos="$(jq '[.due[].repo] | unique | length' "$TMP/dedupe.json")"
+    sent=0
+    wd_notify "Account watchdog: warning" "$total ref(s) in $repos repo(s) differ from the known heads (possible missed webhook). $WD_REVOKE" && sent=1
+    if wd_send_alert missed-webhook "$total" "$repos" </dev/null; then sent=1; else wd_log "reconcile: missed-webhook alert not sent to the Worker: $WD_REASON"; fi
+    if [ "$sent" = 1 ]; then
+      mkdir -p "$STATE/incidents" || return 1
+      inc="$STATE/incidents/r-$NOW-$$.json"
+      jq '.due' "$TMP/dedupe.json" | atomic_write "$inc" || return 1
+      jq '.seen as $s | .due as $d | .seen |= with_entries(.value.alerted = (.value.alerted or ((.key) as $k | any($d[]; (.repo + "|" + .ref) == $k))))' \
+        "$TMP/dedupe.json" > "$TMP/dedupe2.json" && mv "$TMP/dedupe2.json" "$TMP/dedupe.json"
+    fi
+  fi
+  jq '.seen' "$TMP/dedupe.json" | atomic_write "$seenf"
+}
+
+cmd_seed() {
+  local slug vis _rest m n=0
+  mkdir -p "$STATE" || return 1
+  if [ -s "$STATE/heads.json" ] && ! jq -e 'type == "object"' "$STATE/heads.json" >/dev/null 2>&1; then
+    echo "reconcile seed: $STATE/heads.json is not a JSON object; refusing to touch it" >&2
+    wd_log "reconcile seed: heads.json is not a JSON object"; return 1
+  fi
+  if ! take_lock; then echo "reconcile seed: poll lock busy; retry shortly" >&2; wd_log "reconcile seed: poll lock busy"; return 1; fi
+  TMP="$(mktemp -d)" || return 1
+  if [ -s "$STATE/heads.json" ]; then cp "$STATE/heads.json" "$TMP/heads.json"; else echo '{}' > "$TMP/heads.json"; fi
+  [ -f "$STATE/seeded.txt" ] && cp "$STATE/seeded.txt" "$TMP/seeded.txt" || : > "$TMP/seeded.txt"
+  if [ -f "$STATE/repos.txt" ]; then
+    while read -r slug vis _rest; do
+      case "$slug" in ''|\#*) continue ;; esac
+      slug="$(printf '%s' "$slug" | tr '[:upper:]' '[:lower:]')"
+      grep -qxF -- "$slug" "$TMP/seeded.txt" && continue
+      m="$(mirror_path "$slug")"
+      [ -d "$m" ] || continue
+      git -C "$m" for-each-ref --format='%(objectname)%09%(refname)' </dev/null 2>/dev/null | refs_only > "$TMP/seed.tsv"
+      if [ -s "$TMP/seed.tsv" ]; then
+        # mirror refs the entry lacks; existing values win
+        jq --arg r "$slug" --rawfile t "$TMP/seed.tsv" \
+          '.[$r] = (([$t | split("\n")[] | select(length > 0) | split("\t") | {key: .[1], value: .[0]}] | from_entries) + (.[$r] // {}))' \
+          "$TMP/heads.json" > "$TMP/heads.next" && mv "$TMP/heads.next" "$TMP/heads.json" || return 1
+      fi
+      echo "$slug" >> "$TMP/seeded.txt"
+      n=$((n + 1)); wd_log "reconcile seed: seeded $slug"
+    done < "$STATE/repos.txt"
+  fi
+  if [ "$n" -gt 0 ]; then
+    atomic_write "$STATE/heads.json" < "$TMP/heads.json" || return 1
+    atomic_write "$STATE/seeded.txt" < "$TMP/seeded.txt" || return 1
+  fi
+  return 0
+}
+
+main() {
+  local mode="${1:-}" at slug vis idx=0 priv_n=0 stamp priv_ok=1 out
+  case "$mode" in public|all|seed) ;; *) echo "usage: reconcile public|all|seed" >&2; return 2 ;; esac
+  NOW="${WATCHDOG_NOW:-$(date +%s)}"
+  case "$NOW" in ''|*[!0-9]*) NOW="$(date +%s)" ;; esac
+  trap cleanup EXIT
+  [ "$mode" = seed ] && { cmd_seed; return $?; }
+  mkdir -p "$STATE" || return 1
+  if [ "$mode" = all ]; then
+    at="$(cat "$STATE/reconcile-all-at" 2>/dev/null)"
+    case "$at" in ''|*[!0-9]*) at=0 ;; esac
+    if [ $((NOW - at)) -lt 86400 ]; then wd_log "reconcile all: last full run under 24h ago; skipped"; return 0; fi
+  fi
+  TMP="$(mktemp -d)" || return 1
+  mkdir -p "$TMP/r"
+  : > "$TMP/events.jsonl"; : > "$TMP/checked"; : > "$TMP/list"
+
+  # ---- Phase A: all network, no lock ----
+  fetch_keys
+  if [ -f "$STATE/repos.txt" ]; then
+    while read -r slug vis _rest; do
+      case "$slug" in ''|\#*) continue ;; esac
+      slug="$(printf '%s' "$slug" | tr '[:upper:]' '[:lower:]')"
+      case "$vis" in
+        public) ;;
+        private)
+          [ "$mode" = all ] || continue
+          if [ "$priv_n" -eq 0 ]; then
+            wd_ssh_env                                  # one ssh session (one Touch ID) for every private repo
+            # default probe reuses the session's GIT_SSH_COMMAND (ControlMaster/ControlPath): no second Touch ID
+            if [ -n "${WATCHDOG_SSH_PROBE:-}" ]; then out="$($WATCHDOG_SSH_PROBE 2>&1 </dev/null)"
+            else out="$(sh -c "$GIT_SSH_COMMAND -T git@github.com" 2>&1 </dev/null)"; fi
+            case "$out" in *"successfully authenticated"*) ;; *) priv_ok=0; wd_log "reconcile: ssh auth probe failed; private pass skipped" ;; esac
+          fi
+          priv_n=$((priv_n + 1))
+          [ "$priv_ok" = 1 ] || continue
+          echo "$slug" >> "$TMP/priv" ;;
+        *) wd_log "reconcile: bad visibility for $slug: $vis"; continue ;;
+      esac
+      if ! grep -qxF -- "$slug" "$STATE/seeded.txt" 2>/dev/null; then
+        wd_log "reconcile: $slug not seeded; skipped"; continue
+      fi
+      idx=$((idx + 1))
+      if [ "$vis" = private ]; then url="git@github.com:$slug.git"; else url="https://github.com/$slug.git"; fi
+      if $LSR "$url" </dev/null > "$TMP/lsr.out" 2>/dev/null; then
+        refs_only < "$TMP/lsr.out" > "$TMP/r/$idx.tsv"; echo "$idx $slug" >> "$TMP/list"
+      else
+        wd_log "reconcile: ls-remote failed for $slug"
+      fi
+    done < "$STATE/repos.txt"
+  fi
+
+  # ---- Phase B: lock only for heads.json / seen / incident ----
+  if ! take_lock; then wd_log "reconcile: poll lock busy; will retry next run"; return 0; fi
+  while read -r idx slug; do
+    [ -n "$idx" ] || continue
+    compare_repo "$slug" "$TMP/r/$idx.tsv" && echo "$slug" >> "$TMP/checked"
+  done < "$TMP/list"
+  eval_keys
+  report_refs || { wd_log "reconcile: report failed"; return 1; }
+  if [ "$mode" = all ] && [ "$priv_ok" = 1 ]; then
+    # Short re-check (~1 h) only while a private repo CHECKED THIS RUN holds a genuine first strike (first seen
+    # < 600 s ago, awaiting confirmation). Due-but-unalerted entries (notify failing) or repos not checked get the
+    # normal 24 h cadence.
+    stamp="$NOW"
+    if [ -s "$TMP/priv" ] && [ -s "$TMP/checked" ]; then
+      grep -xFf "$TMP/checked" "$TMP/priv" > "$TMP/privchecked" 2>/dev/null
+      if [ -s "$TMP/privchecked" ] && jq -e --rawfile p "$TMP/privchecked" --argjson now "$NOW" \
+           '($p | split("\n") | map(select(length > 0))) as $P
+            | to_entries | any(.[]; ((.key | split("|")[0]) as $r | ($P | index($r))) and (.value.alerted | not) and ($now - .value.first < 600))' \
+           "$STATE/reconcile-seen.json" >/dev/null 2>&1; then
+        stamp=$((NOW - 86400 + 3300))
+      fi
+    fi
+    echo "$stamp" | atomic_write "$STATE/reconcile-all-at"
+  fi
+  return 0
+}
+
+main "$@"

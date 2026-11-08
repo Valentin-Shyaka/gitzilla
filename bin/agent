@@ -1,0 +1,355 @@
+#!/usr/bin/env bash
+# agent poll|health — drains the Worker queue, tracks branch heads, deep-checks suspicious pushes
+# in local bare mirrors, groups them into one incident file, notifies, and hands critical pushes
+# to `restore --prompt`. Compatible with macOS bash 3.2.
+#
+# Env overrides (tests): WATCHDOG_NOTIFY_CMD, WATCHDOG_RESTORE_CMD, WATCHDOG_SCAN_CMD,
+# WATCHDOG_REMOTE_URL_TEMPLATE, ALLOWED_SIGNERS_FILE.
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$here/lib.sh"
+WATCHDOG_HOME="${WATCHDOG_HOME:-$(cd "$here/.." && pwd)}"
+RESTORE="${WATCHDOG_RESTORE_CMD:-$WATCHDOG_HOME/bin/restore}"
+SCAN="${WATCHDOG_SCAN_CMD:-$WATCHDOG_HOME/scanner/scan.sh}" # bundled scanner (WATCHDOG_HOME from the config)
+SIGNERS="${ALLOWED_SIGNERS_FILE:-$(wd_allowed_signers)}" # gpg.ssh.allowedSignersFile, else ~/.config/git/allowed_signers
+REMOTE_TPL="${WATCHDOG_REMOTE_URL_TEMPLATE:-git@github.com:%s.git}"
+ZERO=0000000000000000000000000000000000000000
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR
+
+# Notification text never carries commit content: title + counts only. (wd_notify lives in lib.sh)
+notify() { wd_notify "$@"; }
+
+atomic_write() { # dest ; content on stdin
+  local tmp="$1.tmp.$$"
+  cat > "$tmp" && mv -f "$tmp" "$1"
+}
+
+# queue_get <after> <outfile> -> 0 on HTTP 200
+queue_get() {
+  local after="$1" out="$2" d msg sig code
+  d="$(mktemp -d)" || return 1
+  printf '{"ts":%s}' "$(date +%s)" > "$d/msg"
+  if ! sig="$(wd_sign account-watchdog-queue "$d/msg")"; then rm -rf "$d"; wd_log "queue: signing failed"; return 1; fi
+  msg="$(base64 < "$d/msg" | tr -d '\n')"
+  sig="$(printf '%s' "$sig" | base64 | tr -d '\n')"
+  rm -rf "$d"
+  code="$(curl --max-time 10 -sS -o "$out" -w '%{http_code}' -H "X-Watchdog-Auth: $msg.$sig" \
+          "$WATCHDOG_URL/queue?after=$after" 2>/dev/null </dev/null)"
+  [ "$code" = "200" ] || { wd_log "queue: HTTP ${code:-none}"; return 1; }
+}
+
+# sync_mirror <slug> -> 0 when the mirror is up to date
+sync_mirror() {
+  local slug="$1" m
+  m="$(mirror_path "$slug")"
+  if [ -d "$m" ]; then
+    git -C "$m" fetch --quiet --prune </dev/null >/dev/null 2>&1
+  else
+    mkdir -p "$(dirname "$m")"
+    # shellcheck disable=SC2059
+    git clone --mirror --quiet "$(printf "$REMOTE_TPL" "$slug")" "$m" </dev/null >/dev/null 2>&1 || { rm -rf "$m"; return 1; }
+    wd_mirror_harden "$m" || wd_log "mirror config failed for $slug"
+  fi
+}
+
+# build_excl <slug> <outfile> <evrefs> <evafters>: shas trusted as already-known. Call AFTER sync_mirror.
+# (mirror refs after fetch + pre-poll heads.json shas), minus refs/pull/*, minus every ref named by a
+# push event in this poll, minus every sha that is the `after` of an event in this poll; only shas
+# present in the mirror are kept (one cat-file --batch-check).
+build_excl() {
+  local slug="$1" out="$2" evrefs="$3" evafters="$4" m cand
+  m="$(mirror_path "$slug")"
+  cand="$(mktemp)" || return 1
+  { git -C "$m" for-each-ref --format='%(refname) %(objectname)' 2>/dev/null </dev/null
+    jq -r --arg r "$slug" '(.[$r] // {}) | to_entries[] | "\(.key) \(.value)"' "$STATE/heads.json" 2>/dev/null
+  } | while read -r name sha; do
+      case "$name" in refs/pull/*) continue ;; esac
+      grep -qxF -- "$name" "$evrefs" 2>/dev/null && continue
+      grep -qxF -- "$sha" "$evafters" 2>/dev/null && continue
+      echo "$sha"
+    done | sort -u > "$cand"
+  git -C "$m" cat-file --batch-check='%(objectname) %(objecttype)' < "$cand" 2>/dev/null \
+    | while read -r sha type; do case "$type" in commit|tag) echo "$sha" ;; esac; done > "$out"
+  rm -f "$cand"
+}
+
+# unsigned_scan <mirror> <after> <exclfile> -> prints "%H %G?" lines; non-zero on failure.
+unsigned_scan() {
+  local m="$1" after="$2" excl="$3" spec rc
+  spec="$(mktemp)" || return 1
+  { echo "$after"; sed 's/^/^/' "$excl"; } > "$spec"
+  git -C "$m" -c gpg.ssh.allowedSignersFile="$SIGNERS" log --format='%H %G?' --stdin < "$spec" 2>/dev/null
+  rc=$?
+  rm -f "$spec"
+  return $rc
+}
+
+# deep_check <slug> <ref> <before> <after> <exclfile> -> prints extra flags (space separated)
+deep_check() {
+  local slug="$1" ref="$2" before="$3" after="$4" excl="$5" m out flags="" st rc work
+  m="$(mirror_path "$slug")"
+  [ "$after" = "$ZERO" ] && { echo ok; return 0; }
+  if ! git -C "$m" cat-file -e "$after^{commit}" 2>/dev/null; then echo "ok check-failed"; return 0; fi
+  # Signatures
+  if [ "$before" != "$ZERO" ] && git -C "$m" cat-file -e "$before^{commit}" 2>/dev/null; then
+    out="$(git -C "$m" -c gpg.ssh.allowedSignersFile="$SIGNERS" log --format='%H %G?' "$before..$after" 2>/dev/null </dev/null)" || out="?"
+  else
+    out="$(unsigned_scan "$m" "$after" "$excl")" || out="?"
+  fi
+  if [ "$out" = "?" ]; then flags="$flags check-failed"
+  else
+    while read -r _ st; do
+      [ -n "$st" ] && [ "$st" != "G" ] && { flags="$flags unsigned"; break; }
+    done <<EOF2
+$out
+EOF2
+  fi
+  # Payload scan
+  if [ -f "$SCAN" ]; then
+    work="$(mktemp -d)"
+    GIT_DIR="$m" GIT_WORK_TREE="$work" bash "$SCAN" range "$before" "$after" >/dev/null 2>&1 </dev/null
+    rc=$?
+    rm -rf "$work"
+    case "$rc" in 0) ;; 1) flags="$flags payload" ;; *) flags="$flags scan-failed" ;; esac
+  else
+    wd_log "scan command missing: $SCAN"; flags="$flags scan-failed"
+  fi
+  echo ok $flags
+}
+
+# queue_failed: first failure time of an unreadable /queue (non-2xx, signing failure, bad JSON); `health` reports it
+# after an hour. A readable queue clears it.
+queue_failed() {
+  local f="$STATE/queue-fail-since" since
+  since="$(cat "$f" 2>/dev/null)"
+  case "$since" in ''|*[!0-9]*) date +%s > "$f" 2>/dev/null ;; esac
+  return 0
+}
+
+# check_lost <cursor> <first-page.json>: events the Worker pruned before this Mac read them (offline longer than the
+# Worker keeps events). Uses the page's `oldest` retained seq, else the first event's seq. On a gap: one CRITICAL
+# notification, a log line, and the cursor moves to oldest-1 (those events are gone; the alert is not repeated).
+check_lost() {
+  local cursor="$1" page="$2" oldest lost
+  [ "$cursor" -gt 0 ] 2>/dev/null || return 0
+  oldest="$(jq -r 'if (.oldest | type) == "number" then .oldest elif (.events | length) > 0 then .events[0].seq else "" end' "$page" 2>/dev/null)"
+  case "$oldest" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$oldest" -gt $((cursor + 1)) ] || return 0
+  lost=$((oldest - cursor - 1))
+  wd_log "queue: $lost event(s) lost (cursor $cursor, oldest retained $oldest)"
+  notify "Account watchdog: CRITICAL" "$lost event(s) were lost while this Mac was offline — check phone/Slack alerts and run \`reconcile all\`. $WD_REVOKE"
+  printf '%s\n' "$((oldest - 1))" | atomic_write "$STATE/queue-cursor"
+}
+
+POLL_TMP=""; POLL_LOCK=""
+poll_cleanup() {
+  [ -n "$POLL_TMP" ] && rm -rf "$POLL_TMP"
+  if [ -n "$POLL_LOCK" ]; then rm -f "$POLL_LOCK/pid" 2>/dev/null; rmdir "$POLL_LOCK" 2>/dev/null; fi
+}
+
+# notify_incident <incident-file>: one notification per incident.
+notify_incident() {
+  local inc="$1" total repos crit nofail msg
+  total="$(jq length "$inc")"
+  repos="$(jq '[.[].repo]|unique|length' "$inc")"
+  crit="$(jq '[.[]|select(.level=="critical")]|length' "$inc")"
+  nofail="$(jq '[.[]|select((.flags // []) | (index("check-failed") or index("scan-failed")))]|length' "$inc")"
+  if [ "$crit" -gt 0 ]; then
+    msg="$total suspicious event(s) across $repos repo(s), $crit critical. Open the restore prompt."
+    [ "$nofail" -gt 0 ] && msg="$msg $nofail could not be deep-checked."
+    notify "Account watchdog: CRITICAL" "$msg $WD_REVOKE"
+  else
+    msg="$total event(s) across $repos repo(s) need review."
+    [ "$nofail" -gt 0 ] && msg="$msg $nofail could not be deep-checked."
+    notify "Account watchdog: warning" "$msg $WD_REVOKE"
+  fi
+}
+
+# deliver_batch: INCS holds this poll's incident files (leftover .pending ones plus the new one).
+# Notify each, then ONE restore invocation with every pending file (oldest first) when one has a critical push, so a
+# ref attacked in two incidents is restored to its true pre-attack commit. Restore only has work for
+# critical pushes; "disarmed" events are in the incident for the record. Exit 3 (prompt unanswered)
+# keeps every marker so the next poll asks again; any other exit clears them all.
+# With no critical push, an incident holding a push that could not be deep-checked (check-failed/scan-failed: it may
+# be an attacker's first push that only looks like a warning) keeps its marker, so it joins the next restore chain;
+# the marker then reads "held" and the incident is not notified again. Other markers are cleared.
+deliver_batch() {
+  local f rc crit_any=0 all=()
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    all+=("$f")
+    [ "$(cat "${f%.json}.pending" 2>/dev/null)" = held ] || notify_incident "$f"
+    if [ "$(jq '[.[]|select(.level=="critical" and .kind=="push")]|length' "$f")" -gt 0 ]; then crit_any=1; fi
+  done <<EOF_INCS
+$(printf '%s' "$INCS" | while IFS= read -r f; do [ -n "$f" ] && echo "$(basename "$f" .json) $f"; done | sort -n | cut -d' ' -f2-)
+EOF_INCS
+  # Pass EVERY pending file when any has a critical push: restore's per-ref critical check decides, and the
+  # chain must not be cut by a warning-level file in between.
+  if [ "$crit_any" = 1 ]; then
+    "$RESTORE" --prompt "${all[@]}" </dev/null; rc=$?
+    if [ "$rc" -eq 3 ]; then
+      wd_log "restore prompt unanswered; will re-deliver"
+      return 0
+    fi
+    [ "$rc" -eq 0 ] || wd_log "restore exited $rc"
+    for f in "${all[@]}"; do rm -f "${f%.json}.pending"; done
+    return 0
+  fi
+  for f in "${all[@]}"; do
+    if jq -e 'any(.[]; .kind == "push" and ((.flags // []) | (index("check-failed") or index("scan-failed"))))' "$f" >/dev/null 2>&1; then
+      echo held > "${f%.json}.pending"
+    else
+      rm -f "${f%.json}.pending"
+    fi
+  done
+}
+
+poll_main() {
+  if [ -z "${WATCHDOG_URL:-}" ]; then echo "agent: not configured" >&2; return 1; fi
+  mkdir -p "$STATE/incidents" || return 1
+  # single instance; a lock whose owner is dead, or older than 30 min, is stale
+  local lock="$STATE/poll.lock" opid
+  if ! mkdir "$lock" 2>/dev/null; then
+    opid="$(cat "$lock/pid" 2>/dev/null)"
+    if { [ -n "$opid" ] && ! kill -0 "$opid" 2>/dev/null; } || [ -n "$(find "$lock" -maxdepth 0 -mmin +30 2>/dev/null)" ]; then
+      if mv "$lock" "$lock.stale.$$" 2>/dev/null; then
+        if [ "$(cat "$lock.stale.$$/pid" 2>/dev/null)" != "$opid" ]; then
+          # we grabbed another poller's fresh lock: put it back
+          mv "$lock.stale.$$" "$lock" 2>/dev/null; wd_log "poll already running"; return 0
+        fi
+        rm -rf "$lock.stale.$$"
+      else wd_log "poll already running"; return 0; fi
+      mkdir "$lock" 2>/dev/null || { wd_log "poll already running"; return 0; }
+    else wd_log "poll already running"; return 0; fi
+  fi
+  POLL_LOCK="$lock"; echo $$ > "$lock/pid"
+  POLL_TMP="$(mktemp -d)" || return 1
+  trap poll_cleanup EXIT
+  local tmp="$POLL_TMP"
+  wd_ssh_env
+
+  # Re-deliver incidents whose notify/restore may not have completed (crash after the cursor moved).
+  local pend
+  for pend in "$STATE"/incidents/*.pending; do
+    [ -e "$pend" ] || continue
+    case "$(basename "$pend")" in r-*) continue ;; esac   # reconcile's incidents are warning-only, never re-delivered
+    if [ -s "${pend%.pending}.json" ]; then INCS="$INCS${pend%.pending}.json"$'\n'; else rm -f "$pend"; fi
+  done
+
+  local cursor next after n firstpage=1
+  cursor="$(cat "$STATE/queue-cursor" 2>/dev/null)"; case "$cursor" in ''|*[!0-9]*) cursor=0 ;; esac
+  after="$cursor"; : > "$tmp/events.jsonl"
+  while :; do
+    if ! queue_get "$after" "$tmp/page.json"; then queue_failed; echo "agent: queue fetch failed" >&2; return 1; fi
+    n="$(jq '.events|length' "$tmp/page.json" 2>/dev/null)" || { wd_log "queue: bad json"; queue_failed; return 1; }
+    rm -f "$STATE/queue-fail-since" "$STATE/queue-notified"
+    if [ "$firstpage" = 1 ]; then firstpage=0; check_lost "$cursor" "$tmp/page.json"; fi
+    [ "$n" -gt 0 ] || break
+    jq -c '.events[]' "$tmp/page.json" >> "$tmp/events.jsonl"
+    next="$(jq -r '.next' "$tmp/page.json")"
+    [ "$next" -gt "$after" ] 2>/dev/null || break
+    after="$next"
+  done
+  [ -s "$tmp/events.jsonl" ] || return 0
+  local stored0; stored0="$(cat "$STATE/queue-cursor" 2>/dev/null)"; case "$stored0" in ''|*[!0-9]*) stored0=0 ;; esac
+  jq -s --argjson c "$stored0" 'map(select(.seq > $c)) | sort_by(.seq)' "$tmp/events.jsonl" > "$tmp/all.json" || return 1
+  [ "$(jq length "$tmp/all.json")" -gt 0 ] || return 0
+  local newcursor; newcursor="$(jq -r 'map(.seq)|max' "$tmp/all.json")"
+
+  # Heads: every push event's `after` (zeros removes the ref).
+  [ -s "$STATE/heads.json" ] || echo '{}' > "$STATE/heads.json"
+  jq --slurpfile ev "$tmp/all.json" --arg z "$ZERO" '
+    reduce ($ev[0][] | select(.kind == "push")) as $e (.;
+      if $e.after == $z then
+        (if .[$e.repo] then .[$e.repo] |= del(.[$e.ref]) else . end)
+        | (if (.[$e.repo] // {} | length) == 0 then del(.[$e.repo]) else . end)
+      else .[$e.repo][$e.ref] = $e.after end)' "$STATE/heads.json" > "$tmp/heads.json" || return 1
+
+  # Deep check non-silent pushes, one mirror sync per repo.
+  : > "$tmp/adds.jsonl"
+  jq -r '.[] | select(.kind == "push" and .level != "silent") | .repo' "$tmp/all.json" | sort -u > "$tmp/repos"
+  local repo synced
+  while read -r repo; do
+    [ -n "$repo" ] || continue
+    jq -r --arg r "$repo" '.[] | select(.kind == "push" and .repo == $r) | .ref' "$tmp/all.json" | sort -u > "$tmp/evrefs"
+    jq -r '.[] | select(.kind == "push") | .after' "$tmp/all.json" | sort -u > "$tmp/evafters"
+    synced=1; sync_mirror "$repo" || { synced=0; wd_log "mirror sync failed for $repo"; }
+    [ "$synced" = 1 ] && { build_excl "$repo" "$tmp/excl" "$tmp/evrefs" "$tmp/evafters" || synced=0; }
+    jq -r --arg r "$repo" '.[] | select(.kind == "push" and .level != "silent" and .repo == $r) | [.seq,.ref,.before,.after] | @tsv' "$tmp/all.json" > "$tmp/rows"
+    while IFS="$(printf '\t')" read -r seq ref before after; do
+      if [ "$synced" = 1 ]; then
+        fl="$(deep_check "$repo" "$ref" "$before" "$after" "$tmp/excl")" || fl=""
+        # fail closed: a dead/empty deep_check subshell is check-failed, never "clean"
+        case "$fl" in ok|"ok "*) fl="${fl#ok}" ;; *) fl="check-failed" ;; esac
+      else fl="check-failed"; [ "$after" = "$ZERO" ] && fl=""; fi
+      jq -cn --argjson seq "$seq" --arg f "$fl" '{seq:$seq,add:($f|split(" ")|map(select(length>0)))}' >> "$tmp/adds.jsonl"
+    done < "$tmp/rows"
+  done < "$tmp/repos"
+
+  jq --slurpfile adds <(jq -s . "$tmp/adds.jsonl") '
+    ($adds[0] | map({key:(.seq|tostring), value:.add}) | from_entries) as $m
+    | [ .[] | select(.level != "silent")
+        | ($m[(.seq|tostring)] // []) as $add
+        | .flags = ((.flags // []) + $add | unique)
+        | if (.level == "warning" and (($add | index("unsigned")) or ($add | index("payload")))) then .level = "critical" else . end ]
+  ' "$tmp/all.json" > "$tmp/incident.json" || return 1
+
+  # Durable writes first (heads, incident, pending marker), cursor last: a crash re-processes
+  # instead of dropping, and a leftover .pending re-issues notify/restore on the next poll.
+  atomic_write "$STATE/heads.json" < "$tmp/heads.json" || return 1
+  local inc="" total stored
+  total="$(jq length "$tmp/incident.json")"
+  if [ "$total" -gt 0 ]; then
+    inc="$STATE/incidents/$(jq -r '.[0].seq' "$tmp/incident.json").json"
+    atomic_write "$inc" < "$tmp/incident.json" || return 1
+    : > "${inc%.json}.pending" || return 1
+  fi
+  # The cursor never moves backwards.
+  stored="$(cat "$STATE/queue-cursor" 2>/dev/null)"; case "$stored" in ''|*[!0-9]*) stored=0 ;; esac
+  if [ "$newcursor" -gt "$stored" ]; then
+    printf '%s\n' "$newcursor" | atomic_write "$STATE/queue-cursor" || return 1
+  else
+    wd_log "queue cursor not lowered ($newcursor <= $stored)"
+  fi
+
+  [ -n "$inc" ] && INCS="$INCS$inc"$'\n'
+  return 0
+}
+
+cmd_poll() {
+  local rc
+  INCS=""
+  poll_main; rc=$?
+  [ -n "$INCS" ] && deliver_batch
+  return "$rc"
+}
+
+cmd_health() {
+  mkdir -p "$STATE" || return 1
+  local f="$STATE/health-fail-since" mark="$STATE/health-notified" code since now
+  local qf="$STATE/queue-fail-since" qmark="$STATE/queue-notified"
+  now="$(date +%s)"
+  # /queue unreadable (set by poll) for over an hour: 401 from clock skew, a NOTE_PUBKEY mismatch, signing failure...
+  since="$(cat "$qf" 2>/dev/null)"
+  case "$since" in
+    ''|*[!0-9]*) ;;
+    *) if [ $((now - since)) -gt 3600 ] && [ ! -e "$qmark" ]; then
+         notify "Account watchdog: queue unreadable" "The agent has not been able to read the Worker queue for over an hour (see log/watchdog.log)."
+         : > "$qmark"
+       fi ;;
+  esac
+  code="$(curl --max-time 10 -sS -o /dev/null -w '%{http_code}' "${WATCHDOG_URL:-http://invalid.invalid}/health" 2>/dev/null </dev/null)"
+  if [ "$code" = "200" ]; then rm -f "$f" "$mark"; return 0; fi
+  since="$(cat "$f" 2>/dev/null)"
+  case "$since" in ''|*[!0-9]*) echo "$now" > "$f"; return 1 ;; esac
+  if [ $((now - since)) -gt 3600 ] && [ ! -e "$mark" ]; then
+    notify "Account watchdog: Worker unreachable" "The watchdog Worker has been failing its health check for over an hour."
+    : > "$mark"
+  fi
+  return 1
+}
+
+case "${1:-}" in
+  poll) cmd_poll ;;
+  health) cmd_health ;;
+  *) echo "usage: agent poll|health" >&2; exit 2 ;;
+esac

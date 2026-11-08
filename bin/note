@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# note <remote-name> <remote-url>: pre-push helper. Reads "<lref> <lsha> <rref> <rsha>" lines on stdin,
+# sends a signed push note per owned-repo line, copies pushed objects into the local mirror.
+# Always exits 0 (fail-open).
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$here/lib.sh"
+
+url="${2:-}"
+slug="$(repo_slug "$url")"
+ZERO=0000000000000000000000000000000000000000
+
+owner="$(printf '%s' "${OWNER:-}" | tr '[:upper:]' '[:lower:]')"
+if [ -n "$slug" ] && { [ -z "$owner" ] || [ -z "${WATCHDOG_URL:-}" ]; }; then
+  wd_log "not configured; note skipped for $slug"
+  echo "account-watchdog: note not sent (not configured) — this push will raise a warning" >&2
+elif [ -n "$slug" ] && [ "${slug%%/*}" = "$owner" ]; then
+  top="$(git rev-parse --show-toplevel 2>/dev/null || git rev-parse --absolute-git-dir 2>/dev/null)"
+  mirror="$(mirror_path "$slug")"
+  input="$(cat)"
+  dead=0   # after one "worker unreachable" (connect failure / timeout) the other refs skip the 5 s wait
+  while read -r lref lsha rref rsha _rest; do
+    [ -n "$rref" ] && [ -n "$lsha" ] && [ -n "$rsha" ] || continue
+    if [ "$dead" = 1 ]; then
+      WD_REASON="worker unreachable"
+      wd_log "note skipped for $slug $rref: $WD_REASON"
+      echo "account-watchdog: note not sent ($WD_REASON) — this push will raise a warning" >&2
+    elif ! wd_send_note "$slug" "$rref" "$rsha" "$lsha" </dev/null; then
+      wd_log "note failed for $slug $rref: $WD_REASON"
+      echo "account-watchdog: note not sent ($WD_REASON) — this push will raise a warning" >&2
+      [ "$WD_REASON" = "worker unreachable" ] && dead=1
+    fi
+    if [ "$lsha" != "$ZERO" ] && [ -d "$mirror" ] && [ -n "$top" ]; then
+      env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY \
+          -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_COMMON_DIR \
+          git -C "$mirror" fetch --quiet "$top" "$lsha" </dev/null >/dev/null 2>&1 \
+        || wd_log "mirror fetch failed for $slug $lsha"
+    fi
+  done <<EOF_REFS
+$input
+EOF_REFS
+fi
+exit 0

@@ -1,0 +1,15 @@
+name = "account-watchdog"
+main = "src/index.js"
+compatibility_date = "2026-08-22"
+
+[[durable_objects.bindings]]
+name = "HUB"
+class_name = "Hub"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Hub"]
+
+[vars]
+NOTE_PUBKEY = ""
+ALERT_TZ = "UTC" # install.sh deploys with --var ALERT_TZ:<the Mac's zone>
