@@ -1,8 +1,8 @@
-# account-watchdog shared helpers. Source me; defines functions/defaults only (no output, no exit).
+# gitzilla shared helpers. Source me; defines functions/defaults only (no output, no exit).
 # Compatible with macOS bash 3.2.
 
-WATCHDOG_CONFIG_DIR="${WATCHDOG_CONFIG_DIR:-$HOME/.config/account-watchdog}"
-STATE="${WATCHDOG_STATE_DIR:-$HOME/.local/state/account-watchdog}"
+GITZILLA_CONFIG_DIR="${GITZILLA_CONFIG_DIR:-$HOME/.config/gitzilla}"
+STATE="${GITZILLA_STATE_DIR:-$HOME/.local/state/gitzilla}"
 SECRETIVE_SOCK="$HOME/Library/Containers/com.maxgoedjen.Secretive.SecretAgent/Data/socket.ssh"
 WD_REVOKE="If this wasn't you: revoke tokens at https://github.com/settings/applications"
 WD_REASON=""
@@ -17,12 +17,12 @@ wd_allowed_signers() {
 }
 
 # shellcheck disable=SC1090
-[ -f "$WATCHDOG_CONFIG_DIR/config" ] && . "$WATCHDOG_CONFIG_DIR/config"
+[ -f "$GITZILLA_CONFIG_DIR/config" ] && . "$GITZILLA_CONFIG_DIR/config"
 
 # Hooks run from GUI git clients (GitHub Desktop, Tower, Xcode, ...) get PATH=/usr/bin:/bin:/usr/sbin:/sbin. When no jq
-# is on PATH, use the one install.sh's hook step recorded in $WATCHDOG_CONFIG_DIR/jq-path.
-if ! command -v jq >/dev/null 2>&1 && [ -f "$WATCHDOG_CONFIG_DIR/jq-path" ]; then
-  _wd_jq="$(head -n1 "$WATCHDOG_CONFIG_DIR/jq-path" 2>/dev/null)"
+# is on PATH, use the one install.sh's hook step recorded in $GITZILLA_CONFIG_DIR/jq-path.
+if ! command -v jq >/dev/null 2>&1 && [ -f "$GITZILLA_CONFIG_DIR/jq-path" ]; then
+  _wd_jq="$(head -n1 "$GITZILLA_CONFIG_DIR/jq-path" 2>/dev/null)"
   [ -n "$_wd_jq" ] && [ -x "$_wd_jq" ] && PATH="${_wd_jq%/*}:$PATH"
   unset _wd_jq
 fi
@@ -47,14 +47,14 @@ repo_slug() {
 
 wd_log() {
   mkdir -p "$STATE/log" 2>/dev/null || return 0
-  printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$STATE/log/watchdog.log" 2>/dev/null
+  printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$STATE/log/gitzilla.log" 2>/dev/null
   return 0
 }
 
-# wd_notify <title> <message>: desktop notification (WATCHDOG_NOTIFY_CMD overrides, for tests).
+# wd_notify <title> <message>: desktop notification (GITZILLA_NOTIFY_CMD overrides, for tests).
 wd_notify() {
-  if [ -n "${WATCHDOG_NOTIFY_CMD:-}" ]; then
-    "$WATCHDOG_NOTIFY_CMD" "$1" "$2" </dev/null >/dev/null 2>&1 || { wd_log "notify command failed"; return 1; }
+  if [ -n "${GITZILLA_NOTIFY_CMD:-}" ]; then
+    "$GITZILLA_NOTIFY_CMD" "$1" "$2" </dev/null >/dev/null 2>&1 || { wd_log "notify command failed"; return 1; }
   else
     osascript -e 'on run argv' -e 'display notification (item 2 of argv) with title (item 1 of argv)' \
       -e 'end run' -- "$1" "$2" </dev/null >/dev/null 2>&1 || { wd_log "osascript notify failed"; return 1; }
@@ -97,8 +97,8 @@ wd_sign() {
   local ns="$1" file="$2" dir rc=0
   dir="$(mktemp -d)" || return 1
   cp "$file" "$dir/msg" || { rm -rf "$dir"; return 1; }
-  if [ -n "${WATCHDOG_SIGN_KEY:-}" ]; then
-    ssh-keygen -q -Y sign -f "$WATCHDOG_SIGN_KEY" -n "$ns" "$dir/msg" >/dev/null 2>&1 || rc=1
+  if [ -n "${GITZILLA_SIGN_KEY:-}" ]; then
+    ssh-keygen -q -Y sign -f "$GITZILLA_SIGN_KEY" -n "$ns" "$dir/msg" >/dev/null 2>&1 || rc=1
   else
     SSH_AUTH_SOCK="$SECRETIVE_SOCK" ssh-keygen -q -Y sign -f "$NOTE_PUBKEY_FILE" -n "$ns" "$dir/msg" >/dev/null 2>&1 || rc=1
   fi
@@ -111,7 +111,7 @@ wd_sign() {
 wd_send_note() {
   local repo="$1" ref="$2" old="$3" new="$4" dir payload sig body code
   WD_REASON=""
-  if [ -z "${WATCHDOG_URL:-}" ] || { [ -z "${WATCHDOG_SIGN_KEY:-}" ] && [ -z "${NOTE_PUBKEY_FILE:-}" ]; }; then
+  if [ -z "${GITZILLA_URL:-}" ] || { [ -z "${GITZILLA_SIGN_KEY:-}" ] && [ -z "${NOTE_PUBKEY_FILE:-}" ]; }; then
     WD_REASON="not configured"; return 1
   fi
   dir="$(mktemp -d)" || { WD_REASON="no temp dir"; return 1; }
@@ -120,14 +120,14 @@ wd_send_note() {
         '{repo:$repo,ref:$ref,old_sha:$old,new_sha:$new,ts:$ts,nonce:$nonce}' | tr -d '\n' > "$dir/payload"; then
     WD_REASON="payload build failed"; rm -rf "$dir"; return 1
   fi
-  if ! sig="$(wd_sign account-watchdog-note "$dir/payload")"; then
+  if ! sig="$(wd_sign gitzilla-note "$dir/payload")"; then
     WD_REASON="signing failed"; rm -rf "$dir"; return 1
   fi
   if ! jq -cn --arg p "$(base64 < "$dir/payload" | tr -d '\n')" --arg s "$sig" '{payload:$p,sig:$s}' > "$dir/body"; then
     WD_REASON="body build failed"; rm -rf "$dir"; return 1
   fi
   code="$(curl --max-time 5 -sS -o /dev/null -w '%{http_code}' -X POST \
-          -H 'Content-Type: application/json' --data-binary @"$dir/body" "$WATCHDOG_URL/note" 2>/dev/null)"
+          -H 'Content-Type: application/json' --data-binary @"$dir/body" "$GITZILLA_URL/note" 2>/dev/null)"
   rm -rf "$dir"
   if [ "$code" = "204" ]; then return 0; fi
   case "$code" in ""|000) WD_REASON="worker unreachable" ;; *) WD_REASON="worker returned $code" ;; esac
@@ -144,7 +144,7 @@ wd_send_note() {
 wd_send_report() {
   local file="$1" dir sig code kr ks nr ns reserve=1300 tries=0 size b64
   WD_REASON=""
-  if [ -z "${WATCHDOG_URL:-}" ] || { [ -z "${WATCHDOG_SIGN_KEY:-}" ] && [ -z "${NOTE_PUBKEY_FILE:-}" ]; }; then
+  if [ -z "${GITZILLA_URL:-}" ] || { [ -z "${GITZILLA_SIGN_KEY:-}" ] && [ -z "${NOTE_PUBKEY_FILE:-}" ]; }; then
     WD_REASON="not configured"; return 1
   fi
   dir="$(mktemp -d)" || { WD_REASON="no temp dir"; return 1; }
@@ -165,7 +165,7 @@ wd_send_report() {
     size="$(wc -c < "$dir/payload" | tr -d ' ')"
     b64=$(( (size + 2) / 3 * 4 ))
     if [ $((b64 + reserve + 40)) -le 7600 ] || { [ "$kr" -eq 0 ] && [ "$ks" -eq 0 ]; }; then
-      if ! sig="$(wd_sign account-watchdog-report "$dir/payload")"; then
+      if ! sig="$(wd_sign gitzilla-report "$dir/payload")"; then
         WD_REASON="signing failed"; rm -rf "$dir"; return 1
       fi
       if ! jq -cn --arg p "$(base64 < "$dir/payload" | tr -d '\n')" --arg s "$sig" '{payload:$p,sig:$s}' > "$dir/body"; then
@@ -182,7 +182,7 @@ wd_send_report() {
     if [ "$kr" -gt "$ks" ]; then kr=$((kr - 1)); else ks=$((ks - 1)); fi
   done
   code="$(curl --max-time 5 -sS -o /dev/null -w '%{http_code}' -X POST \
-          -H 'Content-Type: application/json' --data-binary @"$dir/body" "$WATCHDOG_URL/report" 2>/dev/null)"
+          -H 'Content-Type: application/json' --data-binary @"$dir/body" "$GITZILLA_URL/report" 2>/dev/null)"
   rm -rf "$dir"
   if [ "$code" = "204" ]; then return 0; fi
   case "$code" in ""|000) WD_REASON="worker unreachable" ;; *) WD_REASON="worker returned $code" ;; esac
@@ -196,7 +196,7 @@ wd_send_report() {
 wd_send_alert() {
   local kind="$1" dir sig code
   WD_REASON=""
-  if [ -z "${WATCHDOG_URL:-}" ] || { [ -z "${WATCHDOG_SIGN_KEY:-}" ] && [ -z "${NOTE_PUBKEY_FILE:-}" ]; }; then
+  if [ -z "${GITZILLA_URL:-}" ] || { [ -z "${GITZILLA_SIGN_KEY:-}" ] && [ -z "${NOTE_PUBKEY_FILE:-}" ]; }; then
     WD_REASON="not configured"; return 1
   fi
   dir="$(mktemp -d)" || { WD_REASON="no temp dir"; return 1; }
@@ -210,14 +210,14 @@ wd_send_alert() {
     *) false ;;
   esac 2>/dev/null | tr -d '\n' > "$dir/payload"
   if [ ! -s "$dir/payload" ]; then WD_REASON="payload build failed"; rm -rf "$dir"; return 1; fi
-  if ! sig="$(wd_sign account-watchdog-alert "$dir/payload")"; then
+  if ! sig="$(wd_sign gitzilla-alert "$dir/payload")"; then
     WD_REASON="signing failed"; rm -rf "$dir"; return 1
   fi
   if ! jq -cn --arg p "$(base64 < "$dir/payload" | tr -d '\n')" --arg s "$sig" '{payload:$p,sig:$s}' > "$dir/body"; then
     WD_REASON="body build failed"; rm -rf "$dir"; return 1
   fi
   code="$(curl --max-time 5 -sS -o /dev/null -w '%{http_code}' -X POST \
-          -H 'Content-Type: application/json' --data-binary @"$dir/body" "$WATCHDOG_URL/alert" 2>/dev/null </dev/null)"
+          -H 'Content-Type: application/json' --data-binary @"$dir/body" "$GITZILLA_URL/alert" 2>/dev/null </dev/null)"
   rm -rf "$dir"
   if [ "$code" = "204" ]; then return 0; fi
   case "$code" in ""|000) WD_REASON="worker unreachable" ;; *) WD_REASON="worker returned $code" ;; esac

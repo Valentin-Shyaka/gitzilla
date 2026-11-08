@@ -2,8 +2,8 @@
 . "$(dirname "$0")/helpers.sh"
 make_test_key
 start_stub
-cat > "$WATCHDOG_CONFIG_DIR/config" <<CFG
-WATCHDOG_URL=$STUB_URL
+cat > "$GITZILLA_CONFIG_DIR/config" <<CFG
+GITZILLA_URL=$STUB_URL
 OWNER=alice
 NOTE_PUBKEY_FILE=$T/key.pub
 TZ_LOCAL=UTC
@@ -40,7 +40,7 @@ assert_eq "/note" "$(echo "$req" | jq -r .path)" "path"
 body="$(echo "$req" | jq -r .body)"
 echo "$body" | jq -r .payload | base64 -d > "$T/payload"
 echo "$body" | jq -r .sig > "$T/sig"
-ssh-keygen -Y verify -f "$T/allowed_signers" -I test-owner -n account-watchdog-note -s "$T/sig" < "$T/payload" >/dev/null 2>&1
+ssh-keygen -Y verify -f "$T/allowed_signers" -I test-owner -n gitzilla-note -s "$T/sig" < "$T/payload" >/dev/null 2>&1
 assert_eq 0 "$?" "signature verifies"
 assert_eq "alice/repo" "$(jq -r .repo "$T/payload")" "repo"
 assert_eq "refs/heads/main" "$(jq -r .ref "$T/payload")" "ref"
@@ -95,7 +95,7 @@ assert_eq 0 "$(cat "$T/rc")" "fail-fast: exit 0"
 assert_eq 1 "$(wc -l < "$T/curl.calls" | tr -d ' ')" "fail-fast: one curl for three refs"
 assert_eq 3 "$(grep -c 'note not sent (worker unreachable) — this push will raise a warning' "$T/err" | tr -d ' ')" "fail-fast: every ref warned"
 # a non-unreachable failure (HTTP error) does not skip the rest
-start_stub; sed -i.bak "s#^WATCHDOG_URL=.*#WATCHDOG_URL=$STUB_URL#" "$WATCHDOG_CONFIG_DIR/config"
+start_stub; sed -i.bak "s#^GITZILLA_URL=.*#GITZILLA_URL=$STUB_URL#" "$GITZILLA_CONFIG_DIR/config"
 echo 500 > "$STUB_STATUS_FILE"; : > "$STUB_LOG"
 printf 'refs/heads/a %s refs/heads/a %s\nrefs/heads/b %s refs/heads/b %s\n' "$SHA" "$OLD" "$SHA" "$OLD" | run_note git@github.com:Alice/Repo.git
 assert_eq 2 "$(lines)" "fail-fast: HTTP errors still try every ref"
@@ -103,7 +103,7 @@ rm -f "$STUB_STATUS_FILE"; stop_stub
 
 # multi-line push: two branches + tag, plus a new branch (old_sha zeros)
 rm -f "$STUB_STATUS_FILE"; start_stub
-sed -i.bak "s#^WATCHDOG_URL=.*#WATCHDOG_URL=$STUB_URL#" "$WATCHDOG_CONFIG_DIR/config"
+sed -i.bak "s#^GITZILLA_URL=.*#GITZILLA_URL=$STUB_URL#" "$GITZILLA_CONFIG_DIR/config"
 verify_all() { # expected count
   assert_eq "$1" "$(lines)" "note count"
   i=0
@@ -111,7 +111,7 @@ verify_all() { # expected count
     i=$((i+1))
     echo "$l" | jq -r .body | jq -r .payload | base64 -d > "$T/p$i"
     echo "$l" | jq -r .body | jq -r .sig > "$T/s$i"
-    ssh-keygen -Y verify -f "$T/allowed_signers" -I test-owner -n account-watchdog-note -s "$T/s$i" < "$T/p$i" >/dev/null 2>&1
+    ssh-keygen -Y verify -f "$T/allowed_signers" -I test-owner -n gitzilla-note -s "$T/s$i" < "$T/p$i" >/dev/null 2>&1
     assert_eq 0 "$?" "multi sig $i verifies"
   done < "$STUB_LOG"
 }
@@ -143,7 +143,7 @@ assert_eq 0 "$?" "mirror receives commit with GIT_DIR set"
 stop_stub
 
 # not configured
-rm "$WATCHDOG_CONFIG_DIR/config"
+rm "$GITZILLA_CONFIG_DIR/config"
 echo "refs/heads/main $SHA refs/heads/main $OLD" | run_note git@github.com:Alice/Repo.git
 assert_eq 0 "$(cat "$T/rc")" "unconfigured exit 0"
 assert_contains "$(cat "$T/err")" "not configured" "unconfigured reason"

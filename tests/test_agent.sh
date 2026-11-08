@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 . "$(dirname "$0")/helpers.sh"
 make_test_key
-STATE="$WATCHDOG_STATE_DIR"
+STATE="$GITZILLA_STATE_DIR"
 export STUB_EVENTS="$T/events.json" STUB_HEALTH_FILE="$T/health.status"
 export STUB_PAGE=40 STUB_QUEUE_CTL="$T/ctl.json"
 export TMPDIR="$T/tmpdir"; mkdir -p "$TMPDIR"
 start_stub
-cat > "$WATCHDOG_CONFIG_DIR/config" <<CFG
-WATCHDOG_URL=$STUB_URL
+cat > "$GITZILLA_CONFIG_DIR/config" <<CFG
+GITZILLA_URL=$STUB_URL
 OWNER=alice
 NOTE_PUBKEY_FILE=$T/key.pub
 TZ_LOCAL=UTC
@@ -17,9 +17,9 @@ S1=1111111111111111111111111111111111111111
 S2=2222222222222222222222222222222222222222
 
 export ALLOWED_SIGNERS_FILE="$T/allowed_signers"
-export WATCHDOG_REMOTE_URL_TEMPLATE="$T/remotes/%s.git"
-export WATCHDOG_NOTIFY_CMD="$T/notify.sh" WATCHDOG_RESTORE_CMD="$T/restore.sh"
-export WATCHDOG_SCAN_CMD="$T/scan-ok.sh"
+export GITZILLA_REMOTE_URL_TEMPLATE="$T/remotes/%s.git"
+export GITZILLA_NOTIFY_CMD="$T/notify.sh" GITZILLA_RESTORE_CMD="$T/restore.sh"
+export GITZILLA_SCAN_CMD="$T/scan-ok.sh"
 printf '#!/bin/sh\necho "$@" >> "%s/notify.log"\n' "$T" > "$T/notify.sh"
 printf '#!/bin/sh\necho "$@" >> "%s/restore.log"\n' "$T" > "$T/restore.sh"
 printf '#!/bin/sh\nexit 0\n' > "$T/scan-ok.sh"
@@ -47,12 +47,12 @@ assert_eq "no" "$([ -e "$STATE/incidents" ] && ls "$STATE/incidents" | grep -q .
 assert_eq 0 "$(nlines "$T/notify.log")" "silent: no notification"
 first="$(head -n1 "$STUB_LOG")"
 assert_contains "$(echo "$first" | jq -r .path)" "/queue?after=0" "silent: first request after=0"
-hdr="$(echo "$first" | jq -r '.headers["x-watchdog-auth"]')"
+hdr="$(echo "$first" | jq -r '.headers["x-gitzilla-auth"]')"
 printf '%s' "${hdr%%.*}" | base64 -d > "$T/hdr.msg"
 printf '%s' "${hdr#*.}" | base64 -d > "$T/hdr.sig"
 assert_contains "$(cat "$T/hdr.msg")" '"ts":' "auth: payload has ts"
-ssh-keygen -Y check-novalidate -n account-watchdog-queue -s "$T/hdr.sig" < "$T/hdr.msg" >/dev/null 2>&1
-assert_eq 0 "$?" "auth: signature verifies in namespace account-watchdog-queue"
+ssh-keygen -Y check-novalidate -n gitzilla-queue -s "$T/hdr.sig" < "$T/hdr.msg" >/dev/null 2>&1
+assert_eq 0 "$?" "auth: signature verifies in namespace gitzilla-queue"
 assert_eq "no" "$([ -e "$STATE/poll.lock" ] && echo yes || echo no)" "lock: released after poll"
 assert_eq 0 "$(ls "$TMPDIR" | wc -l | tr -d ' ')" "tmp: no temp dir left behind"
 # second poll resumes after cursor, no events
@@ -289,7 +289,7 @@ git -C "$W" push -q "$T/remotes/alice/app.git" ":refs/heads/tagged-new" ":refs/t
 reset_state
 printf '#!/bin/sh\nkill -9 $PPID\nexit 0\n' > "$T/scan-kill.sh"; chmod +x "$T/scan-kill.sh"
 ev 1 alice/app refs/heads/main $BASE $SIGNED warning | set_events
-WATCHDOG_SCAN_CMD="$T/scan-kill.sh" poll 2>/dev/null
+GITZILLA_SCAN_CMD="$T/scan-kill.sh" poll 2>/dev/null
 assert_contains "$(jq -c '.[0].flags' "$STATE/incidents/1.json")" check-failed "dead deep_check: check-failed"
 assert_eq warning "$(jq -r '.[0].level' "$STATE/incidents/1.json")" "dead deep_check: level unchanged"
 reset_state
@@ -313,9 +313,9 @@ assert_eq 0 "$(nlines "$T/restore.log")" "fetch failure: no restore"
 mv "$T/remotes/alice/app.git.away" "$T/remotes/alice/app.git"
 # scan-failed also mentioned
 reset_state
-WATCHDOG_SCAN_CMD="$T/nonexistent-scan" poll
+GITZILLA_SCAN_CMD="$T/nonexistent-scan" poll
 ev 1 alice/app refs/heads/main $BASE $SIGNED warning | set_events
-WATCHDOG_SCAN_CMD="$T/nonexistent-scan" poll
+GITZILLA_SCAN_CMD="$T/nonexistent-scan" poll
 assert_contains "$(jq -c '.[0].flags' "$STATE/incidents/1.json")" scan-failed "scan-failed: flag"
 assert_contains "$(cat "$T/notify.log")" "1 could not be deep-checked" "scan-failed: notification mentions count"
 
@@ -324,15 +324,15 @@ reset_state
 ev 1 alice/app refs/heads/main $SIGNED $UNSIGNED warning | set_events
 printf '#!/bin/sh\nif [ ! -e "%s/crashed" ]; then touch "%s/crashed"; kill -9 $PPID; exit 0; fi\necho "$@" >> "%s/notify.log"\n' "$T" "$T" "$T" > "$T/notify-crash.sh"
 chmod +x "$T/notify-crash.sh"; rm -f "$T/crashed"
-WATCHDOG_NOTIFY_CMD="$T/notify-crash.sh" bash "$AGENT" poll >/dev/null 2>&1
+GITZILLA_NOTIFY_CMD="$T/notify-crash.sh" bash "$AGENT" poll >/dev/null 2>&1
 assert_eq 1 "$(cat "$STATE/queue-cursor")" "crash: cursor already advanced"
 assert_eq "yes" "$([ -e "$STATE/incidents/1.pending" ] && echo yes || echo no)" "crash: pending marker left"
 assert_eq 0 "$(nlines "$T/notify.log")" "crash: nothing notified yet"
-WATCHDOG_NOTIFY_CMD="$T/notify-crash.sh" poll
+GITZILLA_NOTIFY_CMD="$T/notify-crash.sh" poll
 assert_eq 1 "$(nlines "$T/notify.log")" "crash: notify re-issued once"
 assert_eq 1 "$(nlines "$T/restore.log")" "crash: restore re-issued once"
 assert_eq "no" "$([ -e "$STATE/incidents/1.pending" ] && echo yes || echo no)" "crash: pending cleared"
-WATCHDOG_NOTIFY_CMD="$T/notify-crash.sh" poll
+GITZILLA_NOTIFY_CMD="$T/notify-crash.sh" poll
 assert_eq 1 "$(nlines "$T/notify.log")" "crash: not repeated on later poll"
 assert_eq 1 "$(nlines "$T/restore.log")" "crash: restore not repeated"
 reset_state
@@ -344,10 +344,10 @@ assert_eq "no" "$([ -e "$STATE/incidents/1.pending" ] && echo yes || echo no)" "
 reset_state
 ev 1 alice/app refs/heads/main $SIGNED $UNSIGNED warning | set_events
 printf '#!/bin/sh\necho "$@" >> "%s/restore.log"\nexit 3\n' "$T" > "$T/restore3.sh"; chmod +x "$T/restore3.sh"
-WATCHDOG_RESTORE_CMD="$T/restore3.sh" poll
+GITZILLA_RESTORE_CMD="$T/restore3.sh" poll
 assert_eq 1 "$(nlines "$T/restore.log")" "timeout: restore called"
 assert_eq "yes" "$([ -e "$STATE/incidents/1.pending" ] && echo yes || echo no)" "timeout: pending kept on exit 3"
-WATCHDOG_RESTORE_CMD="$T/restore3.sh" poll
+GITZILLA_RESTORE_CMD="$T/restore3.sh" poll
 assert_eq 2 "$(nlines "$T/restore.log")" "timeout: re-delivered on next poll"
 assert_eq "yes" "$([ -e "$STATE/incidents/1.pending" ] && echo yes || echo no)" "timeout: still pending while unanswered"
 poll
@@ -359,7 +359,7 @@ assert_eq 3 "$(nlines "$T/restore.log")" "timeout: not repeated after answered"
 # --- 3e. two incidents: first pending after an unanswered prompt, second created next poll => ONE restore call with both
 reset_state
 ev 1 alice/app refs/heads/main $SIGNED $UNSIGNED warning | set_events
-WATCHDOG_RESTORE_CMD="$T/restore3.sh" poll
+GITZILLA_RESTORE_CMD="$T/restore3.sh" poll
 assert_eq 1 "$(nlines "$T/restore.log")" "batch: first restore call"
 { ev 1 alice/app refs/heads/main $SIGNED $UNSIGNED warning; ev 2 alice/app refs/heads/main $UNSIGNED $S2 critical; } | set_events
 poll
@@ -369,9 +369,9 @@ assert_eq 0 "$(ls "$STATE/incidents" | grep -c pending | tr -d ' ')" "batch: all
 # exit 3 keeps every marker
 reset_state
 ev 1 alice/app refs/heads/main $SIGNED $UNSIGNED warning | set_events
-WATCHDOG_RESTORE_CMD="$T/restore3.sh" poll
+GITZILLA_RESTORE_CMD="$T/restore3.sh" poll
 { ev 1 alice/app refs/heads/main $SIGNED $UNSIGNED warning; ev 2 alice/app refs/heads/main $UNSIGNED $S2 critical; } | set_events
-WATCHDOG_RESTORE_CMD="$T/restore3.sh" poll
+GITZILLA_RESTORE_CMD="$T/restore3.sh" poll
 assert_eq 2 "$(ls "$STATE/incidents" | grep -c pending | tr -d ' ')" "batch: exit 3 keeps both markers"
 
 # --- 3f. leftover warning-only pending incident + new critical incident => restore gets BOTH files
@@ -402,20 +402,20 @@ git -C "$P3W" push -q "$P3O" "$P3A1:refs/heads/main"             # attacker's fi
 # poll 1: only A1 is known; the mirror cannot be reached (owner away, Touch ID unanswered)
 p3ev 1 "$P3S" "$P3A1" warning | set_events
 mv "$P3O" "$P3O.off"
-WATCHDOG_RESTORE_CMD="$WD_ROOT/bin/restore" WATCHDOG_DIALOG_CMD="$T/dialog-restore.sh" poll
+GITZILLA_RESTORE_CMD="$WD_ROOT/bin/restore" GITZILLA_DIALOG_CMD="$T/dialog-restore.sh" poll
 mv "$P3O.off" "$P3O"
 assert_contains "$(jq -c '.[0].flags' "$STATE/incidents/1.json")" check-failed "P3: poll 1 check-failed"
 assert_eq warning "$(jq -r '.[0].level' "$STATE/incidents/1.json")" "P3: poll 1 stays a warning"
 assert_eq held "$(cat "$STATE/incidents/1.pending" 2>/dev/null)" "P3: marker of the unchecked warning is kept (held)"
 assert_eq 1 "$(nlines "$T/notify.log")" "P3: warning notified once"
 # a quiet poll: the held incident is not re-notified and no restore runs
-WATCHDOG_RESTORE_CMD="$WD_ROOT/bin/restore" WATCHDOG_DIALOG_CMD="$T/dialog-restore.sh" poll
+GITZILLA_RESTORE_CMD="$WD_ROOT/bin/restore" GITZILLA_DIALOG_CMD="$T/dialog-restore.sh" poll
 assert_eq 1 "$(nlines "$T/notify.log")" "P3: held incident not re-notified"
 assert_eq held "$(cat "$STATE/incidents/1.pending" 2>/dev/null)" "P3: still held"
 # poll 2: A2 arrives (critical); the real restore runs over both incidents
 git -C "$P3W" push -q "$P3O" "$P3A2:refs/heads/main"             # attacker's second push
 { p3ev 1 "$P3S" "$P3A1" warning; p3ev 2 "$P3A1" "$P3A2" critical; } | set_events
-WATCHDOG_RESTORE_CMD="$WD_ROOT/bin/restore" WATCHDOG_DIALOG_CMD="$T/dialog-restore.sh" poll
+GITZILLA_RESTORE_CMD="$WD_ROOT/bin/restore" GITZILLA_DIALOG_CMD="$T/dialog-restore.sh" poll
 assert_eq "$P3S" "$(git --git-dir="$P3O" rev-parse refs/heads/main)" "P3: origin main back at the owner's S, not A1"
 assert_eq 1 "$(jq '.restored|length' "$STATE/incidents/2.json.result.json")" "P3: result lists the restore"
 assert_eq 0 "$(ls "$STATE/incidents" | grep -c pending | tr -d ' ')" "P3: markers cleared after the restore run"
@@ -444,10 +444,10 @@ reset_state; echo 5 > "$STATE/queue-cursor"
 { ev 9 alice/app refs/heads/main $S1 $S2 silent; ev 10 alice/app refs/heads/dev $Z $S1 silent; } | set_events
 poll
 assert_eq 1 "$(nlines "$T/notify.log")" "I4: one notification for the gap"
-assert_contains "$(cat "$T/notify.log")" "Account watchdog: CRITICAL" "I4: critical"
+assert_contains "$(cat "$T/notify.log")" "gitzilla: CRITICAL" "I4: critical"
 assert_contains "$(cat "$T/notify.log")" "3 event(s) were lost while this Mac was offline — check phone/Slack alerts and run \`reconcile all\`" "I4: message"
 case "$(cat "$T/notify.log")" in *"revoke tokens at https://github.com/settings/applications") _ok ;; *) _bad "I4: ends with the revoke line" ;; esac
-assert_contains "$(cat "$STATE/log/watchdog.log")" "3 event(s) lost" "I4: logged"
+assert_contains "$(cat "$STATE/log/gitzilla.log")" "3 event(s) lost" "I4: logged"
 assert_eq 10 "$(cat "$STATE/queue-cursor")" "I4: events after the gap processed"
 poll
 assert_eq 1 "$(nlines "$T/notify.log")" "I4: not repeated"
@@ -479,13 +479,13 @@ case "$(cat "$T/notify.log")" in *"revoke tokens at https://github.com/settings/
 # --- 4. payload via the bundled scanner (the agent's default SCAN)
 REAL_SCAN="$WD_ROOT/scanner/scan.sh"
 if [ -f "$REAL_SCAN" ] && [ -n "$NODE_BIN" ]; then
-  unset WATCHDOG_SCAN_CMD # the default must be the bundled scanner
+  unset GITZILLA_SCAN_CMD # the default must be the bundled scanner
   reset_state
   ev 1 alice/app refs/heads/stager $BASE $STAGER warning | set_events
   PATH="$(dirname "$NODE_BIN"):$PATH" poll
   assert_contains "$(jq -c '.[0].flags' "$STATE/incidents/1.json")" payload "payload: flag"
   assert_eq critical "$(jq -r '.[0].level' "$STATE/incidents/1.json")" "payload: critical"
-  export WATCHDOG_SCAN_CMD="$T/scan-ok.sh"
+  export GITZILLA_SCAN_CMD="$T/scan-ok.sh"
 else
   _bad "payload: $REAL_SCAN or a usable node not found"
 fi
@@ -503,10 +503,10 @@ assert_eq 1 "$(cat "$STATE/queue-cursor")" "disarmed: cursor"
 # --- 6. queue failure: cursor not advanced, nonzero exit
 reset_state
 ev 1 alice/app refs/heads/main $S1 $S2 silent | set_events
-cp "$WATCHDOG_CONFIG_DIR/config" "$T/config.bak"
-sed 's|^WATCHDOG_URL=.*|WATCHDOG_URL=http://127.0.0.1:1|' "$T/config.bak" > "$WATCHDOG_CONFIG_DIR/config"
+cp "$GITZILLA_CONFIG_DIR/config" "$T/config.bak"
+sed 's|^GITZILLA_URL=.*|GITZILLA_URL=http://127.0.0.1:1|' "$T/config.bak" > "$GITZILLA_CONFIG_DIR/config"
 bash "$AGENT" poll >/dev/null 2>&1; rc=$?
-cp "$T/config.bak" "$WATCHDOG_CONFIG_DIR/config"
+cp "$T/config.bak" "$GITZILLA_CONFIG_DIR/config"
 assert_eq 1 "$rc" "unreachable: exit 1"
 assert_eq "no" "$([ -e "$STATE/queue-cursor" ] && echo yes || echo no)" "unreachable: no cursor"
 
@@ -547,7 +547,7 @@ assert_eq "no" "$([ -e "$STATE/queue-notified" ] && echo yes || echo no)" "M8: n
 # a signing failure counts too
 reset_state
 echo $(( $(date +%s) - 7200 )) > "$STATE/queue-fail-since"
-WATCHDOG_SIGN_KEY="$T/nonexistent-key" poll
+GITZILLA_SIGN_KEY="$T/nonexistent-key" poll
 assert_eq "yes" "$([ -s "$STATE/queue-fail-since" ] && echo yes || echo no)" "M8: signing failure keeps the failure time"
 bash "$AGENT" health >/dev/null 2>&1
 assert_eq 1 "$(nlines "$T/notify.log")" "M8: signing failure notified"

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 . "$(dirname "$0")/helpers.sh"
-STATE="$WATCHDOG_STATE_DIR"
-cat > "$WATCHDOG_CONFIG_DIR/config" <<CFG
-WATCHDOG_URL=http://127.0.0.1:1
+STATE="$GITZILLA_STATE_DIR"
+cat > "$GITZILLA_CONFIG_DIR/config" <<CFG
+GITZILLA_URL=http://127.0.0.1:1
 OWNER=Alice
 CFG
 NOW=1760000000
@@ -14,12 +14,12 @@ SSHD="$HOME/.ssh"
 SEC="$T/secretive"
 
 # Every external command is a stub; nothing here can reach the real ~/.ssh, gh, clipboard, Secretive or Terminal.
-export WATCHDOG_NOW=$NOW WATCHDOG_POLL_INTERVAL=0 WATCHDOG_POLL_TIMEOUT=3 WATCHDOG_SEED_RETRY_SLEEP=0
-export WATCHDOG_OPEN_CMD="$T/open.sh" WATCHDOG_PBPASTE_CMD="$T/pbpaste.sh" WATCHDOG_PBCOPY_CMD="$T/pbcopy.sh"
-export WATCHDOG_GH_CMD="$T/gh.sh" WATCHDOG_CURL="$T/curl.sh" WATCHDOG_DIALOG_CMD="$T/dialog.sh"
-export WATCHDOG_TERMINAL_CMD="$T/terminal.sh" WATCHDOG_SECRETIVE_DIR="$SEC" WATCHDOG_SSH_CMD="$T/ssh.sh"
-export WATCHDOG_SSH_ADD="$T/sshadd.sh" WATCHDOG_NOTIFY_CMD="$T/notify.sh"
-export WATCHDOG_REMOTE_URL_TEMPLATE="$T/remote/%s.git"
+export GITZILLA_NOW=$NOW GITZILLA_POLL_INTERVAL=0 GITZILLA_POLL_TIMEOUT=3 GITZILLA_SEED_RETRY_SLEEP=0
+export GITZILLA_OPEN_CMD="$T/open.sh" GITZILLA_PBPASTE_CMD="$T/pbpaste.sh" GITZILLA_PBCOPY_CMD="$T/pbcopy.sh"
+export GITZILLA_GH_CMD="$T/gh.sh" GITZILLA_CURL="$T/curl.sh" GITZILLA_DIALOG_CMD="$T/dialog.sh"
+export GITZILLA_TERMINAL_CMD="$T/terminal.sh" GITZILLA_SECRETIVE_DIR="$SEC" GITZILLA_SSH_CMD="$T/ssh.sh"
+export GITZILLA_SSH_ADD="$T/sshadd.sh" GITZILLA_NOTIFY_CMD="$T/notify.sh"
+export GITZILLA_REMOTE_URL_TEMPLATE="$T/remote/%s.git"
 
 printf '#!/bin/sh\necho "$*" >> "%s/open.log"\n[ -f "%s/lockswap.flag" ] && echo 99999999 > "%s/rotate.lock/pid"\nexit 0\n' "$T" "$T" "$STATE" > "$T/open.sh"
 printf '#!/bin/sh\necho "$@" >> "%s/terminal.log"\n' "$T" > "$T/terminal.sh"
@@ -283,7 +283,7 @@ echo '[{"nameWithOwner":"Alice/Foo","visibility":"PUBLIC"}]' > "$T/gh.repos.json
 echo "$OLDTOK" > "$T/gh.token"; echo "$NEWTOK" > "$T/clip"
 mkdir -p "$STATE/poll.lock"; ( sleep 2; rmdir "$STATE/poll.lock" ) &
 setrot '{gh:{last:0,step:null,snooze_until:0}}'
-WATCHDOG_SEED_RETRY_SLEEP=1 runin '\n' gh
+GITZILLA_SEED_RETRY_SLEEP=1 runin '\n' gh
 wait
 assert_eq "alice/foo" "$(cat "$STATE/seeded.txt")" "seed retry: seeded on a later attempt"
 assert_eq 0 "$(nlines "$T/notify.log")" "seed retry: no notification"

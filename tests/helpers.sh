@@ -15,9 +15,9 @@ mkdir -p "$HOME"
 export GIT_CONFIG_GLOBAL="$T/gitconfig"
 export GIT_CONFIG_NOSYSTEM=1
 printf '[user]\n\tname = Test\n\temail = test@example.com\n' > "$GIT_CONFIG_GLOBAL"
-export WATCHDOG_CONFIG_DIR="$T/config"
-export WATCHDOG_STATE_DIR="$T/state"
-mkdir -p "$WATCHDOG_CONFIG_DIR" "$WATCHDOG_STATE_DIR"
+export GITZILLA_CONFIG_DIR="$T/config"
+export GITZILLA_STATE_DIR="$T/state"
+mkdir -p "$GITZILLA_CONFIG_DIR" "$GITZILLA_STATE_DIR"
 unset SSH_AUTH_SOCK GIT_SSH_COMMAND
 
 PASS=0; FAIL=0
@@ -34,7 +34,7 @@ finish() { echo "  $PASS passed, $FAIL failed"; [ "$FAIL" -eq 0 ]; }
 # Test signing key + allowed_signers.
 make_test_key() {
   ssh-keygen -q -t ed25519 -N '' -C test -f "$T/key" >/dev/null
-  export WATCHDOG_SIGN_KEY="$T/key"
+  export GITZILLA_SIGN_KEY="$T/key"
   echo "test-owner $(cut -d' ' -f1,2 "$T/key.pub")" > "$T/allowed_signers"
 }
 

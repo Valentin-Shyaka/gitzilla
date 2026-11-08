@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# account-watchdog bundled scanner: polin-guard plus a few extra checks, run on pushed commits by the standalone
+# gitzilla bundled scanner: polin-guard plus a few extra checks, run on pushed commits by the standalone
 # pre-push hook (hooks/pre-push) and by the Mac agent's deep check (bin/agent).
 # READ-ONLY: never executes repo content. Exit 0 clean · 1 findings · 2 error.
 #
@@ -16,7 +16,7 @@ G="$(cd "$(dirname "$0")" && pwd)"
 NODE=""
 [ -f "$G/node-path" ] && NODE="$(head -n1 "$G/node-path" 2>/dev/null)"
 [ -n "$NODE" ] && [ -x "$NODE" ] || NODE="$(command -v node 2>/dev/null)"
-[ -n "$NODE" ] && [ -x "$NODE" ] || { echo "account-watchdog scanner: node not found — cannot scan" >&2; exit 2; }
+[ -n "$NODE" ] && [ -x "$NODE" ] || { echo "gitzilla scanner: node not found — cannot scan" >&2; exit 2; }
 
 ZERO=0000000000000000000000000000000000000000
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/aw-scan.XXXXXX")"; trap 'rm -rf "$tmp"' EXIT
@@ -62,12 +62,12 @@ find "$tmp/w" -name .polinguardrc.json -delete
 pgerr=0
 ( cd "$tmp/w" && find . -type f -print0 | PGM="$tmp" xargs -0 sh -c '"$0" "$@"; r=$?
     case "$r" in 0) exit 0 ;; 1) : > "$PGM/.pg-found"; exit 1 ;; esac
-    : > "$PGM/.pg-err"; echo "account-watchdog scanner: polin-guard could not run (node exit $r)" >&2; exit 1' \
+    : > "$PGM/.pg-err"; echo "gitzilla scanner: polin-guard could not run (node exit $r)" >&2; exit 1' \
     "$NODE" "$G/polin-guard/bin/cli.js" --quiet )
 pgx=$?
 [ -e "$tmp/.pg-found" ] && rc=1
 if [ -e "$tmp/.pg-err" ]; then pgerr=1
-elif [ "$pgx" -ne 0 ] && [ "$rc" -eq 0 ]; then pgerr=1; echo "account-watchdog scanner: could not start polin-guard (xargs exit $pgx)" >&2
+elif [ "$pgx" -ne 0 ] && [ "$rc" -eq 0 ]; then pgerr=1; echo "gitzilla scanner: could not start polin-guard (xargs exit $pgx)" >&2
 fi
 
 
@@ -88,5 +88,5 @@ while IFS= read -r -d '' f; do
 done < <(find "$tmp/w" -type f -print0)
 
 # findings win; otherwise a polin-guard that could not run makes the whole scan an error
-[ "$rc" -eq 0 ] && [ "$pgerr" = 1 ] && { echo "account-watchdog scanner: scan incomplete (node failed)" >&2; exit 2; }
+[ "$rc" -eq 0 ] && [ "$pgerr" = 1 ] && { echo "gitzilla scanner: scan incomplete (node failed)" >&2; exit 2; }
 exit $rc

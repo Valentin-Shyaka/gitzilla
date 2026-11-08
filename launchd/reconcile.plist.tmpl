@@ -7,13 +7,13 @@
   <array>
     <string>/bin/bash</string>
     <string>-c</string>
-    <string>"@WATCHDOG_HOME@/bin/reconcile" public &amp;&amp; "@WATCHDOG_HOME@/bin/reconcile" all</string>
+    <string>"@GITZILLA_HOME@/bin/reconcile" public &amp;&amp; "@GITZILLA_HOME@/bin/reconcile" all</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-    <key>WATCHDOG_STATE_DIR</key><string>@STATE@</string>
-    <key>WATCHDOG_CONFIG_DIR</key><string>@CONFIG@</string>
+    <key>GITZILLA_STATE_DIR</key><string>@STATE@</string>
+    <key>GITZILLA_CONFIG_DIR</key><string>@CONFIG@</string>
   </dict>
   <key>StartInterval</key><integer>3600</integer>
   <key>StandardOutPath</key><string>@STATE@/log/reconcile.out</string>

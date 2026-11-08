@@ -8,12 +8,12 @@ rm -f key key.pub other other.pub msg.txt msg.txt.sig msg.sig note-ok.json note-
 ssh-keygen -q -t ecdsa -b 256 -N '' -C fixture -f key
 ssh-keygen -q -t ecdsa -b 256 -N '' -C other -f other
 printf 'hello watchdog' > msg.txt
-ssh-keygen -Y sign -f key -n account-watchdog-note msg.txt
+ssh-keygen -Y sign -f key -n gitzilla-note msg.txt
 mv msg.txt.sig msg.sig
 
 # Signed push notes (Mac -> Worker wire format). ts is fixed: 2100-01-01T00:00:00Z, far future so a pinned test clock stays ahead of real time and DO alarms are never clamped to "now".
 printf '%s' '{"repo":"owner/name","ref":"refs/heads/main","old_sha":"1111111111111111111111111111111111111111","new_sha":"2222222222222222222222222222222222222222","ts":4102444800,"nonce":"0123456789abcdef0123456789abcdef"}' > note-payload.json
-ssh-keygen -Y sign -f key -n account-watchdog-note note-payload.json
+ssh-keygen -Y sign -f key -n gitzilla-note note-payload.json
 # Tampered: same signature, payload altered after signing (new_sha changed).
 sed 's/2222222222222222222222222222222222222222/3333333333333333333333333333333333333333/' note-payload.json > note-tampered-payload.json
 python3 - <<'PY'
@@ -27,10 +27,10 @@ PY
 # Queue auth header values: base64(JSON).base64(armored SSHSIG over exactly those JSON bytes).
 # ts is fixed (same instant as the notes); tests pin the clock around it.
 printf '%s' '{"ts":4102444800}' > queue-payload.json
-ssh-keygen -Y sign -f key -n account-watchdog-queue queue-payload.json
+ssh-keygen -Y sign -f key -n gitzilla-queue queue-payload.json
 # Wrong namespace: signed as a note, must not authenticate the queue.
 cp queue-payload.json queue-wrongns-payload.json
-ssh-keygen -Y sign -f key -n account-watchdog-note queue-wrongns-payload.json
+ssh-keygen -Y sign -f key -n gitzilla-note queue-wrongns-payload.json
 python3 - <<'PY'
 import base64
 b = lambda x: base64.b64encode(x).decode()
@@ -42,7 +42,7 @@ open("queue-auth-tampered.txt", "w").write(b(b'{"ts":4102444801}') + "." + b(sig
 open("queue-auth-wrongns.txt", "w").write(b(rd("queue-wrongns-payload.json")) + "." + b(rd("queue-wrongns-payload.json.sig")))
 PY
 
-# Signed restore reports (POST /report). Namespace account-watchdog-report; ts fixed like the notes.
+# Signed restore reports (POST /report). Namespace gitzilla-report; ts fixed like the notes.
 python3 - <<'PY'
 import json
 B = {"ts": 4102444800, "nonce": "0123456789abcdef0123456789abcdef"}
@@ -84,11 +84,11 @@ for k, v in cases.items():
 PY
 for f in report-*-payload.json; do
   n=${f#report-}; n=${n%-payload.json}
-  ssh-keygen -Y sign -f key -n account-watchdog-report "$f"
+  ssh-keygen -Y sign -f key -n gitzilla-report "$f"
 done
 # Wrong namespace: same payload as ok, signed as a note.
 cp report-ok-payload.json report-wrongns-payload.json
-ssh-keygen -Y sign -f key -n account-watchdog-note -q report-wrongns-payload.json
+ssh-keygen -Y sign -f key -n gitzilla-note -q report-wrongns-payload.json
 sed 's/owner\/name/owner\/evil/' report-ok-payload.json > report-tampered-payload.json
 python3 - <<'PY'
 import base64, glob, json
@@ -105,7 +105,7 @@ big = len(rd("report-big.json"))
 assert 7000 < big <= 7600, big
 PY
 
-# Signed account alerts (POST /alert). Namespace account-watchdog-alert; same nonce as report-ok on purpose
+# Signed account alerts (POST /alert). Namespace gitzilla-alert; same nonce as report-ok on purpose
 # (the nonce store is shared across routes).
 python3 - <<'PY'
 import json
@@ -141,12 +141,12 @@ for k, v in cases.items():
     open("alert-%s-payload.json" % k, "w").write(json.dumps(v, separators=(",", ":")))
 PY
 for f in alert-*-payload.json; do
-  ssh-keygen -q -Y sign -f key -n account-watchdog-alert "$f"
+  ssh-keygen -q -Y sign -f key -n gitzilla-alert "$f"
 done
 # Wrong namespace: same payload as newkey, signed as a report.
 cp alert-newkey-payload.json alert-wrongns-payload.json
 rm -f alert-wrongns-payload.json.sig
-ssh-keygen -q -Y sign -f key -n account-watchdog-report alert-wrongns-payload.json
+ssh-keygen -q -Y sign -f key -n gitzilla-report alert-wrongns-payload.json
 sed 's/ssh-ed25519/ssh-rsa/' alert-newkey-payload.json > alert-tampered-payload.json
 python3 - <<'PY'
 import base64, glob

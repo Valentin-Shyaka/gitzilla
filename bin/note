@@ -10,9 +10,9 @@ slug="$(repo_slug "$url")"
 ZERO=0000000000000000000000000000000000000000
 
 owner="$(printf '%s' "${OWNER:-}" | tr '[:upper:]' '[:lower:]')"
-if [ -n "$slug" ] && { [ -z "$owner" ] || [ -z "${WATCHDOG_URL:-}" ]; }; then
+if [ -n "$slug" ] && { [ -z "$owner" ] || [ -z "${GITZILLA_URL:-}" ]; }; then
   wd_log "not configured; note skipped for $slug"
-  echo "account-watchdog: note not sent (not configured) — this push will raise a warning" >&2
+  echo "gitzilla: note not sent (not configured) — this push will raise a warning" >&2
 elif [ -n "$slug" ] && [ "${slug%%/*}" = "$owner" ]; then
   top="$(git rev-parse --show-toplevel 2>/dev/null || git rev-parse --absolute-git-dir 2>/dev/null)"
   mirror="$(mirror_path "$slug")"
@@ -23,10 +23,10 @@ elif [ -n "$slug" ] && [ "${slug%%/*}" = "$owner" ]; then
     if [ "$dead" = 1 ]; then
       WD_REASON="worker unreachable"
       wd_log "note skipped for $slug $rref: $WD_REASON"
-      echo "account-watchdog: note not sent ($WD_REASON) — this push will raise a warning" >&2
+      echo "gitzilla: note not sent ($WD_REASON) — this push will raise a warning" >&2
     elif ! wd_send_note "$slug" "$rref" "$rsha" "$lsha" </dev/null; then
       wd_log "note failed for $slug $rref: $WD_REASON"
-      echo "account-watchdog: note not sent ($WD_REASON) — this push will raise a warning" >&2
+      echo "gitzilla: note not sent ($WD_REASON) — this push will raise a warning" >&2
       [ "$WD_REASON" = "worker unreachable" ] && dead=1
     fi
     if [ "$lsha" != "$ZERO" ] && [ -d "$mirror" ] && [ -n "$top" ]; then

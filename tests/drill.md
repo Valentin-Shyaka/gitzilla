@@ -1,7 +1,7 @@
 # Live drill
 
-Run after `install.sh` has completed every step, in your drill repo (default `watchdog-drill`; the name is `DRILL_REPO`
-in `~/.config/account-watchdog/config`), with the owner present. For each row, note the time from `git push` returning to the alert arriving on the phone (ntfy), and
+Run after `install.sh` has completed every step, in your drill repo (default `gitzilla-drill`; the name is `DRILL_REPO`
+in `~/.config/gitzilla/config`), with the owner present. For each row, note the time from `git push` returning to the alert arriving on the phone (ntfy), and
 fill in the Result column (pass/fail, time, notes). A failed row needs a fix task before the watchdog counts as done.
 
 The payload sample is `tests/fixtures/stager.js.b64`. Outside the automated tests (which decode it into temp repos), base64-decode it inside the drill clone only (for example as

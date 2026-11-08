@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# account-watchdog standalone pre-push hook
-# Rendered by install.sh (hook step) from hooks/pre-push in the account-watchdog repo; rerunning that step refreshes it.
+# gitzilla standalone pre-push hook
+# Rendered by install.sh (hook step) from hooks/pre-push in the gitzilla repo; rerunning that step refreshes it.
 # Installed as the global hook (core.hooksPath) for people who have no polin-guard hook. On every push it:
 #   1. scans the pushed commits with the bundled scanner (scanner/scan.sh) and blocks the push on a finding,
 #      before any note is sent (new branch: only commits that are not on any remote). A scan that cannot run
 #      (exit 2) blocks too; `git push --no-verify` bypasses the hook;
 #   2. sends the signed push note (fail-open: a failure never blocks the push);
-#   3. runs the global hook that was here before (moved aside to pre-push.account-watchdog-prev by install.sh and
-#      called through account-watchdog-prev/pre-push, so it still sees the name pre-push), then the repo's own
+#   3. runs the global hook that was here before (moved aside to pre-push.gitzilla-prev by install.sh and
+#      called through gitzilla-prev/pre-push, so it still sees the name pre-push), then the repo's own
 #      hooks/pre-push in the common git dir (a global core.hooksPath makes git skip it; worktrees share it), each
 #      with the same stdin and arguments; a non-zero exit from either blocks the push with that status.
-# If the account-watchdog clone is gone, steps 1 and 2 are skipped (the push is allowed) and step 3 still runs.
-WATCHDOG_HOME="@WATCHDOG_HOME@"
+# If the gitzilla clone is gone, steps 1 and 2 are skipped (the push is allowed) and step 3 still runs.
+GITZILLA_HOME="@GITZILLA_HOME@"
 ZERO=0000000000000000000000000000000000000000
 # GUI git clients run hooks with a minimal PATH. Homebrew's dirs are APPENDED (fallbacks only), so the chained hooks
 # below still see the caller's PATH order (nvm, pyenv, mise, ... first). The scanner takes node from
@@ -19,7 +19,7 @@ ZERO=0000000000000000000000000000000000000000
 PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"; export PATH
 input="$(cat)"
 
-if [ -f "$WATCHDOG_HOME/scanner/scan.sh" ] && [ -x "$WATCHDOG_HOME/bin/note" ]; then
+if [ -f "$GITZILLA_HOME/scanner/scan.sh" ] && [ -x "$GITZILLA_HOME/bin/note" ]; then
   errf="$(mktemp "${TMPDIR:-/tmp}/aw-hook.XXXXXX")" || errf=/dev/null
   while read -r lref lsha rref rsha _rest; do
     [ -n "$lsha" ] || continue
@@ -31,29 +31,29 @@ if [ -f "$WATCHDOG_HOME/scanner/scan.sh" ] && [ -x "$WATCHDOG_HOME/bin/note" ]; 
       [ -n "$oldest" ] || continue # every commit is already on a remote
       base="$(git rev-parse -q --verify "$oldest^" 2>/dev/null)" || base=""
     fi
-    bash "$WATCHDOG_HOME/scanner/scan.sh" range "$base" "$lsha" </dev/null 2>"$errf"
+    bash "$GITZILLA_HOME/scanner/scan.sh" range "$base" "$lsha" </dev/null 2>"$errf"
     rc=$?
     [ "$errf" = /dev/null ] || cat "$errf" >&2
     case "$rc" in
       0) ;;
-      1) echo "account-watchdog: push of $lref BLOCKED by the scanner (findings above). No note was sent." >&2
+      1) echo "gitzilla: push of $lref BLOCKED by the scanner (findings above). No note was sent." >&2
          [ "$errf" = /dev/null ] || rm -f "$errf"; exit 1 ;;
       *) why="$(grep -v '^[[:space:]]*$' "$errf" 2>/dev/null | tail -n1)"
-         echo "account-watchdog: push of $lref BLOCKED: the scan could not run (${why:-scanner exit $rc})." >&2
-         echo "account-watchdog: fix that, or bypass this hook once with  git push --no-verify  (the push then raises an orange alert)." >&2
+         echo "gitzilla: push of $lref BLOCKED: the scan could not run (${why:-scanner exit $rc})." >&2
+         echo "gitzilla: fix that, or bypass this hook once with  git push --no-verify  (the push then raises an orange alert)." >&2
          [ "$errf" = /dev/null ] || rm -f "$errf"; exit 1 ;;
     esac
   done <<< "$input"
   [ "$errf" = /dev/null ] || rm -f "$errf"
 
-# account-watchdog: push note (fail-open)
-printf '%s\n' "$input" | "@WATCHDOG_HOME@/bin/note" "$@" || true
+# gitzilla: push note (fail-open)
+printf '%s\n' "$input" | "@GITZILLA_HOME@/bin/note" "$@" || true
 else
-  echo "account-watchdog: install dir $WATCHDOG_HOME not found — rerun install.sh from the new location, or remove the hook ($0). No scan, no note: this push will raise a warning." >&2
+  echo "gitzilla: install dir $GITZILLA_HOME not found — rerun install.sh from the new location, or remove the hook ($0). No scan, no note: this push will raise a warning." >&2
 fi
 
 here="$(cd "$(dirname "$0")" && pwd)"
-prev="$here/account-watchdog-prev/pre-push"
+prev="$here/gitzilla-prev/pre-push"
 if [ -x "$prev" ]; then
   printf '%s\n' "$input" | "$prev" "$@"
   rc=$?
