@@ -52,7 +52,7 @@ describe("POST /alert", () => {
     expect(n.topic).toBe("t0pic");
     expect(n.priority).toBe(5);
     expect(n.tags).toEqual(["rotating_light"]);
-    expect(n.title).toBe("🔴 Watchdog: new key on your GitHub account");
+    expect(n.title).toBe("🔴 gitzilla: new key on your GitHub account");
     expect(n.message).toBe([
       `New authentication key: ssh-ed25519 ${FP}`,
       "Time: 2100-01-01 00:00:00 UTC / 01/01/2100, 02:00:00 (Africa/Kigali)",
@@ -73,7 +73,7 @@ describe("POST /alert", () => {
     const [n] = sent(NTFY);
     expect(n.priority).toBe(3);
     expect(n.tags).toEqual(["warning"]);
-    expect(n.title).toBe("🟠 Watchdog: possible missed webhook");
+    expect(n.title).toBe("🟠 gitzilla: possible missed webhook");
     expect(n.message).toBe([
       "3 ref(s) in 2 repo(s) differ from the known heads (possible missed webhook).",
       "Time: 2100-01-01 00:00:00 UTC / 01/01/2100, 02:00:00 (Africa/Kigali)",

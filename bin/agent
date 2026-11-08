@@ -3,15 +3,15 @@
 # in local bare mirrors, groups them into one incident file, notifies, and hands critical pushes
 # to `restore --prompt`. Compatible with macOS bash 3.2.
 #
-# Env overrides (tests): WATCHDOG_NOTIFY_CMD, WATCHDOG_RESTORE_CMD, WATCHDOG_SCAN_CMD,
-# WATCHDOG_REMOTE_URL_TEMPLATE, ALLOWED_SIGNERS_FILE.
+# Env overrides (tests): GITZILLA_NOTIFY_CMD, GITZILLA_RESTORE_CMD, GITZILLA_SCAN_CMD,
+# GITZILLA_REMOTE_URL_TEMPLATE, ALLOWED_SIGNERS_FILE.
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$here/lib.sh"
-WATCHDOG_HOME="${WATCHDOG_HOME:-$(cd "$here/.." && pwd)}"
-RESTORE="${WATCHDOG_RESTORE_CMD:-$WATCHDOG_HOME/bin/restore}"
-SCAN="${WATCHDOG_SCAN_CMD:-$WATCHDOG_HOME/scanner/scan.sh}" # bundled scanner (WATCHDOG_HOME from the config)
+GITZILLA_HOME="${GITZILLA_HOME:-$(cd "$here/.." && pwd)}"
+RESTORE="${GITZILLA_RESTORE_CMD:-$GITZILLA_HOME/bin/restore}"
+SCAN="${GITZILLA_SCAN_CMD:-$GITZILLA_HOME/scanner/scan.sh}" # bundled scanner (GITZILLA_HOME from the config)
 SIGNERS="${ALLOWED_SIGNERS_FILE:-$(wd_allowed_signers)}" # gpg.ssh.allowedSignersFile, else ~/.config/git/allowed_signers
-REMOTE_TPL="${WATCHDOG_REMOTE_URL_TEMPLATE:-git@github.com:%s.git}"
+REMOTE_TPL="${GITZILLA_REMOTE_URL_TEMPLATE:-git@github.com:%s.git}"
 ZERO=0000000000000000000000000000000000000000
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR
 
@@ -28,12 +28,12 @@ queue_get() {
   local after="$1" out="$2" d msg sig code
   d="$(mktemp -d)" || return 1
   printf '{"ts":%s}' "$(date +%s)" > "$d/msg"
-  if ! sig="$(wd_sign account-watchdog-queue "$d/msg")"; then rm -rf "$d"; wd_log "queue: signing failed"; return 1; fi
+  if ! sig="$(wd_sign gitzilla-queue "$d/msg")"; then rm -rf "$d"; wd_log "queue: signing failed"; return 1; fi
   msg="$(base64 < "$d/msg" | tr -d '\n')"
   sig="$(printf '%s' "$sig" | base64 | tr -d '\n')"
   rm -rf "$d"
-  code="$(curl --max-time 10 -sS -o "$out" -w '%{http_code}' -H "X-Watchdog-Auth: $msg.$sig" \
-          "$WATCHDOG_URL/queue?after=$after" 2>/dev/null </dev/null)"
+  code="$(curl --max-time 10 -sS -o "$out" -w '%{http_code}' -H "X-Gitzilla-Auth: $msg.$sig" \
+          "$GITZILLA_URL/queue?after=$after" 2>/dev/null </dev/null)"
   [ "$code" = "200" ] || { wd_log "queue: HTTP ${code:-none}"; return 1; }
 }
 
@@ -136,7 +136,7 @@ check_lost() {
   [ "$oldest" -gt $((cursor + 1)) ] || return 0
   lost=$((oldest - cursor - 1))
   wd_log "queue: $lost event(s) lost (cursor $cursor, oldest retained $oldest)"
-  notify "Account watchdog: CRITICAL" "$lost event(s) were lost while this Mac was offline — check phone/Slack alerts and run \`reconcile all\`. $WD_REVOKE"
+  notify "gitzilla: CRITICAL" "$lost event(s) were lost while this Mac was offline — check phone/Slack alerts and run \`reconcile all\`. $WD_REVOKE"
   printf '%s\n' "$((oldest - 1))" | atomic_write "$STATE/queue-cursor"
 }
 
@@ -156,11 +156,11 @@ notify_incident() {
   if [ "$crit" -gt 0 ]; then
     msg="$total suspicious event(s) across $repos repo(s), $crit critical. Open the restore prompt."
     [ "$nofail" -gt 0 ] && msg="$msg $nofail could not be deep-checked."
-    notify "Account watchdog: CRITICAL" "$msg $WD_REVOKE"
+    notify "gitzilla: CRITICAL" "$msg $WD_REVOKE"
   else
     msg="$total event(s) across $repos repo(s) need review."
     [ "$nofail" -gt 0 ] && msg="$msg $nofail could not be deep-checked."
-    notify "Account watchdog: warning" "$msg $WD_REVOKE"
+    notify "gitzilla: warning" "$msg $WD_REVOKE"
   fi
 }
 
@@ -204,7 +204,7 @@ EOF_INCS
 }
 
 poll_main() {
-  if [ -z "${WATCHDOG_URL:-}" ]; then echo "agent: not configured" >&2; return 1; fi
+  if [ -z "${GITZILLA_URL:-}" ]; then echo "agent: not configured" >&2; return 1; fi
   mkdir -p "$STATE/incidents" || return 1
   # single instance; a lock whose owner is dead, or older than 30 min, is stale
   local lock="$STATE/poll.lock" opid
@@ -333,16 +333,16 @@ cmd_health() {
   case "$since" in
     ''|*[!0-9]*) ;;
     *) if [ $((now - since)) -gt 3600 ] && [ ! -e "$qmark" ]; then
-         notify "Account watchdog: queue unreadable" "The agent has not been able to read the Worker queue for over an hour (see log/watchdog.log)."
+         notify "gitzilla: queue unreadable" "The agent has not been able to read the Worker queue for over an hour (see log/gitzilla.log)."
          : > "$qmark"
        fi ;;
   esac
-  code="$(curl --max-time 10 -sS -o /dev/null -w '%{http_code}' "${WATCHDOG_URL:-http://invalid.invalid}/health" 2>/dev/null </dev/null)"
+  code="$(curl --max-time 10 -sS -o /dev/null -w '%{http_code}' "${GITZILLA_URL:-http://invalid.invalid}/health" 2>/dev/null </dev/null)"
   if [ "$code" = "200" ]; then rm -f "$f" "$mark"; return 0; fi
   since="$(cat "$f" 2>/dev/null)"
   case "$since" in ''|*[!0-9]*) echo "$now" > "$f"; return 1 ;; esac
   if [ $((now - since)) -gt 3600 ] && [ ! -e "$mark" ]; then
-    notify "Account watchdog: Worker unreachable" "The watchdog Worker has been failing its health check for over an hour."
+    notify "gitzilla: Worker unreachable" "The watchdog Worker has been failing its health check for over an hour."
     : > "$mark"
   fi
   return 1

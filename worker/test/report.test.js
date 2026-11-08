@@ -47,7 +47,7 @@ describe("POST /report", () => {
     vi.useFakeTimers(); setClock(0);
     expect((await post(OK)).status).toBe(204);
     const [n] = sent(NTFY), [s] = sent(SLACK);
-    expect(n.title).toBe("Account watchdog: restore report");
+    expect(n.title).toBe("gitzilla: restore report");
     expect(n.topic).toBe("t0pic");
     expect(n.message).toBe([
       "Restored 1, skipped 2",

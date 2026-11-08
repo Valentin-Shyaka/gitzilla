@@ -13,7 +13,7 @@ afterEach(() => vi.restoreAllMocks());
 describe("formatAlert", () => {
   it("critical forced push", () => {
     const { title, body, priority } = formatAlert([base], "Africa/Kigali");
-    expect(title.startsWith("🔴 Watchdog:")).toBe(true);
+    expect(title.startsWith("🔴 gitzilla:")).toBe(true);
     expect(title).toContain("owner/repo");
     expect(priority).toBe(5);
     expect(body).toContain("refs/heads/main");

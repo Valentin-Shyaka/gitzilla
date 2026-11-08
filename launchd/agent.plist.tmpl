@@ -7,13 +7,13 @@
   <array>
     <string>/bin/bash</string>
     <string>-c</string>
-    <string>"@WATCHDOG_HOME@/bin/agent" poll; "@WATCHDOG_HOME@/bin/agent" health</string>
+    <string>"@GITZILLA_HOME@/bin/agent" poll; "@GITZILLA_HOME@/bin/agent" health</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-    <key>WATCHDOG_STATE_DIR</key><string>@STATE@</string>
-    <key>WATCHDOG_CONFIG_DIR</key><string>@CONFIG@</string>
+    <key>GITZILLA_STATE_DIR</key><string>@STATE@</string>
+    <key>GITZILLA_CONFIG_DIR</key><string>@CONFIG@</string>
   </dict>
   <key>StartInterval</key><integer>300</integer>
   <key>RunAtLoad</key><true/>

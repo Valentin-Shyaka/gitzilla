@@ -40,7 +40,7 @@ async function handleNote(request, env) {
   const raw = b64decode(body.payload);
   if (!raw) return new Response("bad base64", { status: 400 });
 
-  if (!(await verifySshSig(body.sig, raw, "account-watchdog-note", env.NOTE_PUBKEY || ""))) {
+  if (!(await verifySshSig(body.sig, raw, "gitzilla-note", env.NOTE_PUBKEY || ""))) {
     return new Response("bad signature", { status: 401 });
   }
   let note;
@@ -106,7 +106,7 @@ async function handleReport(request, env) {
   }
   const raw = b64decode(body.payload);
   if (!raw) return new Response("bad base64", { status: 400 });
-  if (!(await verifySshSig(body.sig, raw, "account-watchdog-report", env.NOTE_PUBKEY || ""))) {
+  if (!(await verifySshSig(body.sig, raw, "gitzilla-report", env.NOTE_PUBKEY || ""))) {
     return new Response("bad signature", { status: 401 });
   }
   let parsed;
@@ -163,7 +163,7 @@ async function handleAlert(request, env) {
   }
   const raw = b64decode(body.payload);
   if (!raw) return new Response("bad base64", { status: 400 });
-  if (!(await verifySshSig(body.sig, raw, "account-watchdog-alert", env.NOTE_PUBKEY || ""))) {
+  if (!(await verifySshSig(body.sig, raw, "gitzilla-alert", env.NOTE_PUBKEY || ""))) {
     return new Response("bad signature", { status: 401 });
   }
   let parsed;
@@ -221,9 +221,9 @@ async function handleWebhook(request, env) {
   return new Response(null, { status: 204 });
 }
 
-// X-Watchdog-Auth: base64(JSON {"ts":<unix s>}) "." base64(armored SSHSIG over those exact JSON bytes)
+// X-Gitzilla-Auth: base64(JSON {"ts":<unix s>}) "." base64(armored SSHSIG over those exact JSON bytes)
 async function queueAuthorized(request, env) {
-  const parts = (request.headers.get("X-Watchdog-Auth") || "").split(".");
+  const parts = (request.headers.get("X-Gitzilla-Auth") || "").split(".");
   if (parts.length !== 2) return false;
   const raw = b64decode(parts[0]);
   const sigBytes = b64decode(parts[1]);
@@ -234,7 +234,7 @@ async function queueAuthorized(request, env) {
   } catch { return false; }
   if (!Number.isInteger(ts) || Math.abs(ts * 1000 - Date.now()) > QUEUE_SKEW_MS) return false;
   const sig = new TextDecoder().decode(sigBytes);
-  return verifySshSig(sig, raw, "account-watchdog-queue", env.NOTE_PUBKEY || "");
+  return verifySshSig(sig, raw, "gitzilla-queue", env.NOTE_PUBKEY || "");
 }
 
 async function handleQueue(request, env) {

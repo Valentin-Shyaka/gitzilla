@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 . "$(dirname "$0")/helpers.sh"
-STATE="$WATCHDOG_STATE_DIR"
+STATE="$GITZILLA_STATE_DIR"
 export TMPDIR="$T/tmpdir"; mkdir -p "$TMPDIR"
-cat > "$WATCHDOG_CONFIG_DIR/config" <<CFG
-WATCHDOG_URL=http://127.0.0.1:1
+cat > "$GITZILLA_CONFIG_DIR/config" <<CFG
+GITZILLA_URL=http://127.0.0.1:1
 OWNER=Alice
 CFG
 Z=0000000000000000000000000000000000000000
@@ -13,7 +13,7 @@ S3=3333333333333333333333333333333333333333
 S4=4444444444444444444444444444444444444444
 T0=1760000000
 
-export WATCHDOG_NOTIFY_CMD="$T/notify.sh" WATCHDOG_GIT_LS_REMOTE="$T/lsr.sh" WATCHDOG_CURL="$T/curl.sh" WATCHDOG_SSH_PROBE="$T/probe.sh"
+export GITZILLA_NOTIFY_CMD="$T/notify.sh" GITZILLA_GIT_LS_REMOTE="$T/lsr.sh" GITZILLA_CURL="$T/curl.sh" GITZILLA_SSH_PROBE="$T/probe.sh"
 printf '#!/bin/sh\n[ -f "%s/notify.fail" ] && exit 1\necho "$1|$2" >> "%s/notify.log"\n' "$T" "$T" > "$T/notify.sh"
 # ls-remote stub: $T/remote/<owner>__<repo> holds "sha<TAB>ref" lines; a missing file is a failure.
 cat > "$T/lsr.sh" <<STUB
@@ -52,7 +52,7 @@ chmod +x "$T/notify.sh" "$T/lsr.sh" "$T/curl.sh" "$T/probe.sh"
 RECONCILE="$WD_ROOT/bin/reconcile"
 AGENT="$WD_ROOT/bin/agent"
 run() { bash "$RECONCILE" "$@" >"$T/out" 2>&1; echo $? > "$T/rc"; }
-runat() { local n="$1"; shift; WATCHDOG_NOW="$n" run "$@"; }
+runat() { local n="$1"; shift; GITZILLA_NOW="$n" run "$@"; }
 nlines() { [ -f "$1" ] && wc -l < "$1" | tr -d ' ' || echo 0; }
 nincs() { ls "$STATE/incidents" 2>/dev/null | grep -c '^r-.*\.json$' | tr -d ' '; }
 lastinc() { echo "$STATE/incidents/$(ls "$STATE/incidents" | grep '^r-.*\.json$' | tail -n1)"; }
@@ -113,7 +113,7 @@ assert_eq "$S1" "$(jq -r '.[0].before' "$inc")" "strike2: before = heads value"
 assert_eq "$S2" "$(jq -r '.[0].after' "$inc")" "strike2: after = remote"
 assert_eq "null" "$(jq -r '.[0].seq' "$inc")" "strike2: no seq"
 assert_eq 1 "$(nlines "$T/notify.log")" "strike2: one notification"
-assert_contains "$(cat "$T/notify.log")" "Account watchdog: warning|" "strike2: warning title"
+assert_contains "$(cat "$T/notify.log")" "gitzilla: warning|" "strike2: warning title"
 assert_eq "no" "$(ls "$STATE/incidents" | grep -q pending && echo yes || echo no)" "strike2: no .pending marker"
 assert_eq "$(cat "$T/heads.before")" "$(cat "$STATE/heads.json")" "strike2: heads.json untouched"
 assert_eq "true" "$(seen_alerted 'alice/app|refs/heads/main')" "strike2: marked alerted"
@@ -152,13 +152,13 @@ assert_eq "true" "$(seen_alerted 'alice/app|refs/heads/main')" "notify fail: ale
 export STUB_EVENTS="$T/events.json" STUB_HEALTH_FILE="$T/health.status" STUB_QUEUE_CTL="$T/ctl.json"
 make_test_key
 start_stub
-cat > "$WATCHDOG_CONFIG_DIR/config" <<CFG
-WATCHDOG_URL=$STUB_URL
+cat > "$GITZILLA_CONFIG_DIR/config" <<CFG
+GITZILLA_URL=$STUB_URL
 OWNER=Alice
 NOTE_PUBKEY_FILE=$T/key.pub
 CFG
 echo '[]' > "$STUB_EVENTS"
-export WATCHDOG_RESTORE_CMD="$T/restore.sh"
+export GITZILLA_RESTORE_CMD="$T/restore.sh"
 printf '#!/bin/sh\necho "$@" >> "%s/restore.log"\n' "$T" > "$T/restore.sh"; chmod +x "$T/restore.sh"
 jq -cn --arg z "$Z" --arg s "$S2" '[{seq:null,delivery:"x",ts:1,kind:"push",repo:"alice/app",ref:"refs/heads/main",before:$z,after:$s,forced:false,level:"critical",flags:["unsigned"]}]' > "$STATE/incidents/r-5-5.json"
 : > "$STATE/incidents/r-5-5.pending"
@@ -208,7 +208,7 @@ setremote alice/app $c2 refs/heads/main
 runat $T0 public; runat $((T0 + 700)) public
 assert_eq 0 "$(nincs)" "unseeded: no alert even though remote differs from the mirror"
 assert_eq 0 "$(nlines "$T/lsr.log")" "unseeded: no ls-remote"
-assert_contains "$(cat "$STATE/log/watchdog.log")" "alice/app not seeded" "unseeded: logged"
+assert_contains "$(cat "$STATE/log/gitzilla.log")" "alice/app not seeded" "unseeded: logged"
 assert_eq "no" "$([ -e "$STATE/heads.json" ] && echo yes || echo no)" "unseeded: reconcile never writes heads.json"
 # seed adds missing repos only
 M2="$(. "$WD_ROOT/bin/lib.sh"; mirror_path alice/other)"; git init -q --bare "$M2"
@@ -329,7 +329,7 @@ cp "$STATE/known-keys.txt" "$T/known.before"
 { cat "$T/k1.pub"; cat "$T/k2.pub"; } > "$T/curl/auth.keys"
 run public
 assert_eq 1 "$(nlines "$T/notify.log")" "auth key: one notification"
-assert_contains "$(cat "$T/notify.log")" "Account watchdog: CRITICAL|" "auth key: critical title"
+assert_contains "$(cat "$T/notify.log")" "gitzilla: CRITICAL|" "auth key: critical title"
 assert_contains "$(cat "$T/notify.log")" "New key on your GitHub account" "auth key: message"
 assert_contains "$(cat "$T/notify.log")" "ssh-ed25519" "auth key: type"
 assert_contains "$(cat "$T/notify.log")" "SHA256:" "auth key: fingerprint"
@@ -369,7 +369,7 @@ rm -f "$T/notify.log"
 printf 'garbage line\nssh-ed25519 AAAAnotakey\n<html>\n' > "$T/curl/auth.keys"; echo '[]' > "$T/curl/signing.json"
 run public
 assert_eq 0 "$(nlines "$T/notify.log")" "unparseable key blob: no alert"
-assert_contains "$(cat "$STATE/log/watchdog.log")" "unparseable key blob" "unparseable key blob: logged"
+assert_contains "$(cat "$STATE/log/gitzilla.log")" "unparseable key blob" "unparseable key blob: logged"
 
 # --- 9. key fetch failure / non-200 / junk -> no alert, no update
 reset_state; : > "$STATE/repos.txt"; blob "$T/k1" > "$STATE/known-keys.txt"
@@ -393,7 +393,7 @@ reset_state; : > "$STATE/repos.txt"
 cp "$T/k2.pub" "$T/curl/auth.keys"; echo '[]' > "$T/curl/signing.json"
 run public
 assert_eq 0 "$(nlines "$T/notify.log")" "no known-keys: no alert"
-assert_contains "$(cat "$STATE/log/watchdog.log")" "known-keys.txt" "no known-keys: logged"
+assert_contains "$(cat "$STATE/log/gitzilla.log")" "known-keys.txt" "no known-keys: logged"
 
 # --- 10b. seen files that are not JSON objects are treated as empty
 reset_state
@@ -401,7 +401,7 @@ echo "alice/app public" > "$STATE/repos.txt"; sethead alice/app refs/heads/main 
 echo '["junk"]' > "$STATE/reconcile-seen.json"
 runat $T0 public
 assert_eq "$T0" "$(seen_first 'alice/app|refs/heads/main')" "seen not an object: treated as empty"
-assert_contains "$(cat "$STATE/log/watchdog.log")" "not a JSON object" "seen not an object: logged"
+assert_contains "$(cat "$STATE/log/gitzilla.log")" "not a JSON object" "seen not an object: logged"
 
 # --- 11. reconcile all: probe, private repos over one ssh session, 24 h gate
 reset_state
@@ -442,7 +442,7 @@ assert_eq "$((T0 + 183700))" "$(cat "$STATE/reconcile-all-at")" "N3: full stamp 
 mkdir -p "$T/fakebin"
 printf '#!/bin/sh\necho "$@" >> "%s/ssh.log"\necho "Hi alice! You have successfully authenticated"\nexit 1\n' "$T" > "$T/fakebin/ssh"; chmod +x "$T/fakebin/ssh"
 rm -f "$STATE/reconcile-all-at" "$T/ssh.log"
-env -u WATCHDOG_SSH_PROBE PATH="$T/fakebin:$PATH" WATCHDOG_NOW=$T0 bash "$RECONCILE" all >/dev/null 2>&1
+env -u GITZILLA_SSH_PROBE PATH="$T/fakebin:$PATH" GITZILLA_NOW=$T0 bash "$RECONCILE" all >/dev/null 2>&1
 assert_contains "$(cat "$T/ssh.log")" "ControlMaster=auto" "N2: default probe uses ControlMaster=auto"
 assert_contains "$(cat "$T/ssh.log")" "ControlPath=$HOME/.ssh/wd-%C" "N2: default probe shares the ControlPath (in ~/.ssh)"
 assert_contains "$(cat "$T/ssh.log")" "IdentityAgent=$HOME/Library/Containers/com.maxgoedjen.Secretive.SecretAgent/Data/socket.ssh" "M5: probe names the Secretive agent"
@@ -456,7 +456,7 @@ touch "$T/probe.fail"
 runat $T0 all
 assert_eq 1 "$(nlines "$T/lsr.log")" "probe fail: only the public repo is checked"
 assert_eq "no" "$([ -e "$STATE/reconcile-all-at" ] && echo yes || echo no)" "probe fail: no stamp"
-assert_contains "$(cat "$STATE/log/watchdog.log")" "ssh auth probe failed" "probe fail: logged"
+assert_contains "$(cat "$STATE/log/gitzilla.log")" "ssh auth probe failed" "probe fail: logged"
 rm -f "$T/probe.fail"
 # first private repo missing: logged, later one still checked and alerts, stamp written
 reset_state
@@ -466,7 +466,7 @@ setremote alice/priv2 $S2 refs/heads/main            # alice/gone has no remote 
 runat $T0 all; runat $((T0 + 90000)) all
 assert_eq 1 "$(nincs)" "private fail: later repo alerts"
 assert_eq "alice/priv2" "$(jq -r '.[0].repo' "$(lastinc)")" "private fail: it is the later repo"
-assert_contains "$(cat "$STATE/log/watchdog.log")" "ls-remote failed for alice/gone" "private fail: logged"
+assert_contains "$(cat "$STATE/log/gitzilla.log")" "ls-remote failed for alice/gone" "private fail: logged"
 assert_eq "$((T0 + 90000))" "$(cat "$STATE/reconcile-all-at")" "private fail: stamp written"
 
 # --- 11b. N3 loop: the short stamp is only for a genuine, freshly checked first strike
@@ -509,7 +509,7 @@ printf '#!/bin/sh\necho "---lsr" >> "%s/ssh.argv"\nsh -c "$GIT_SSH_COMMAND git@g
 chmod +x "$T/fakebin/ssh" "$T/lsr-ssh.sh"
 echo "alice/priv private" > "$SP/repos.txt"; echo "alice/priv" > "$SP/seeded.txt"
 rm -f "$T/ssh.argv"
-env -u WATCHDOG_SSH_PROBE PATH="$T/fakebin:$PATH" HOME="$T/sp ace/home" WATCHDOG_STATE_DIR="$SP" WATCHDOG_GIT_LS_REMOTE="$T/lsr-ssh.sh" WATCHDOG_NOW=$T0 bash "$RECONCILE" all >/dev/null 2>&1
+env -u GITZILLA_SSH_PROBE PATH="$T/fakebin:$PATH" HOME="$T/sp ace/home" GITZILLA_STATE_DIR="$SP" GITZILLA_GIT_LS_REMOTE="$T/lsr-ssh.sh" GITZILLA_NOW=$T0 bash "$RECONCILE" all >/dev/null 2>&1
 cp_lines="$(grep -c '^ControlPath=' "$T/ssh.argv")"
 assert_eq 2 "$cp_lines" "space: probe and ls-remote each pass one ControlPath element"
 assert_eq 1 "$(grep '^ControlPath=' "$T/ssh.argv" | sort -u | wc -l | tr -d ' ')" "space: identical ControlPath for probe and ls-remote"
@@ -521,8 +521,8 @@ assert_eq "IdentityAgent=$T/sp ace/home/Library/Containers/com.maxgoedjen.Secret
 make_test_key
 export STUB_ALERT_STATUS_FILE="$T/alert.status"; rm -f "$T/alert.status"
 start_stub
-cp "$WATCHDOG_CONFIG_DIR/config" "$T/config.rec"
-printf 'WATCHDOG_URL=%s\nOWNER=Alice\n' "$STUB_URL" > "$WATCHDOG_CONFIG_DIR/config"
+cp "$GITZILLA_CONFIG_DIR/config" "$T/config.rec"
+printf 'GITZILLA_URL=%s\nOWNER=Alice\n' "$STUB_URL" > "$GITZILLA_CONFIG_DIR/config"
 alerts() { grep '"/alert"' "$STUB_LOG" | jq -r .body | grep .; }
 alert_payload() { alerts | sed -n "${1}p" | jq -r .payload | base64 -d; }
 # new authentication key
@@ -538,8 +538,8 @@ assert_eq "$(ssh-keygen -lf "$T/k2.pub" | awk '{print $2}')" "$(echo "$p1" | jq 
 assert_eq auth "$(echo "$p1" | jq -r .source)" "I5 key: source auth"
 assert_eq "kind,ts,nonce,key_type,fingerprint,source" "$(echo "$p1" | jq -r 'keys_unsorted|join(",")')" "I5 key: only the fixed fields"
 printf '%s' "$p1" > "$T/al.msg"; alerts | sed -n 1p | jq -r .sig > "$T/al.sig"
-ssh-keygen -Y check-novalidate -n account-watchdog-alert -s "$T/al.sig" < "$T/al.msg" >/dev/null 2>&1
-assert_eq 0 "$?" "I5 key: signed in namespace account-watchdog-alert"
+ssh-keygen -Y check-novalidate -n gitzilla-alert -s "$T/al.sig" < "$T/al.msg" >/dev/null 2>&1
+assert_eq 0 "$?" "I5 key: signed in namespace gitzilla-alert"
 assert_contains "$(cat "$T/notify.log")" "Review keys: https://github.com/settings/keys" "M3 key: desktop alert points to the keys page"
 case "$(cat "$T/notify.log")" in *"revoke tokens at https://github.com/settings/applications") _ok ;; *) _bad "M3 key: desktop alert ends with the revoke line" ;; esac
 assert_eq "$(blob "$T/k2")" "$(cat "$STATE/reconcile-seen-keys.txt")" "I5 key: marked alerted"
@@ -559,7 +559,7 @@ reset_state; : > "$STUB_LOG"; touch "$T/notify.fail"; echo 500 > "$T/alert.statu
 : > "$STATE/repos.txt"; blob "$T/k1" > "$STATE/known-keys.txt"; { cat "$T/k1.pub"; cat "$T/k2.pub"; } > "$T/curl/auth.keys"; echo '[]' > "$T/curl/signing.json"
 run public
 assert_eq "" "$(cat "$STATE/reconcile-seen-keys.txt")" "I5 key: not alerted when both channels failed"
-assert_contains "$(cat "$STATE/log/watchdog.log")" "key alert not sent to the Worker: worker returned 500" "I5 key: Worker failure logged"
+assert_contains "$(cat "$STATE/log/gitzilla.log")" "key alert not sent to the Worker: worker returned 500" "I5 key: Worker failure logged"
 rm -f "$T/notify.fail" "$T/alert.status"
 # missed webhook: two strikes, then one /alert with the counts
 reset_state; : > "$STUB_LOG"
@@ -584,7 +584,7 @@ runat $T0 public; runat $((T0 + 700)) public
 assert_eq "false" "$(seen_alerted 'alice/app|refs/heads/main')" "I5 refs: not alerted when both failed"
 rm -f "$T/notify.fail" "$T/alert.status"
 stop_stub
-cp "$T/config.rec" "$WATCHDOG_CONFIG_DIR/config"; unset WATCHDOG_SIGN_KEY
+cp "$T/config.rec" "$GITZILLA_CONFIG_DIR/config"; unset GITZILLA_SIGN_KEY
 
 # --- 12. usage
 run bogus

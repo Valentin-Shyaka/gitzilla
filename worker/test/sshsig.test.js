@@ -10,13 +10,13 @@ const MSG = enc(MSG_TXT);
 
 describe("verifySshSig", () => {
   it("accepts a valid signature", async () =>
-    expect(await verifySshSig(SIG, MSG, "account-watchdog-note", PUB)).toBe(true));
+    expect(await verifySshSig(SIG, MSG, "gitzilla-note", PUB)).toBe(true));
   it("rejects a tampered message", async () =>
-    expect(await verifySshSig(SIG, enc("tampered"), "account-watchdog-note", PUB)).toBe(false));
+    expect(await verifySshSig(SIG, enc("tampered"), "gitzilla-note", PUB)).toBe(false));
   it("rejects the wrong namespace", async () =>
-    expect(await verifySshSig(SIG, MSG, "account-watchdog-queue", PUB)).toBe(false));
+    expect(await verifySshSig(SIG, MSG, "gitzilla-queue", PUB)).toBe(false));
   it("rejects a different key", async () =>
-    expect(await verifySshSig(SIG, MSG, "account-watchdog-note", OTHER)).toBe(false));
+    expect(await verifySshSig(SIG, MSG, "gitzilla-note", OTHER)).toBe(false));
   it("returns false on garbage", async () =>
-    expect(await verifySshSig("nope", MSG, "account-watchdog-note", PUB)).toBe(false));
+    expect(await verifySshSig("nope", MSG, "gitzilla-note", PUB)).toBe(false));
 });

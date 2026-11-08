@@ -17,11 +17,11 @@
 # alerted when at least one of the two succeeded.
 # Dedupe: $STATE/reconcile-seen.json {"repo|ref": {sha, first, alerted}} (two strikes: a (repo,ref) alerts only once
 # it has mismatched for >= 600 s; a new sha keeps `first` but re-arms the alert), $STATE/reconcile-seen-keys.txt.
-# Env overrides (tests): WATCHDOG_GIT_LS_REMOTE, WATCHDOG_CURL, WATCHDOG_NOTIFY_CMD, WATCHDOG_SSH_PROBE, WATCHDOG_NOW.
+# Env overrides (tests): GITZILLA_GIT_LS_REMOTE, GITZILLA_CURL, GITZILLA_NOTIFY_CMD, GITZILLA_SSH_PROBE, GITZILLA_NOW.
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$here/lib.sh"
-LSR="${WATCHDOG_GIT_LS_REMOTE:-git -c credential.helper= -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 ls-remote}"
-CURL="${WATCHDOG_CURL:-curl}"
+LSR="${GITZILLA_GIT_LS_REMOTE:-git -c credential.helper= -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 ls-remote}"
+CURL="${GITZILLA_CURL:-curl}"
 ZERO=0000000000000000000000000000000000000000
 STRIKE_SECS=600
 KEY_RE='^(ssh-|ecdsa-|sk-)[^ ]+ [A-Za-z0-9+/=]+'
@@ -114,7 +114,7 @@ eval_keys() {
     if [ -z "$fp" ]; then wd_log "reconcile: unparseable key blob ($type); no alert"; continue; fi
     if grep -qxF -- "$blob" "$TMP/auth.keys" 2>/dev/null; then src=auth; else src=signing; fi
     sent=0
-    wd_notify "Account watchdog: CRITICAL" "New key on your GitHub account ($type $fp). Review keys: https://github.com/settings/keys $WD_REVOKE" && sent=1
+    wd_notify "gitzilla: CRITICAL" "New key on your GitHub account ($type $fp). Review keys: https://github.com/settings/keys $WD_REVOKE" && sent=1
     if wd_send_alert new-key "$type" "$fp" "$src" </dev/null; then sent=1; else wd_log "reconcile: key alert not sent to the Worker: $WD_REASON"; fi
     [ "$sent" = 1 ] && echo "$blob" >> "$seen"
   done < "$TMP/new.keys"
@@ -158,7 +158,7 @@ report_refs() {
   if [ "$total" -gt 0 ]; then
     repos="$(jq '[.due[].repo] | unique | length' "$TMP/dedupe.json")"
     sent=0
-    wd_notify "Account watchdog: warning" "$total ref(s) in $repos repo(s) differ from the known heads (possible missed webhook). $WD_REVOKE" && sent=1
+    wd_notify "gitzilla: warning" "$total ref(s) in $repos repo(s) differ from the known heads (possible missed webhook). $WD_REVOKE" && sent=1
     if wd_send_alert missed-webhook "$total" "$repos" </dev/null; then sent=1; else wd_log "reconcile: missed-webhook alert not sent to the Worker: $WD_REASON"; fi
     if [ "$sent" = 1 ]; then
       mkdir -p "$STATE/incidents" || return 1
@@ -210,7 +210,7 @@ cmd_seed() {
 main() {
   local mode="${1:-}" at slug vis idx=0 priv_n=0 stamp priv_ok=1 out
   case "$mode" in public|all|seed) ;; *) echo "usage: reconcile public|all|seed" >&2; return 2 ;; esac
-  NOW="${WATCHDOG_NOW:-$(date +%s)}"
+  NOW="${GITZILLA_NOW:-$(date +%s)}"
   case "$NOW" in ''|*[!0-9]*) NOW="$(date +%s)" ;; esac
   trap cleanup EXIT
   [ "$mode" = seed ] && { cmd_seed; return $?; }
@@ -237,7 +237,7 @@ main() {
           if [ "$priv_n" -eq 0 ]; then
             wd_ssh_env                                  # one ssh session (one Touch ID) for every private repo
             # default probe reuses the session's GIT_SSH_COMMAND (ControlMaster/ControlPath): no second Touch ID
-            if [ -n "${WATCHDOG_SSH_PROBE:-}" ]; then out="$($WATCHDOG_SSH_PROBE 2>&1 </dev/null)"
+            if [ -n "${GITZILLA_SSH_PROBE:-}" ]; then out="$($GITZILLA_SSH_PROBE 2>&1 </dev/null)"
             else out="$(sh -c "$GIT_SSH_COMMAND -T git@github.com" 2>&1 </dev/null)"; fi
             case "$out" in *"successfully authenticated"*) ;; *) priv_ok=0; wd_log "reconcile: ssh auth probe failed; private pass skipped" ;; esac
           fi

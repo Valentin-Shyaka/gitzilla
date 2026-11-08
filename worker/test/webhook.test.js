@@ -34,7 +34,7 @@ const pushPayload = (o = {}) => ({
 });
 const postNote = () => SELF.fetch("https://w.test/note", { method: "POST", body: JSON.stringify(NOTE) });
 const queue = (after = 0, auth = QUEUE_OK.trim()) =>
-  SELF.fetch(`https://w.test/queue?after=${after}`, { headers: auth === null ? {} : { "X-Watchdog-Auth": auth } });
+  SELF.fetch(`https://w.test/queue?after=${after}`, { headers: auth === null ? {} : { "X-Gitzilla-Auth": auth } });
 const events = async (after = 0) => (await (await queue(after)).json());
 const at = (secFromT0) => vi.setSystemTime(T0 + secFromT0 * 1000);
 const alarm = () => runDurableObjectAlarm(hub());

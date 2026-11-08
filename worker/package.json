@@ -1,5 +1,5 @@
 {
-  "name": "account-watchdog-worker",
+  "name": "gitzilla-worker",
   "private": true,
   "type": "module",
   "scripts": { "test": "vitest run", "deploy": "wrangler deploy" },

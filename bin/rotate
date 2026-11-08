@@ -15,25 +15,25 @@
 # gh on stdin). known-keys.txt is never rebuilt from what GitHub shows: the new auth blob is appended at `export`,
 # the old one removed at `done`. One flow at a time ($STATE/rotate.lock; a lock older than 1 h is taken over). The signing key (~/.ssh/git-signing.pub) is never touched.
 #
-# Env overrides (tests): WATCHDOG_OPEN_CMD, WATCHDOG_PBPASTE_CMD, WATCHDOG_PBCOPY_CMD, WATCHDOG_GH_CMD,
-# WATCHDOG_CURL, WATCHDOG_DIALOG_CMD (<message> <buttons>; prints the button or TIMEOUT), WATCHDOG_TERMINAL_CMD
-# (<rotate-path> <gh|ssh>), WATCHDOG_SECRETIVE_DIR, WATCHDOG_SSH_CMD, WATCHDOG_SSH_ADD, WATCHDOG_NOTIFY_CMD,
-# WATCHDOG_NOW, WATCHDOG_POLL_INTERVAL (5), WATCHDOG_POLL_TIMEOUT (600), WATCHDOG_SEED_RETRY_SLEEP (20),
-# WATCHDOG_REMOTE_URL_TEMPLATE.
+# Env overrides (tests): GITZILLA_OPEN_CMD, GITZILLA_PBPASTE_CMD, GITZILLA_PBCOPY_CMD, GITZILLA_GH_CMD,
+# GITZILLA_CURL, GITZILLA_DIALOG_CMD (<message> <buttons>; prints the button or TIMEOUT), GITZILLA_TERMINAL_CMD
+# (<rotate-path> <gh|ssh>), GITZILLA_SECRETIVE_DIR, GITZILLA_SSH_CMD, GITZILLA_SSH_ADD, GITZILLA_NOTIFY_CMD,
+# GITZILLA_NOW, GITZILLA_POLL_INTERVAL (5), GITZILLA_POLL_TIMEOUT (600), GITZILLA_SEED_RETRY_SLEEP (20),
+# GITZILLA_REMOTE_URL_TEMPLATE.
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SELF="$here/$(basename "${BASH_SOURCE[0]}")"
 . "$here/lib.sh"
-OPEN="${WATCHDOG_OPEN_CMD:-open}"
-PBPASTE="${WATCHDOG_PBPASTE_CMD:-pbpaste}"
-PBCOPY="${WATCHDOG_PBCOPY_CMD:-pbcopy}"
-GH="${WATCHDOG_GH_CMD:-gh}"
-CURL="${WATCHDOG_CURL:-curl}"
-SSH_CMD="${WATCHDOG_SSH_CMD:-ssh -o ConnectTimeout=15}"
-SSH_ADD="${WATCHDOG_SSH_ADD:-ssh-add}"
-SDIR="${WATCHDOG_SECRETIVE_DIR:-$HOME/Library/Containers/com.maxgoedjen.Secretive.SecretAgent/Data/PublicKeys}"
-REMOTE_TPL="${WATCHDOG_REMOTE_URL_TEMPLATE:-git@github.com:%s.git}"
-POLL_INTERVAL="${WATCHDOG_POLL_INTERVAL:-5}"
-POLL_TIMEOUT="${WATCHDOG_POLL_TIMEOUT:-600}"
+OPEN="${GITZILLA_OPEN_CMD:-open}"
+PBPASTE="${GITZILLA_PBPASTE_CMD:-pbpaste}"
+PBCOPY="${GITZILLA_PBCOPY_CMD:-pbcopy}"
+GH="${GITZILLA_GH_CMD:-gh}"
+CURL="${GITZILLA_CURL:-curl}"
+SSH_CMD="${GITZILLA_SSH_CMD:-ssh -o ConnectTimeout=15}"
+SSH_ADD="${GITZILLA_SSH_ADD:-ssh-add}"
+SDIR="${GITZILLA_SECRETIVE_DIR:-$HOME/Library/Containers/com.maxgoedjen.Secretive.SecretAgent/Data/PublicKeys}"
+REMOTE_TPL="${GITZILLA_REMOTE_URL_TEMPLATE:-git@github.com:%s.git}"
+POLL_INTERVAL="${GITZILLA_POLL_INTERVAL:-5}"
+POLL_TIMEOUT="${GITZILLA_POLL_TIMEOUT:-600}"
 INTERVAL_SECS=$((5 * 86400))
 SNOOZE_SECS=86400
 RJ="$STATE/rotation.json"
@@ -42,7 +42,7 @@ SSHDIR="$HOME/.ssh"
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR
 export GIT_TERMINAL_PROMPT=0
 
-now() { echo "${WATCHDOG_NOW:-$(date +%s)}"; }
+now() { echo "${GITZILLA_NOW:-$(date +%s)}"; }
 say() { printf '%s\n' "$*"; }
 die() { printf 'rotate: %s\n' "$*" >&2; wd_log "rotate: $*"; exit 1; }
 
@@ -100,11 +100,11 @@ ask_enter() { local a; printf '%s ' "$1"; read -r a || { echo; return 1; }; retu
 dialog() {
   local out rc=0 b1 b2
   b1="${2%%,*}"; b2="${2#*,}"
-  if [ -n "${WATCHDOG_DIALOG_CMD:-}" ]; then
-    out="$("$WATCHDOG_DIALOG_CMD" "$1" "$2" </dev/null 2>/dev/null)"
+  if [ -n "${GITZILLA_DIALOG_CMD:-}" ]; then
+    out="$("$GITZILLA_DIALOG_CMD" "$1" "$2" </dev/null 2>/dev/null)"
   else
     out="$(osascript -e 'on run argv' \
-      -e 'set r to display dialog (item 1 of argv) with title "Account watchdog" buttons {item 2 of argv, item 3 of argv} default button (item 2 of argv) giving up after 600' \
+      -e 'set r to display dialog (item 1 of argv) with title "gitzilla" buttons {item 2 of argv, item 3 of argv} default button (item 2 of argv) giving up after 600' \
       -e 'if gave up of r then return "TIMEOUT"' \
       -e 'return button returned of r' -e 'end run' -- "$1" "$b1" "$b2" </dev/null 2>/dev/null)" || rc=$?
     [ "$rc" -eq 0 ] || { wd_log "dialog failed (rc $rc)"; out=""; }
@@ -113,8 +113,8 @@ dialog() {
 }
 
 launch_terminal() { # gh|ssh
-  if [ -n "${WATCHDOG_TERMINAL_CMD:-}" ]; then
-    "$WATCHDOG_TERMINAL_CMD" "$SELF" "$1" </dev/null >/dev/null 2>&1 || wd_log "rotate: terminal launch failed"
+  if [ -n "${GITZILLA_TERMINAL_CMD:-}" ]; then
+    "$GITZILLA_TERMINAL_CMD" "$SELF" "$1" </dev/null >/dev/null 2>&1 || wd_log "rotate: terminal launch failed"
   else
     osascript -e 'on run argv' -e 'tell application "Terminal" to do script (quoted form of item 1 of argv & " " & item 2 of argv)' \
       -e 'end run' -- "$SELF" "$1" </dev/null >/dev/null 2>&1 || wd_log "rotate: terminal launch failed"
@@ -187,12 +187,12 @@ repos_refresh() { # never fails the rotation
   [ -n "${OWNER:-}" ] || { wd_log "rotate: no OWNER; repos not refreshed"; return 0; }
   mkwork
   if ! json="$($GH repo list "$OWNER" --limit 1000 --json nameWithOwner,visibility </dev/null 2>/dev/null)"; then
-    wd_log "rotate: gh repo list failed; repos.txt unchanged"; wd_notify "Account watchdog" "Could not refresh repos.txt - run rotate gh again"; return 0
+    wd_log "rotate: gh repo list failed; repos.txt unchanged"; wd_notify "gitzilla" "Could not refresh repos.txt - run rotate gh again"; return 0
   fi
   printf '%s' "$json" | wd_repos_from_gh "$OWNER_LC" > "$WORK/repos.new" 2>/dev/null
   if [ ! -s "$WORK/repos.new" ]; then
     wd_log "rotate: gh repo list returned no repos; repos.txt unchanged"
-    wd_notify "Account watchdog" "gh repo list returned no repos - repos.txt kept. Check the token's repository access" || true
+    wd_notify "gitzilla" "gh repo list returned no repos - repos.txt kept. Check the token's repository access" || true
     return 0
   fi
   # repos we already watch that the new list lacks are kept (a narrow token must not shrink the watch list)
@@ -206,7 +206,7 @@ repos_refresh() { # never fails the rotation
   atomic_write "$STATE/repos.txt" < "$WORK/repos.new" || { wd_log "rotate: cannot write repos.txt"; return 0; }
   if [ "$gone" -gt 0 ]; then
     wd_log "rotate: $gone repos disappeared from gh repo list"
-    wd_notify "Account watchdog" "$gone repos disappeared from gh repo list — check the token's repository access" || true
+    wd_notify "gitzilla" "$gone repos disappeared from gh repo list — check the token's repository access" || true
   fi
   touch "$STATE/seeded.txt" 2>/dev/null
   (
@@ -226,7 +226,7 @@ repos_refresh() { # never fails the rotation
   )
   while ! bash "$here/reconcile" seed </dev/null >/dev/null 2>&1; do
     tries=$((tries + 1)); [ "$tries" -gt 3 ] && break
-    sleep "${WATCHDOG_SEED_RETRY_SLEEP:-20}"
+    sleep "${GITZILLA_SEED_RETRY_SLEEP:-20}"
   done
   while read -r slug vis; do
     [ -n "$slug" ] || continue
@@ -234,7 +234,7 @@ repos_refresh() { # never fails the rotation
   done < "$STATE/repos.txt"
   if [ "$unseeded" -gt 0 ]; then
     wd_log "rotate: $unseeded repos not yet seeded"
-    wd_notify "Account watchdog" "$unseeded repos not yet seeded — run reconcile seed" || true
+    wd_notify "gitzilla" "$unseeded repos not yet seeded — run reconcile seed" || true
   fi
   return 0
 }

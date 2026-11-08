@@ -1,5 +1,7 @@
 # Account Watchdog Implementation Plan
 
+> gitzilla was called account-watchdog when this was written.
+
 > Original implementation plan record, kept for reference. Names of the original owner and repos are replaced with generic ones; the README describes the tool as it ships.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

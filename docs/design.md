@@ -1,5 +1,7 @@
 # Account Watchdog — design
 
+> gitzilla was called account-watchdog when this was written.
+
 > Original design record, kept for reference. Names of the original owner and repos are replaced with generic ones; the README describes the tool as it ships.
 
 **Date:** 2026-10-06 · **Owner:** the original author · **Status:** approved in conversation, awaiting spec review

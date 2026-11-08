@@ -37,15 +37,15 @@ export function formatAlert(events, tz = "UTC") {
     (allRepos.length > TITLE_REPOS_MAX ? ` +${allRepos.length - TITLE_REPOS_MAX} more` : "");
   const title =
     first.kind === "disarmed" && events.length === 1
-      ? `${icon} Watchdog: disarmed (${repos})`
-      : `${icon} Watchdog: ${repos}`;
+      ? `${icon} gitzilla disarmed (${repos})`
+      : `${icon} gitzilla: ${repos}`;
   const ordered = events.length > ALERT_LIST_MAX
     ? [...events.filter((e) => e.level === "critical"), ...events.filter((e) => e.level !== "critical")]
     : events;
   const lines = ordered.slice(0, ALERT_LIST_MAX).map((e) => {
     const flags = (e.flags ?? []).join(", ") || "-";
     if (e.kind === "disarmed") {
-      return `Watchdog disarmed: ${cap(e.repo)}\nTime: ${utc(e.ts)} / ${local(e.ts, tz)}\nFlags: ${flags}`;
+      return `gitzilla disarmed: ${cap(e.repo)}\nTime: ${utc(e.ts)} / ${local(e.ts, tz)}\nFlags: ${flags}`;
     }
     return [
       `Repo: ${cap(e.repo)}`,
@@ -70,14 +70,14 @@ export function formatAccountAlert(a, tz = "UTC") {
   if (a.kind === "new-key") {
     const src = a.source === "signing" ? "signing" : "authentication";
     return {
-      title: "🔴 Watchdog: new key on your GitHub account",
+      title: "🔴 gitzilla: new key on your GitHub account",
       body: [`New ${src} key: ${cap(a.key_type)} ${cap(a.fingerprint)}`, time,
         "Review keys: https://github.com/settings/keys", "", REVOKE].join("\n"),
       priority: 5,
     };
   }
   return {
-    title: "🟠 Watchdog: possible missed webhook",
+    title: "🟠 gitzilla: possible missed webhook",
     body: [`${Number(a.refs)} ref(s) in ${Number(a.repos)} repo(s) differ from the known heads (possible missed webhook).`,
       time, "", REVOKE].join("\n"),
     priority: 3,
@@ -120,7 +120,7 @@ export function formatReport(report) {
     "",
     REVOKE,
   ].join("\n");
-  return { title: "Account watchdog: restore report", body, priority: 4 };
+  return { title: "gitzilla: restore report", body, priority: 4 };
 }
 
 export async function notify(event, env, timeoutMs = 8000) {

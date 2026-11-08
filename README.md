@@ -1,4 +1,4 @@
-# account-watchdog
+# gitzilla
 
 Tells your phone within about a minute when someone pushes to your GitHub repos from anywhere but your Mac, and
 (after one click) puts the branches back. It was built after a stolen GitHub token force-pushed malware (PolinRider)
@@ -14,7 +14,7 @@ no credential that can push code.
   push that carries a known payload.
 - **Webhook.** A private GitHub App (read-only: Contents, Metadata) sends push events to the same Worker.
   A push with no matching note is an alert: orange for one stray push, red for a force-push, a burst across
-  repos, or the app being uninstalled / losing repos ("watchdog disarmed").
+  repos, or the app being uninstalled / losing repos ("gitzilla disarmed").
 - **Alerts** go to ntfy (phone) and, if you set it up, Slack. They carry repo, ref, SHAs and flags, never commit
   content.
 - **Mac agent** (`bin/agent`, every 5 min) drains the Worker queue, keeps bare mirrors of all repos up to date,
@@ -80,22 +80,22 @@ Add the same public key at https://github.com/settings/keys as a **Signing key**
 ## Install
 
 ```
-git clone https://github.com/Valentin-Shyaka/account-watchdog && cd account-watchdog && ./install.sh
+git clone https://github.com/Valentin-Shyaka/gitzilla && cd gitzilla && ./install.sh
 ```
 
 Keep the clone where it is: the hook, the LaunchAgents and the config point at it. If you move or delete it, the
 hook stops scanning and sending notes (pushes still go through, each one an orange alert, and every push prints
 "install dir ... not found") until you rerun `./install.sh --from-step hook` from the new place or remove the hook
 (Uninstall). The installer is resumable:
-`~/.local/state/account-watchdog/install-step` holds the last completed step and a rerun continues after it;
+`~/.local/state/gitzilla/install-step` holds the last completed step and a rerun continues after it;
 `--from-step <name>` forces a start point (and runs everything after it).
 
 | Step | What it asks / does |
 |---|---|
 | `prereqs` | checks the tools, Secretive, `gh auth status` and `~/.ssh/github-auth.pub` |
-| `note-key` | you create a key named `push-note` in Secretive (Authentication: **Not Required**, so the hook can sign without a prompt) and copy its public key; it is saved to `~/.config/account-watchdog/push-note.pub` |
-| `worker` | `npm ci`, `wrangler login` (browser), deploys the Worker with the note public key, then prints the webhook secret and a random ntfy topic **once** and puts them as Worker secrets. Asks for the Slack URL (hidden; press Enter to skip Slack). Runs `wrangler logout` and checks no Cloudflare token is left on disk. Alerts show times in UTC and in your zone: the deploy passes `ALERT_TZ` (the Mac's zone from `/etc/localtime`, or `WATCHDOG_ALERT_TZ=Europe/Paris ./install.sh --from-step worker`; an unknown zone falls back to UTC). Writes `~/.config/account-watchdog/config` (`OWNER`, `WATCHDOG_URL`, `APP_NAME`, `DRILL_REPO`, `ALERT_TZ`, ...). On a rerun it asks whether to keep the secrets (default, redeploy only) or `rotate` them |
-| `github-app` | prints the exact settings for your GitHub App (`account-watchdog-<your login>`, cut to 34 characters) and opens the new-app page; you create it, generate a private key (GitHub requires one before install) and install it on **all** repositories. The installer then deletes the downloaded `<app-name>.*.private-key*.pem` from `~/Downloads` after you confirm. If your drill repo does not exist it offers to create it (private). You push one commit to the drill repo; the installer waits until the push shows up in the Worker queue |
+| `note-key` | you create a key named `push-note` in Secretive (Authentication: **Not Required**, so the hook can sign without a prompt) and copy its public key; it is saved to `~/.config/gitzilla/push-note.pub` |
+| `worker` | `npm ci`, `wrangler login` (browser), deploys the Worker with the note public key, then prints the webhook secret and a random ntfy topic **once** and puts them as Worker secrets. Asks for the Slack URL (hidden; press Enter to skip Slack). Runs `wrangler logout` and checks no Cloudflare token is left on disk. Alerts show times in UTC and in your zone: the deploy passes `ALERT_TZ` (the Mac's zone from `/etc/localtime`, or `GITZILLA_ALERT_TZ=Europe/Paris ./install.sh --from-step worker`; an unknown zone falls back to UTC). Writes `~/.config/gitzilla/config` (`OWNER`, `GITZILLA_URL`, `APP_NAME`, `DRILL_REPO`, `ALERT_TZ`, ...). On a rerun it asks whether to keep the secrets (default, redeploy only) or `rotate` them |
+| `github-app` | prints the exact settings for your GitHub App (`gitzilla-<your login>`, cut to 34 characters) and opens the new-app page; you create it, generate a private key (GitHub requires one before install) and install it on **all** repositories. The installer then deletes the downloaded `<app-name>.*.private-key*.pem` from `~/Downloads` after you confirm. If your drill repo does not exist it offers to create it (private). You push one commit to the drill repo; the installer waits until the push shows up in the Worker queue |
 | `hook` | installs the push note in your global `pre-push` hook (see below) |
 | `repos` | `gh repo list` into `repos.txt` (`<owner/repo> public\|private` per line) |
 | `mirrors` | a bare mirror of every repo over one SSH session (one Touch ID), never auto-gc'd (restore needs old commits), then `reconcile seed` baselines them |
@@ -107,14 +107,14 @@ hook stops scanning and sending notes (pushes still go through, each one an oran
 In the ntfy app, subscribe to the topic printed in the `worker` step.
 
 **Drill repo.** A throwaway repo the installer and the drill push to, never a real one. The default name is
-`watchdog-drill`; to use another, set it before the `worker` step: `WATCHDOG_DRILL_REPO=my-drill ./install.sh`
+`gitzilla-drill`; to use another, set it before the `worker` step: `GITZILLA_DRILL_REPO=my-drill ./install.sh`
 (or `--from-step worker`). It is saved as `DRILL_REPO` in the config.
 
 **Global pre-push hook.** The hook step reads `git config --global --includes core.hooksPath` (a value in an
 included dotfile counts, and is used as it is):
 
 - not set: it lists what is already in `~/.config/git/hooks` and asks before setting `core.hooksPath` there (the
-  installer records that in `~/.local/state/account-watchdog/install-set-hookspath`). A global hooks path makes git
+  installer records that in `~/.local/state/gitzilla/install-set-hookspath`). A global hooks path makes git
   ignore each repo's own `.git/hooks`; the installed hook runs the repo's `pre-push` itself (from the shared git dir,
   so worktrees work too), but other repo-local hooks (pre-commit, ...) stop running. If you decline, set your own
   global hooks dir (`git config --global core.hooksPath <absolute dir>`) and rerun `./install.sh --from-step hook`.
@@ -125,14 +125,14 @@ included dotfile counts, and is used as it is):
   `scanner/scan.sh` and blocks on a finding (before any note is sent), sends the note (fail-open), then runs the
   repo's own `pre-push` with the same input and exits with its status.
 - a polin-guard hook (or one already carrying the note): it inserts the two note lines after the scan loop.
-- any other hook (after a yes): it is backed up (`pre-push.bak-account-watchdog`), moved to
-  `pre-push.account-watchdog-prev` and run by the new hook as `account-watchdog-prev/pre-push` (still named
+- any other hook (after a yes): it is backed up (`pre-push.bak-gitzilla`), moved to
+  `pre-push.gitzilla-prev` and run by the new hook as `gitzilla-prev/pre-push` (still named
   `pre-push`) with the same input and arguments; its exit status still decides the push. A hook that was not
-  executable (git ignored it) stays that way and is not run. Because it now runs from the `account-watchdog-prev/`
+  executable (git ignored it) stays that way and is not run. Because it now runs from the `gitzilla-prev/`
   subdirectory, a hook that loads files next to itself via `$(dirname "$0")` must use absolute paths instead.
-  Keep `account-watchdog-prev/` (it only holds that link); if it goes missing, rerun `--from-step hook`.
+  Keep `gitzilla-prev/` (it only holds that link); if it goes missing, rerun `--from-step hook`.
 
-The step also records the absolute `node` (`scanner/node-path`) and `jq` (`~/.config/account-watchdog/jq-path`),
+The step also records the absolute `node` (`scanner/node-path`) and `jq` (`~/.config/gitzilla/jq-path`),
 and the hook appends `/opt/homebrew/bin:/usr/local/bin` to `PATH` as fallbacks (your own hooks keep your PATH order), so pushes from GUI clients (GitHub Desktop, Tower,
 Xcode) still scan and send notes.
 
@@ -143,11 +143,11 @@ example node was removed); the message says why. If you are sure the push is fin
 
 **Repos with their own hooks path (husky, lefthook, `.githooks`).** A repo-level `core.hooksPath`
 (`git config --local core.hooksPath`, set by husky v5+, lefthook and similar) overrides the global one, so in those
-repos the watchdog hook never runs: no scan, no note, and every push is an orange alert (red with unsigned commits).
+repos the gitzilla hook never runs: no scan, no note, and every push is an orange alert (red with unsigned commits).
 Fix it per repo, either by calling the global hook from the repo's pre-push hook (for husky, add to
 `.husky/pre-push`: `"$(git config --global --includes --get core.hooksPath | sed "s|^~|$HOME|")/pre-push" "$@" || exit $?` — note
 that stdin must be passed through, so put it first in the file), or by adding the two note lines from
-`hooks/pre-push` (`# account-watchdog: push note` and the `bin/note` line, after reading stdin into `input`).
+`hooks/pre-push` (`# gitzilla: push note` and the `bin/note` line, after reading stdin into `input`).
 `git config --get-regexp core.hookspath` inside a repo shows whether it has one.
 
 Rerunning `worker` keeps the existing secrets unless you type `rotate`. After a rotate, `github-app` does not create
@@ -159,8 +159,8 @@ set up once, the old `SLACK_WEBHOOK_URL` secret stays in the Worker and alerts k
 `cd worker && npx wrangler login && npx wrangler secret delete SLACK_WEBHOOK_URL && npx wrangler logout`
 (then revoke the webhook in Slack).
 
-Files: config in `~/.config/account-watchdog/`, state and logs in `~/.local/state/account-watchdog/`
-(`log/agent.out`, `log/reconcile.out`, `log/rotate.out`, `log/watchdog.log`).
+Files: config in `~/.config/gitzilla/`, state and logs in `~/.local/state/gitzilla/`
+(`log/agent.out`, `log/reconcile.out`, `log/rotate.out`, `log/gitzilla.log`).
 
 ## Drill
 
@@ -174,13 +174,13 @@ rotation and restore dialogs. Each row says what must happen.
 |---|---|---|
 | Nothing | Pushes you made carry a note; all is quiet | nothing |
 | Orange alert | A push with no note from this Mac (or the Worker was unreachable when you pushed, or you used `--no-verify`). GitHub web-UI merges and bot commits (Dependabot, Actions) also have no note | If it was you, ignore it. If not, treat it as red. |
-| Red alert | Force-push, burst across repos, unsigned commit, polin-guard hit, or "watchdog disarmed" (app uninstalled, suspended or repos removed) | Open the restore dialog (below), then revoke tokens at https://github.com/settings/applications and rotate keys |
-| Red alert + restore dialog for a GitHub web-UI merge or a bot commit | The watchdog only trusts commits signed by keys in your `allowed_signers`; GitHub's web-flow signature is not trusted, so these commits count as unsigned | If it was your own merge or your bot, choose **Ignore** |
+| Red alert | Force-push, burst across repos, unsigned commit, polin-guard hit, or "gitzilla disarmed" (app uninstalled, suspended or repos removed) | Open the restore dialog (below), then revoke tokens at https://github.com/settings/applications and rotate keys |
+| Red alert + restore dialog for a GitHub web-UI merge or a bot commit | gitzilla only trusts commits signed by keys in your `allowed_signers`; GitHub's web-flow signature is not trusted, so these commits count as unsigned | If it was your own merge or your bot, choose **Ignore** |
 | "Restore N branches?" dialog | The agent found rewritten branches | **Restore** pushes the old tips back from the mirrors (`--force-with-lease`; branches that moved on are skipped and listed). **Details** shows them. **Ignore** does nothing. A typical incident costs up to 2 Touch IDs: one for the agent's deep check, and one for the restore push if you answer the dialog more than 2 minutes later |
 | Restore skipped "restore target not verified — review manually" | The commit a branch would go back to is not signed by your key (for example the attacker's first push was never deep-checked) | Find the last good commit yourself and use the manual restore below |
 | "N event(s) were lost while this Mac was offline" | The Mac was offline longer than the Worker keeps events (7 days) | Check the phone (and Slack) alerts for that period and run `bin/reconcile all` |
-| "Worker unreachable" notification | Health check failing for over an hour | Check the Cloudflare dashboard; `curl $WATCHDOG_URL/health` |
-| "queue unreadable" notification | The agent could not read the Worker queue for over an hour (Mac clock off by more than 5 min, a Worker deployed without the note key, or a Secretive signing failure) | Check `log/watchdog.log`; fix the clock, or redeploy with `install.sh --from-step worker` |
+| "Worker unreachable" notification | Health check failing for over an hour | Check the Cloudflare dashboard; `curl $GITZILLA_URL/health` |
+| "queue unreadable" notification | The agent could not read the Worker queue for over an hour (Mac clock off by more than 5 min, a Worker deployed without the note key, or a Secretive signing failure) | Check `log/gitzilla.log`; fix the clock, or redeploy with `install.sh --from-step worker` |
 | "New key on your GitHub account" (Mac, phone and Slack if set) | `reconcile` saw a key not in `known-keys.txt` | If you did not add it, remove it at https://github.com/settings/keys and rotate |
 | Rotation reminder dialog | gh token or SSH key is 5 days old | **Rotate now** opens a guided Terminal flow. **Snooze 1 day** delays the next prompt a day. |
 
@@ -189,7 +189,7 @@ Manual commands (run from the clone):
 ```
 bin/rotate gh | ssh      # rotate now
 bin/rotate check         # what the daily job runs
-bin/restore --prompt <incident-file>   # incident files: ~/.local/state/account-watchdog/incidents/
+bin/restore --prompt <incident-file>   # incident files: ~/.local/state/gitzilla/incidents/
 bin/reconcile public | all | seed
 bin/agent poll | health
 ```
@@ -199,11 +199,11 @@ secrets). Never run a plain `wrangler deploy`: `wrangler.toml` ships `NOTE_PUBKE
 note key and every note and queue read then fails with 401.
 
 Manual restore (when the Worker is down, restore sends no note and pushes nothing). From the repo's mirror in
-`~/.local/state/account-watchdog/mirrors/<owner>__<repo>.git`, with `<bad>` the attacker's SHA now on GitHub and
+`~/.local/state/gitzilla/mirrors/<owner>__<repo>.git`, with `<bad>` the attacker's SHA now on GitHub and
 `<good>` the last good commit:
 
 ```
-git -C ~/.local/state/account-watchdog/mirrors/<owner>__<repo>.git push --force-with-lease=<ref>:<bad> git@github.com:<owner>/<repo>.git <good>:<ref>
+git -C ~/.local/state/gitzilla/mirrors/<owner>__<repo>.git push --force-with-lease=<ref>:<bad> git@github.com:<owner>/<repo>.git <good>:<ref>
 ```
 
 This push itself raises a red alert (it carries no note); that one is expected.
@@ -233,8 +233,8 @@ stolen token short-lived, so there is no longer snooze).
 | Cloudflare login | **Not kept.** `wrangler logout` after each deploy, checked on disk | nothing |
 | `gh` token | `gh`'s own credential store; fine-grained PAT, 7-day expiry, rotated every 5 days; Contents and Metadata read-only (plus pull requests and issues) | Usable for at most 7 days; it cannot push, and any push it could cause would raise an alert anyway |
 
-What is stored where: `~/.config/account-watchdog/config` (mode 600) holds only non-secret settings (login,
-Worker URL, app name, drill repo, paths) and `push-note.pub`. `~/.local/state/account-watchdog/` holds the queue
+What is stored where: `~/.config/gitzilla/config` (mode 600) holds only non-secret settings (login,
+Worker URL, app name, drill repo, paths) and `push-note.pub`. `~/.local/state/gitzilla/` holds the queue
 cursor, `repos.txt`, `known-keys.txt`, the bare mirrors, incident files and logs. No secret is written to disk,
 logs or command lines: the Worker secrets go to `wrangler secret put` on stdin, the gh token to `gh` on stdin.
 No stored credential can push, change account keys or alter the Worker. Every alert that is not silent ends with
@@ -244,22 +244,22 @@ No stored credential can push, change account keys or alter the Worker. Every al
 
 ```
 for j in agent reconcile rotate; do
-  launchctl bootout gui/$(id -u)/io.github.account-watchdog.$j
-  rm ~/Library/LaunchAgents/io.github.account-watchdog.$j.plist
+  launchctl bootout gui/$(id -u)/io.github.gitzilla.$j
+  rm ~/Library/LaunchAgents/io.github.gitzilla.$j.plist
 done
 ```
 
 1. The global hook, first (before deleting the clone): in `git config --global --includes core.hooksPath`
    (usually `~/.config/git/hooks`), if the installer created `pre-push`, delete it; if it moved your hook aside,
-   `mv pre-push.account-watchdog-prev pre-push && rm -r account-watchdog-prev`; if it edited a polin-guard hook,
-   remove the two lines starting `# account-watchdog: push note` (or restore `pre-push.bak-account-watchdog`).
-   If `~/.local/state/account-watchdog/install-set-hookspath` exists, the installer set `core.hooksPath` (to the
+   `mv pre-push.gitzilla-prev pre-push && rm -r gitzilla-prev`; if it edited a polin-guard hook,
+   remove the two lines starting `# gitzilla: push note` (or restore `pre-push.bak-gitzilla`).
+   If `~/.local/state/gitzilla/install-set-hookspath` exists, the installer set `core.hooksPath` (to the
    directory in that file): undo it with `git config --global --unset core.hooksPath`.
-2. Delete the GitHub App: https://github.com/settings/apps, your `account-watchdog-<login>` app, Advanced, Delete.
+2. Delete the GitHub App: https://github.com/settings/apps, your `gitzilla-<login>` app, Advanced, Delete.
 3. Delete the Worker: `cd worker && npx wrangler login && npx wrangler delete && npx wrangler logout`.
 4. Delete the `push-note` key in Secretive, the ntfy subscription and the Slack webhook (if any); delete the drill
    repo if you like.
-5. `rm -rf ~/.config/account-watchdog ~/.local/state/account-watchdog`, then delete the clone.
+5. `rm -rf ~/.config/gitzilla ~/.local/state/gitzilla`, then delete the clone.
 
 ## Tests
 

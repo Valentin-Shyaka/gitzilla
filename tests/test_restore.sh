@@ -4,8 +4,8 @@ make_test_key
 export STUB_EVENTS="$T/events.json"
 export TMPDIR="$T/tmpdir"; mkdir -p "$TMPDIR"
 start_stub
-cat > "$WATCHDOG_CONFIG_DIR/config" <<CFG
-WATCHDOG_URL=$STUB_URL
+cat > "$GITZILLA_CONFIG_DIR/config" <<CFG
+GITZILLA_URL=$STUB_URL
 OWNER=alice
 TZ_LOCAL=UTC
 CFG
@@ -14,8 +14,8 @@ Z=0000000000000000000000000000000000000000
 printf '[gpg]\n\tformat = ssh\n[user]\n\tsigningkey = %s\n[commit]\n\tgpgsign = true\n' "$T/key" >> "$GIT_CONFIG_GLOBAL"
 cp "$GIT_CONFIG_GLOBAL" "$T/gitconfig.base"
 export ALLOWED_SIGNERS_FILE="$T/allowed_signers"
-export WATCHDOG_REMOTE_URL_TEMPLATE="$T/remotes/%s.git"
-export WATCHDOG_NOTIFY_CMD="$T/notify.sh" WATCHDOG_DIALOG_CMD="$T/dialog.sh"
+export GITZILLA_REMOTE_URL_TEMPLATE="$T/remotes/%s.git"
+export GITZILLA_NOTIFY_CMD="$T/notify.sh" GITZILLA_DIALOG_CMD="$T/dialog.sh"
 printf '#!/bin/sh\necho "$1|$2" >> "%s/notify.log"\n' "$T" > "$T/notify.sh"
 # dialog stub: prints the next answer from $T/dialog.answers (default Restore), logs the prompt text
 cat > "$T/dialog.sh" <<STUB
@@ -44,8 +44,8 @@ commit() { # file msg -> sha (in $WORK)
   echo "$2" >> "$WORK/$1"; git -C "$WORK" add "$1"; git -C "$WORK" commit -q -m "$2"; git -C "$WORK" rev-parse HEAD
 }
 setup() {
-  rm -rf "$T/remotes" "$WORK" "$WATCHDOG_STATE_DIR" "$T/notify.log" "$T/dialog.log" "$T/dialog.answers" "$INC" "$INC.result.json"
-  mkdir -p "$WATCHDOG_STATE_DIR" "$T/remotes/alice"
+  rm -rf "$T/remotes" "$WORK" "$GITZILLA_STATE_DIR" "$T/notify.log" "$T/dialog.log" "$T/dialog.answers" "$INC" "$INC.result.json"
+  mkdir -p "$GITZILLA_STATE_DIR" "$T/remotes/alice"
   : > "$STUB_LOG"
   git init -q --bare "$ORIGIN"
   git init -q -b main "$WORK"
@@ -409,9 +409,9 @@ assert_eq 2 "$(cat "$T/rc")" "all unusable: exit 2"
 setup; attack_main
 ts_event 1 alice/app refs/heads/main "$C1" "$C2" | write_inc
 mkdir -p "$T/fakebin"; printf '#!/bin/sh\nexit 7\n' > "$T/fakebin/osascript"; chmod +x "$T/fakebin/osascript"
-PATH="$T/fakebin:$PATH" WATCHDOG_DIALOG_CMD= bash "$RESTORE" --prompt "$INC" >"$T/out" 2>&1; echo $? > "$T/rc"
+PATH="$T/fakebin:$PATH" GITZILLA_DIALOG_CMD= bash "$RESTORE" --prompt "$INC" >"$T/out" 2>&1; echo $? > "$T/rc"
 assert_eq 3 "$(cat "$T/rc")" "osascript fail: exit 3"
-assert_contains "$(cat "$WATCHDOG_STATE_DIR/log/watchdog.log")" "dialog failed (rc 7)" "osascript fail: logged"
+assert_contains "$(cat "$GITZILLA_STATE_DIR/log/gitzilla.log")" "dialog failed (rc 7)" "osascript fail: logged"
 assert_eq "$C2" "$(head_of refs/heads/main)" "osascript fail: no push"
 
 # --- 19. Details, Details, Restore: loops until Restore
@@ -539,8 +539,8 @@ assert_eq 1 "$(reports)" "report: exactly one"
 rb="$(report_body 1)"
 printf '%s' "$rb" | jq -r .payload | base64 -d > "$T/rep.payload"
 printf '%s\n' "$rb" | jq -r .sig > "$T/rep.sig"
-if ssh-keygen -Y verify -f "$T/allowed_signers" -I test-owner -n account-watchdog-report -s "$T/rep.sig" < "$T/rep.payload" >/dev/null 2>&1; then _ok; else _bad "report: signature verifies in namespace account-watchdog-report"; fi
-if ssh-keygen -Y verify -f "$T/allowed_signers" -I test-owner -n account-watchdog-note -s "$T/rep.sig" < "$T/rep.payload" >/dev/null 2>&1; then _bad "report: must not verify as a note"; else _ok; fi
+if ssh-keygen -Y verify -f "$T/allowed_signers" -I test-owner -n gitzilla-report -s "$T/rep.sig" < "$T/rep.payload" >/dev/null 2>&1; then _ok; else _bad "report: signature verifies in namespace gitzilla-report"; fi
+if ssh-keygen -Y verify -f "$T/allowed_signers" -I test-owner -n gitzilla-note -s "$T/rep.sig" < "$T/rep.payload" >/dev/null 2>&1; then _bad "report: must not verify as a note"; else _ok; fi
 assert_eq "$(result '[.restored[]|{repo,ref}]')" "$(jq -c '.restored' "$T/rep.payload" | jq .)" "report: restored matches result.json"
 assert_eq "$(result '.skipped')" "$(jq '.skipped' "$T/rep.payload")" "report: skipped matches result.json"
 assert_eq 1 "$(jq .restored_total "$T/rep.payload")" "report: restored_total"
@@ -550,16 +550,16 @@ case "$(jq -r .ts "$T/rep.payload")" in ''|*[!0-9]*) _bad "report: integer ts" ;
 assert_eq 1 "$(nlines "$T/notify.log")" "report: local summary still shown"
 # worker answering 500: still exit 0, logged, not retried
 echo 500 > "$T/report.status"; stop_stub; STUB_REPORT_STATUS_FILE="$T/report.status" start_stub
-sed -i.bak "s#^WATCHDOG_URL=.*#WATCHDOG_URL=$STUB_URL#" "$WATCHDOG_CONFIG_DIR/config"
+sed -i.bak "s#^GITZILLA_URL=.*#GITZILLA_URL=$STUB_URL#" "$GITZILLA_CONFIG_DIR/config"
 setup; attack_main
 ts_event 1 alice/app refs/heads/main "$C1" "$C2" | write_inc
 run --yes "$INC"
 assert_eq 0 "$(cat "$T/rc")" "report 500: exit 0"
 assert_eq 1 "$(reports)" "report 500: not retried"
-assert_contains "$(cat "$WATCHDOG_STATE_DIR/log/watchdog.log")" "restore report not sent: worker returned 500" "report 500: logged"
+assert_contains "$(cat "$GITZILLA_STATE_DIR/log/gitzilla.log")" "restore report not sent: worker returned 500" "report 500: logged"
 assert_eq "$C1" "$(head_of refs/heads/main)" "report 500: still restored"
 stop_stub; unset STUB_REPORT_STATUS_FILE; start_stub
-sed -i.bak "s#^WATCHDOG_URL=.*#WATCHDOG_URL=$STUB_URL#" "$WATCHDOG_CONFIG_DIR/config"
+sed -i.bak "s#^GITZILLA_URL=.*#GITZILLA_URL=$STUB_URL#" "$GITZILLA_CONFIG_DIR/config"
 # nothing attempted and nothing skipped (no events): no report
 setup
 echo '[]' > "$INC"
@@ -577,7 +577,7 @@ ts_event 1 alice/app refs/heads/main "$C1" "$C2" | write_inc
 run --yes "$INC"; run --yes "$INC"
 assert_eq 1 "$(reports)" "report: rerun with nothing new sends no second report"
 # wd_send_report directly: totals, byte budget, lower-casing, reason detail sanitising
-send_report() { ( . "$WD_ROOT/bin/lib.sh"; WATCHDOG_URL="$STUB_URL" wd_send_report "$1" ); }
+send_report() { ( . "$WD_ROOT/bin/lib.sh"; GITZILLA_URL="$STUB_URL" wd_send_report "$1" ); }
 : > "$STUB_LOG"
 jq -n '{restored:[range(80) | {repo:"Alice/App",ref:("refs/heads/" + ("r" * 180) + (.|tostring)),before:"x",after:"y",through_seq:1}],
         skipped:[range(3) | {repo:"alice/app",ref:"refs/heads/s",reason:"could not send note (worker: http://x.test/?a=1&b=*\n)"}]}' > "$T/big.result.json"
@@ -599,11 +599,11 @@ if printf '%s' "$rsn" | grep -Eq '^could not send note \([A-Za-z0-9 ._:/-]{0,100
 setup; attack_main
 ts_event 1 alice/app refs/heads/main "$C1" "$C2" | write_inc
 stop_stub
-sed -i.bak "s#^WATCHDOG_URL=.*#WATCHDOG_URL=http://127.0.0.1:9#" "$WATCHDOG_CONFIG_DIR/config"
+sed -i.bak "s#^GITZILLA_URL=.*#GITZILLA_URL=http://127.0.0.1:9#" "$GITZILLA_CONFIG_DIR/config"
 run --yes "$INC"
 assert_eq 0 "$(cat "$T/rc")" "worker down: exit 0"
 assert_contains "$(result '.skipped[0].reason')" "could not send note" "worker down: note failed so ref skipped"
-assert_contains "$(cat "$WATCHDOG_STATE_DIR/log/watchdog.log")" "restore report not sent: worker unreachable" "worker down: report failure logged"
+assert_contains "$(cat "$GITZILLA_STATE_DIR/log/gitzilla.log")" "restore report not sent: worker unreachable" "worker down: report failure logged"
 
 # --- 11. usage
 run
