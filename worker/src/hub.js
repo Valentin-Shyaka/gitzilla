@@ -23,6 +23,21 @@ export class Hub extends DurableObject {
       const dead = [...rows].filter(([, exp]) => exp <= now).map(([k]) => k);
       if (dead.length) await this.ctx.storage.delete(dead);
     }
+    for (const prefix of ["call:", "testcall:"]) {
+      const rows = await this.ctx.storage.list({ prefix });
+      const dead = [...rows].filter(([, last]) => last <= now - 3_600_000).map(([k]) => k);
+      if (dead.length) await this.ctx.storage.delete(dead);
+    }
+  }
+
+  // Call rate limit per number: normal calls 10 min apart, test calls 1 h apart (own key space).
+  async callAllowed(number, now = Date.now(), test = false) {
+    await this.#prune(now);
+    const key = `${test ? "testcall" : "call"}:${number}`;
+    const last = await this.ctx.storage.get(key);
+    if (last !== undefined && now - last < (test ? 3_600_000 : 600_000)) return false;
+    await this.ctx.storage.put(key, now);
+    return true;
   }
 
   // Returns false if the nonce was already seen (replay), true if the note was stored.
@@ -80,7 +95,7 @@ export class Hub extends DurableObject {
   async #notify(events) {
     const loud = events.filter((e) => e.level !== "silent");
     if (!loud.length) return;
-    try { await notifyEvents(loud, this.env); } catch (e) { console.error("notify failed", e); }
+    try { await notifyEvents(loud, this.env, 8000, (n) => this.callAllowed(n)); } catch (e) { console.error("notify failed", e); }
   }
 
   // Queue a push for classification GRACE_MS from now (a note may still arrive).

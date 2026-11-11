@@ -173,7 +173,7 @@ async function handleAlert(request, env) {
   const now = Date.now();
   if (Math.abs(a.ts * 1000 - now) > ALERT_SKEW_MS) return new Response("ts out of range", { status: 422 });
   if (!(await getHub(env).useNonce(a.nonce, a.ts, now))) return new Response("replayed", { status: 409 });
-  try { await notifyAccountAlert(a, env); } catch (e) { console.error("alert notify failed", e); }
+  try { await notifyAccountAlert(a, env, 8000, (n) => getHub(env).callAllowed(n)); } catch (e) { console.error("alert notify failed", e); }
   return new Response(null, { status: 204 });
 }
 
