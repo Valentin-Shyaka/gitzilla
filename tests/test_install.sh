@@ -419,6 +419,66 @@ for badtok in "tk_short" "tk_AbCdEfGhIjKlMnOpQrStUvWxYz0123" "xx_AbCdEfGhIjKlMnO
   case "$badtok" in ?*) case "$(out)" in *"$badtok"*) _bad "calls: token '$badtok' echoed" ;; *) _ok ;; esac ;; esac
   no_call_secret_anywhere "calls: nothing leaked on a bad token"
 done
+# a mistyped number or token is asked again (up to 3 tries): the one-time secrets were already printed
+NOT_SAVED="not saved"
+reset
+mkkey notekey ecdsa; cp "$T/keys/notekey.pub" "$GITZILLA_CONFIG_DIR/push-note.pub"
+GITZILLA_INSTALL_STOP_AFTER=worker runin "$SLACK\n0788123442\n$CN1\n$CTOK\n" --from-step worker
+assert_eq 0 "$(rc)" "calls retry: a mistyped number then a good one succeeds"
+assert_eq 2 "$(out | grep -o 'Phone numbers for red-alert calls' | wc -l | tr -d ' ')" "calls retry: numbers asked twice"
+assert_contains "$(out)" "+E164" "calls retry: says why the number was refused"
+assert_eq "$CN1" "$(cat "$T/secrets/NTFY_CALL_NUMBERS")" "calls retry: the good numbers are put"
+case "$(out)" in *0788123442*) _bad "calls retry: mistyped number echoed" ;; *) _ok ;; esac
+reset
+mkkey notekey ecdsa; cp "$T/keys/notekey.pub" "$GITZILLA_CONFIG_DIR/push-note.pub"
+GITZILLA_INSTALL_STOP_AFTER=worker runin "$SLACK\n$CN1\ntk_short\n$CTOK\n" --from-step worker
+assert_eq 0 "$(rc)" "calls retry: a mistyped token then a good one succeeds"
+assert_eq 2 "$(out | grep -o 'ntfy access token (tk_' | wc -l | tr -d ' ')" "calls retry: token asked twice"
+assert_eq 1 "$(out | grep -o 'Phone numbers for red-alert calls' | wc -l | tr -d ' ')" "calls retry: numbers not asked again for a bad token"
+assert_eq "$CTOK" "$(cat "$T/secrets/NTFY_CALL_TOKEN")" "calls retry: the good token is put"
+no_call_secret_anywhere "calls retry: nothing leaked"
+reset
+mkkey notekey ecdsa; cp "$T/keys/notekey.pub" "$GITZILLA_CONFIG_DIR/push-note.pub"
+GITZILLA_INSTALL_STOP_AFTER=worker runin "$SLACK\n0788\n+1234\n$CN1;$CN2\n$CN1\n$CTOK\n" --from-step worker
+assert_eq 1 "$(rc)" "calls retry: three mistyped numbers give up"
+assert_eq 3 "$(out | grep -o 'Phone numbers for red-alert calls' | wc -l | tr -d ' ')" "calls retry: at most 3 tries"
+assert_eq 0 "$(nmatch 'secret put' "$T/npx.log")" "calls retry: no secret put after giving up"
+assert_contains "$(out)" "$NOT_SAVED" "calls retry: says the secrets shown are not saved"
+assert_contains "$(out)" "--from-step worker" "calls retry: says to rerun the worker step"
+assert_contains "$(out)" "type rotate" "calls retry: says to type rotate"
+assert_eq "" "$(step_file)" "calls retry: step not recorded"
+reset
+mkkey notekey ecdsa; cp "$T/keys/notekey.pub" "$GITZILLA_CONFIG_DIR/push-note.pub"
+GITZILLA_INSTALL_STOP_AFTER=worker runin "$SLACK\n$CN1\ntk_a\ntk_b\ntk_c\n$CTOK\n" --from-step worker
+assert_eq 1 "$(rc)" "calls retry: three mistyped tokens give up"
+assert_eq 3 "$(out | grep -o 'ntfy access token (tk_' | wc -l | tr -d ' ')" "calls retry: token at most 3 tries"
+assert_contains "$(out)" "$NOT_SAVED" "calls retry: token give-up says the secrets are not saved"
+assert_contains "$(out)" "type rotate" "calls retry: token give-up says to type rotate"
+assert_eq 0 "$(nmatch 'secret put' "$T/npx.log")" "calls retry: no secret put after token give-up"
+# end of input after a mistyped value: the same message, no hang
+reset
+mkkey notekey ecdsa; cp "$T/keys/notekey.pub" "$GITZILLA_CONFIG_DIR/push-note.pub"
+GITZILLA_INSTALL_STOP_AFTER=worker runin "$SLACK\n0788\n" --from-step worker
+assert_eq 1 "$(rc)" "calls retry: end of input after a mistyped number fails"
+assert_contains "$(out)" "$NOT_SAVED" "calls retry: end of input says the secrets are not saved"
+# Slack URL: same retry
+reset
+mkkey notekey ecdsa; cp "$T/keys/notekey.pub" "$GITZILLA_CONFIG_DIR/push-note.pub"
+GITZILLA_INSTALL_STOP_AFTER=worker runin "http://x\n$SLACK\n\n" --from-step worker
+assert_eq 0 "$(rc)" "slack retry: a non-https URL then a good one succeeds"
+assert_eq "$SLACK" "$(cat "$T/secrets/SLACK_WEBHOOK_URL")" "slack retry: the good URL is put"
+# calls skipped on rotate: older NTFY_CALL_* secrets may still be in the Worker, so do not claim calls are off
+CALLS_KEPT="Call settings unchanged in the Worker; to remove them: npx wrangler secret delete NTFY_CALL_NUMBERS / NTFY_CALL_TOKEN"
+reset
+mkkey notekey ecdsa; cp "$T/keys/notekey.pub" "$GITZILLA_CONFIG_DIR/push-note.pub"
+GITZILLA_INSTALL_STOP_AFTER=worker runin "$SLACK\n\n" --from-step worker
+case "$(out)" in *"$CALLS_KEPT"*) _bad "calls skipped (fresh): no 'unchanged' message" ;; *) _ok ;; esac
+: > "$T/npx.log"
+GITZILLA_INSTALL_STOP_AFTER=worker runin "rotate\n$SLACK\n\n" --from-step worker
+assert_eq 0 "$(rc)" "calls skipped (rotate): ok"
+assert_contains "$(out)" "$CALLS_KEPT" "calls skipped (rotate): says the call settings are unchanged and how to remove them"
+case "$(out)" in *"do not ring the phone"*) _bad "calls skipped (rotate): must not claim calls are off" ;; *) _ok ;; esac
+assert_eq 0 "$(nmatch 'NTFY_CALL' "$T/npx.log")" "calls skipped (rotate): no call secret put or deleted"
 # alert time zone: GITZILLA_ALERT_TZ wins, the config value is kept on a rerun, no usable zone -> UTC
 reset
 mkkey notekey ecdsa; cp "$T/keys/notekey.pub" "$GITZILLA_CONFIG_DIR/push-note.pub"

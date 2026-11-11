@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # install.sh [--from-step <name>] — guided, resumable install of the gitzilla. Compatible with macOS bash 3.2.
 #
+# GITZILLA_PROFILE=<name> installs a separate instance (bin/lib.sh: its own config, state and launchd labels
+# io.github.gitzilla.<name>.<job>); unset = personal. The hook step refuses in a profile.
+#
 # Steps (in order): prereqs note-key worker github-app hook repos mirrors known-keys launchd first-rotation self-test
 # $STATE/install-step holds the last completed step; a rerun resumes after it. --from-step <name> forces the start.
 #
@@ -37,7 +40,7 @@ REMOTE_TPL="${GITZILLA_REMOTE_URL_TEMPLATE:-git@github.com:%s.git}"
 POLL_INTERVAL="${GITZILLA_POLL_INTERVAL:-5}"
 POLL_TIMEOUT="${GITZILLA_POLL_TIMEOUT:-180}"
 KEY_RE='^(ssh-|ecdsa-|sk-)[^ ]+ [A-Za-z0-9+/=]+'
-LABEL_PREFIX="io.github.gitzilla"
+LABEL_PREFIX="io.github.gitzilla${GITZILLA_PROFILE:+.$GITZILLA_PROFILE}" # personal: io.github.gitzilla.<job>
 STEPS="prereqs note-key worker github-app hook repos mirrors known-keys launchd first-rotation self-test"
 STEPFILE="$STATE/install-step"
 PUBFILE="$GITZILLA_CONFIG_DIR/push-note.pub"
@@ -176,9 +179,48 @@ check_call_numbers() {
   return 0
 }
 
+# Validators for ask_hidden_valid: 0 if the answer is acceptable, else 1 with CHECK_ERR set (never holding the input).
+check_slack_url() {
+  CHECK_ERR="the Slack webhook URL must start with https://"
+  case "$1" in ''|https://*) return 0 ;; esac
+  return 1
+}
+check_call_input() { # empty = skip calls
+  local v="${1// /}"
+  [ -z "$v" ] && return 0
+  check_call_numbers "$v" || { CHECK_ERR="$CALL_ERR"; return 1; }
+}
+check_call_token() {
+  local tre='^tk_[A-Za-z0-9]{29}$'
+  CHECK_ERR="invalid ntfy access token: it must be tk_ followed by 29 letters or digits (ntfy.sh > Account > Access tokens)"
+  [[ $1 =~ $tre ]]
+}
+
+# ask_hidden_valid <prompt> <check-fn>: reads a hidden answer into ASK_VAL until <check-fn> accepts it, at most 3
+# tries (a mistyped answer is asked again, since the one-time secrets are already on screen). End of input on the
+# first try is an empty answer. The third refusal, or end of input after a refusal, gives up: the WEBHOOK_SECRET and
+# NTFY_TOPIC just printed were never put, so the message says to rerun the step and rotate.
+ask_hidden_valid() {
+  local n=0 why
+  ASK_VAL=""
+  while :; do
+    n=$((n + 1))
+    printf '%s' "$1"
+    if read -rs ASK_VAL; then echo; else
+      ASK_VAL=""; echo
+      [ "$n" -eq 1 ] || { why="$CHECK_ERR (no answer after it)"; break; }
+    fi
+    "$2" "$ASK_VAL" && return 0
+    printf 'install: %s\n' "$CHECK_ERR" >&2
+    [ "$n" -lt 3 ] || { why="$CHECK_ERR (3 tries)"; break; }
+  done
+  ASK_VAL=""
+  worker_die "$why. The WEBHOOK_SECRET and NTFY_TOPIC shown above are not saved: rerun ./install.sh --from-step worker and type rotate (when asked) to get new ones"
+}
+
 step_worker() {
   [ -s "$PUBFILE" ] || die "no $PUBFILE: run the note-key step first"
-  local owner pub out url wsec topic slack nums ctok tre left last mode=fresh ans drill app tz
+  local owner pub out url wsec topic slack nums ctok left last mode=fresh ans drill app tz
   owner="${OWNER:-$("$GH" api user --jq .login 2>/dev/null)}"
   [ -n "$owner" ] || die "cannot determine the GitHub login (gh api user)"
   app="$(app_name_for "$owner")"
@@ -222,19 +264,13 @@ step_worker() {
     say "NTFY_TOPIC (shown once; subscribe to it in the ntfy app on your phone):"
     say "  $topic"
     say ""
-    printf 'Slack incoming-webhook URL, or press Enter to skip Slack (input hidden): '
-    read -rs slack || slack=""; echo
-    case "$slack" in ''|https://*) ;; *) worker_die "the Slack webhook URL must start with https://" ;; esac
-    printf 'Phone numbers for red-alert calls, comma-separated +E164 (ntfy Pro; Enter to skip) (input hidden): '
-    read -rs nums || nums=""; echo
-    nums="${nums// /}"; ctok=""
+    ask_hidden_valid 'Slack incoming-webhook URL, or press Enter to skip Slack (input hidden): ' check_slack_url
+    slack="$ASK_VAL"; ASK_VAL=""
+    ask_hidden_valid 'Phone numbers for red-alert calls, comma-separated +E164 (ntfy Pro; Enter to skip) (input hidden): ' check_call_input
+    nums="${ASK_VAL// /}"; ASK_VAL=""; ctok=""
     if [ -n "$nums" ]; then
-      check_call_numbers "$nums" || { nums=""; worker_die "$CALL_ERR"; }
-      printf 'ntfy access token (tk_...) (input hidden): '
-      read -rs ctok || ctok=""; echo
-      tre='^tk_[A-Za-z0-9]{29}$'
-      [[ $ctok =~ $tre ]] \
-        || { nums=""; ctok=""; worker_die "invalid ntfy access token: it must be tk_ followed by 29 letters or digits (ntfy.sh > Account > Access tokens)"; }
+      ask_hidden_valid 'ntfy access token (tk_...) (input hidden): ' check_call_token
+      ctok="$ASK_VAL"; ASK_VAL=""
     fi
     ( cd "$here/worker" || exit 1
       printf '%s' "$wsec" | "$NPX" wrangler secret put WEBHOOK_SECRET || exit 1
@@ -248,7 +284,14 @@ step_worker() {
       fi
     ) || { wsec=""; topic=""; slack=""; nums=""; ctok=""; worker_die "wrangler secret put failed"; }
     [ -n "$slack" ] || say "Slack skipped: alerts go to the phone (ntfy) only"
-    [ -n "$nums" ] || say "Calls skipped: red alerts do not ring the phone"
+    if [ -z "$nums" ]; then
+      # a rotate keeps any NTFY_CALL_* secrets a previous run put, so calls may still be on
+      if [ "$mode" = rotate ]; then
+        say "Call settings unchanged in the Worker; to remove them: npx wrangler secret delete NTFY_CALL_NUMBERS / NTFY_CALL_TOKEN"
+      else
+        say "Calls skipped: red alerts do not ring the phone"
+      fi
+    fi
     wsec=""; topic=""; slack=""; nums=""; ctok=""
     # Only an app that already exists needs its webhook secret edited; before that the create flow uses the new secret.
     if [ "$mode" = rotate ]; then
@@ -412,6 +455,8 @@ install_standalone() {
 #   - no hook: install the standalone hook.
 # Also records the absolute node (scanner/node-path) and jq ($GITZILLA_CONFIG_DIR/jq-path) for hooks run by GUI clients.
 step_hook() {
+  # one global pre-push hook serves every profile; routing notes per profile comes later
+  [ -z "$GITZILLA_PROFILE" ] || die "profile $GITZILLA_PROFILE: the hook is installed by the personal profile (run ./install.sh --from-step hook without GITZILLA_PROFILE); nothing changed"
   case "$GITZILLA_HOME" in *\"*|*\$*|*\`*|*\\*) die "unsupported characters in $GITZILLA_HOME" ;; esac
   [ -f "$here/hooks/pre-push" ] || die "hooks/pre-push not found next to install.sh"
   local dir set_path=0 tmp prev link existing
@@ -623,8 +668,12 @@ step_known_keys() {
   say "known-keys.txt written"
 }
 
-render() { # template out
-  sed -e "s|@LABEL@|$3|g" -e "s|@GITZILLA_HOME@|$GITZILLA_HOME|g" -e "s|@STATE@|$STATE|g" \
+# render <template> <out> <label>: fill the launchd template. The @PROFILE@ line becomes the GITZILLA_PROFILE
+# environment entry in a profile and is dropped for personal (so a personal plist is what it was before profiles).
+render() {
+  local prof='/@PROFILE@/d'
+  [ -z "$GITZILLA_PROFILE" ] || prof="s|@PROFILE@|<key>GITZILLA_PROFILE</key><string>$GITZILLA_PROFILE</string>|"
+  sed -e "$prof" -e "s|@LABEL@|$3|g" -e "s|@GITZILLA_HOME@|$GITZILLA_HOME|g" -e "s|@STATE@|$STATE|g" \
       -e "s|@CONFIG@|$GITZILLA_CONFIG_DIR|g" "$1" > "$2"
 }
 

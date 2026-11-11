@@ -18,7 +18,7 @@ printf '[user]\n\tname = Test\n\temail = test@example.com\n' > "$GIT_CONFIG_GLOB
 export GITZILLA_CONFIG_DIR="$T/config"
 export GITZILLA_STATE_DIR="$T/state"
 mkdir -p "$GITZILLA_CONFIG_DIR" "$GITZILLA_STATE_DIR"
-unset SSH_AUTH_SOCK GIT_SSH_COMMAND
+unset SSH_AUTH_SOCK GIT_SSH_COMMAND GITZILLA_PROFILE # personal unless a test sets a profile
 
 PASS=0; FAIL=0
 _ok()  { PASS=$((PASS+1)); }
@@ -33,6 +33,7 @@ finish() { echo "  $PASS passed, $FAIL failed"; [ "$FAIL" -eq 0 ]; }
 
 # Test signing key + allowed_signers.
 make_test_key() {
+  rm -f "$T/key" "$T/key.pub" # a second call must not stop at ssh-keygen's "Overwrite (y/n)?" prompt
   ssh-keygen -q -t ed25519 -N '' -C test -f "$T/key" >/dev/null
   export GITZILLA_SIGN_KEY="$T/key"
   echo "test-owner $(cut -d' ' -f1,2 "$T/key.pub")" > "$T/allowed_signers"

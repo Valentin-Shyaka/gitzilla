@@ -518,7 +518,12 @@ assert_eq 2 "$(grep -c '^IdentityAgent=' "$T/ssh.argv")" "space: one IdentityAge
 assert_eq "IdentityAgent=$T/sp ace/home/Library/Containers/com.maxgoedjen.Secretive.SecretAgent/Data/socket.ssh" "$(grep '^IdentityAgent=' "$T/ssh.argv" | head -n1)" "space: IdentityAgent intact with the space"
 
 # --- 11d. I5: reconcile alerts also go, signed, to the Worker's /alert (phone + Slack); M3: revoke line locally
-make_test_key
+# The test key exists already (section 3): a second make_test_key with stdin open must not stop at ssh-keygen's
+# "Overwrite (y/n)?" prompt (a 'n' on stdin would keep the old key; an open terminal would hang).
+fp_before="$(ssh-keygen -lf "$T/key.pub" | awk '{print $2}')"
+mk_out="$(printf 'n\n' | make_test_key 2>&1)"
+case "$mk_out" in *Overwrite*) _bad "make_test_key twice: no Overwrite prompt" ;; *) _ok ;; esac
+[ "$(ssh-keygen -lf "$T/key.pub" | awk '{print $2}')" != "$fp_before" ] && _ok || _bad "make_test_key twice: a fresh key"
 export STUB_ALERT_STATUS_FILE="$T/alert.status"; rm -f "$T/alert.status"
 start_stub
 cp "$GITZILLA_CONFIG_DIR/config" "$T/config.rec"

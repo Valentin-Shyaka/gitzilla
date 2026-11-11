@@ -95,7 +95,7 @@ hook stops scanning and sending notes (pushes still go through, each one an oran
 |---|---|
 | `prereqs` | checks the tools, Secretive, `gh auth status` and `~/.ssh/github-auth.pub` |
 | `note-key` | you create a key named `push-note` in Secretive (Authentication: **Not Required**, so the hook can sign without a prompt) and copy its public key; it is saved to `~/.config/gitzilla/push-note.pub` |
-| `worker` | `npm ci`, `wrangler login` (browser), deploys the Worker with the note public key, then prints the webhook secret and a random ntfy topic **once** and puts them as Worker secrets. Asks for the Slack URL (hidden; press Enter to skip Slack), then the phone numbers for red-alert calls (hidden; comma-separated `+E164`, 1 to 5; press Enter to skip calls) and, if you gave numbers, the ntfy access token (hidden; `tk_` and 29 letters or digits). A malformed number or token stops the step before any secret is put. Runs `wrangler logout` and checks no Cloudflare token is left on disk. Alerts show times in UTC and in your zone: the deploy passes `ALERT_TZ` (the Mac's zone from `/etc/localtime`, or `GITZILLA_ALERT_TZ=Europe/Paris ./install.sh --from-step worker`; an unknown zone falls back to UTC). Writes `~/.config/gitzilla/config` (`OWNER`, `GITZILLA_URL`, `APP_NAME`, `DRILL_REPO`, `ALERT_TZ`, ...). On a rerun it asks whether to keep the secrets (default, redeploy only) or `rotate` them |
+| `worker` | `npm ci`, `wrangler login` (browser), deploys the Worker with the note public key, then prints the webhook secret and a random ntfy topic **once** and puts them as Worker secrets. Asks for the Slack URL (hidden; press Enter to skip Slack), then the phone numbers for red-alert calls (hidden; comma-separated `+E164`, 1 to 5; press Enter to skip calls) and, if you gave numbers, the ntfy access token (hidden; `tk_` and 29 letters or digits). A mistyped Slack URL, number or token is asked again (3 tries); if it still fails, the step stops before any secret is put, and the webhook secret and topic it printed are not saved (rerun `--from-step worker` and type `rotate`). Runs `wrangler logout` and checks no Cloudflare token is left on disk. Alerts show times in UTC and in your zone: the deploy passes `ALERT_TZ` (the Mac's zone from `/etc/localtime`, or `GITZILLA_ALERT_TZ=Europe/Paris ./install.sh --from-step worker`; an unknown zone falls back to UTC). Writes `~/.config/gitzilla/config` (`OWNER`, `GITZILLA_URL`, `APP_NAME`, `DRILL_REPO`, `ALERT_TZ`, ...). On a rerun it asks whether to keep the secrets (default, redeploy only) or `rotate` them |
 | `github-app` | prints the exact settings for your GitHub App (`gitzilla-<your login>`, cut to 34 characters) and opens the new-app page; you create it, generate a private key (GitHub requires one before install) and install it on **all** repositories. The installer then deletes the downloaded `<app-name>.*.private-key*.pem` from `~/Downloads` after you confirm. If your drill repo does not exist it offers to create it (private). You push one commit to the drill repo; the installer waits until the push shows up in the Worker queue |
 | `hook` | installs the push note in your global `pre-push` hook (see below) |
 | `repos` | `gh repo list` into `repos.txt` (`<owner/repo> public\|private` per line) |
@@ -168,6 +168,16 @@ Calls work the same way: pressing Enter at the phone-number prompt only skips se
 
 Files: config in `~/.config/gitzilla/`, state and logs in `~/.local/state/gitzilla/`
 (`log/agent.out`, `log/reconcile.out`, `log/rotate.out`, `log/gitzilla.log`).
+
+### Profiles
+
+One Mac can run more than one gitzilla (for example your personal one and an organization's). Each extra instance is
+a profile: `GITZILLA_PROFILE=<name>` (1 to 40 lower-case letters, digits or hyphens, starting with a letter or digit;
+not `log`, `mirrors` or `incidents`) in front of `./install.sh` and the `bin/` commands. A profile keeps its config in
+`~/.config/gitzilla/<name>/`, its state, logs and mirrors in `~/.local/state/gitzilla/<name>/`, and its launchd jobs
+as `io.github.gitzilla.<name>.agent|reconcile|rotate` (the jobs carry `GITZILLA_PROFILE`). It never reads or writes
+the personal files or jobs. Without `GITZILLA_PROFILE` everything is as described above (the personal instance).
+The global pre-push hook belongs to the personal instance: the `hook` step refuses to run in a profile.
 
 ## Alert channels
 
@@ -272,6 +282,9 @@ for j in agent reconcile rotate; do
   rm ~/Library/LaunchAgents/io.github.gitzilla.$j.plist
 done
 ```
+
+For a profile, use `io.github.gitzilla.<name>.$j` above and remove only `~/.config/gitzilla/<name>` and
+`~/.local/state/gitzilla/<name>` in step 5 (the personal directories hold the profiles' directories too).
 
 1. The global hook, first (before deleting the clone): in `git config --global --includes core.hooksPath`
    (usually `~/.config/git/hooks`), if the installer created `pre-push`, delete it; if it moved your hook aside,

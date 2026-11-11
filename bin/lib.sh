@@ -1,8 +1,30 @@
-# gitzilla shared helpers. Source me; defines functions/defaults only (no output, no exit).
+# gitzilla shared helpers. Source me; defines functions/defaults only (no output, no exit), except that an invalid
+# GITZILLA_PROFILE stops the caller (exit 2) before anything is read or written.
 # Compatible with macOS bash 3.2.
 
-GITZILLA_CONFIG_DIR="${GITZILLA_CONFIG_DIR:-$HOME/.config/gitzilla}"
-STATE="${GITZILLA_STATE_DIR:-$HOME/.local/state/gitzilla}"
+# Profiles: GITZILLA_PROFILE=<p> runs a separate instance (an org's, next to the personal one) with its config in
+# ~/.config/gitzilla/<p>, its state, log and mirrors in ~/.local/state/gitzilla/<p>, and its own launchd labels.
+# Unset or empty = personal: today's paths. GITZILLA_CONFIG_DIR / GITZILLA_STATE_DIR, when set, still win (the
+# launchd jobs set both). A profile may not be named like a personal state directory (log, mirrors, incidents),
+# since its state directory would then be that one.
+GITZILLA_PROFILE="${GITZILLA_PROFILE:-}"
+if [ -n "$GITZILLA_PROFILE" ]; then
+  case "$GITZILLA_PROFILE" in
+    log|mirrors|incidents) _wd_ok=0 ;;
+    *) _wd_ok='^[a-z0-9][a-z0-9-]{0,39}$'
+       if [[ $GITZILLA_PROFILE =~ $_wd_ok ]]; then _wd_ok=1; else _wd_ok=0; fi ;;
+  esac
+  if [ "$_wd_ok" != 1 ]; then
+    printf 'gitzilla: invalid GITZILLA_PROFILE: use 1-40 lower-case letters, digits or hyphens, starting with a letter or digit (not log, mirrors or incidents)\n' >&2
+    exit 2
+  fi
+  unset _wd_ok
+  GITZILLA_CONFIG_DIR="${GITZILLA_CONFIG_DIR:-$HOME/.config/gitzilla/$GITZILLA_PROFILE}"
+  STATE="${GITZILLA_STATE_DIR:-$HOME/.local/state/gitzilla/$GITZILLA_PROFILE}"
+else
+  GITZILLA_CONFIG_DIR="${GITZILLA_CONFIG_DIR:-$HOME/.config/gitzilla}"
+  STATE="${GITZILLA_STATE_DIR:-$HOME/.local/state/gitzilla}"
+fi
 SECRETIVE_SOCK="$HOME/Library/Containers/com.maxgoedjen.Secretive.SecretAgent/Data/socket.ssh"
 WD_REVOKE="If this wasn't you: revoke tokens at https://github.com/settings/applications"
 WD_REASON=""
