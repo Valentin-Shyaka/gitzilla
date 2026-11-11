@@ -21,3 +21,4 @@ The payload sample is `tests/fixtures/stager.js.b64`. Outside the automated test
 | 10 | Notification and restore dialog from the launchd agent job (not from a Terminal) | The macOS notification and the Restore / Details / Ignore dialog both appear while the job runs under launchd | |
 | 11 | `bin/reconcile all` when it is due | Exactly one Touch ID for the whole private-repo pass | |
 | 12 | Lost-event alert after a gap beyond the Mac's queue cursor | Manual note only, not simulated against the live Worker: if the Mac ever reports "N event(s) were lost while this Mac was offline", record it here with the date and what `reconcile all` found | |
+| 13 | With calls set up, trigger a red alert (for example by repeating row 3); `bin/notify-test` checks the call on its own | The red alert rings the phone and the English voice names what happened (no SHAs); ntfy push and Slack arrive too. A second red alert within 10 min does not ring again | |

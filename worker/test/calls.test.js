@@ -43,6 +43,14 @@ describe("formatCall", () => {
     expect(name).toMatch(/^[a-z0-9._/-]{1,60}$/);
     expect(odd).not.toMatch(/[a-f0-9]{40}/);
   });
+  it("names that all sanitise to empty say \"your repositories\"", () => {
+    expect(formatCall([ev({ repo: "<>" }), ev({ repo: "!!" })])).toBe(
+      "gitzilla critical alert. Possible stolen GitHub credential. 2 events in your repositories. " +
+      "Check Slack or the ntfy app, and revoke tokens if this was not you.");
+    expect(formatCall([ev({ kind: "disarmed", repo: "" })])).toBe(
+      "gitzilla critical alert. gitzilla was disarmed for your repositories. " +
+      "Check Slack or the ntfy app, and revoke tokens if this was not you.");
+  });
   it("disarmed and account", () => {
     expect(formatCall([ev({ kind: "disarmed", repo: "o/r" })])).toBe(
       "gitzilla critical alert. gitzilla was disarmed for o/r. Check Slack or the ntfy app, and revoke tokens if this was not you.");

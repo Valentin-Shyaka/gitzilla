@@ -348,6 +348,77 @@ GITZILLA_INSTALL_STOP_AFTER=worker runin 'http://hooks.slack.com/services/x\n' -
 assert_eq 1 "$(rc)" "worker: a non-https Slack URL fails"
 assert_contains "$(out)" "must start with https://" "worker: says why"
 assert_eq 0 "$(nmatch 'secret put' "$T/npx.log")" "worker: no secret put when the Slack URL is rejected"
+# red-alert calls: numbers + ntfy token, both hidden, piped on stdin, never in argv / output / files
+CN1="+250788123442"; CN2="+14155550142"; CTOK="tk_AbCdEfGhIjKlMnOpQrStUvWxYz012"
+NUM_PROMPT="Phone numbers for red-alert calls, comma-separated +E164 (ntfy Pro; Enter to skip) (input hidden): "
+TOK_PROMPT="ntfy access token (tk_...) (input hidden): "
+no_call_secret_anywhere() { # msg
+  local h
+  h="$(grep -rlF -e "$CTOK" -e "$CN1" -e "$CN2" -e "${CN1#+}" "$HOME" "$STATE" "$GITZILLA_CONFIG_DIR" "$T/npx.log" "$T/npm.log" "$T/out" 2>/dev/null)"
+  assert_eq "" "$h" "$1"
+}
+reset
+mkkey notekey ecdsa; cp "$T/keys/notekey.pub" "$GITZILLA_CONFIG_DIR/push-note.pub"
+GITZILLA_INSTALL_STOP_AFTER=worker runin "$SLACK\n$CN1, $CN2\n$CTOK\n" --from-step worker
+assert_eq 0 "$(rc)" "calls: worker ok with numbers and token"
+assert_contains "$(out)" "$NUM_PROMPT" "calls: asks for the numbers (hidden)"
+assert_contains "$(out)" "$TOK_PROMPT" "calls: asks for the token (hidden)"
+assert_eq "$CN1,$CN2" "$(cat "$T/secrets/NTFY_CALL_NUMBERS")" "calls: numbers piped to secret put NTFY_CALL_NUMBERS"
+assert_eq "$CTOK" "$(cat "$T/secrets/NTFY_CALL_TOKEN")" "calls: token piped to secret put NTFY_CALL_TOKEN"
+assert_eq 5 "$(nmatch 'secret put' "$T/npx.log")" "calls: five secrets put"
+assert_eq 1 "$(nmatch 'secret put NTFY_CALL_NUMBERS' "$T/npx.log")" "calls: NTFY_CALL_NUMBERS put once"
+assert_eq 1 "$(nmatch 'secret put NTFY_CALL_TOKEN' "$T/npx.log")" "calls: NTFY_CALL_TOKEN put once"
+no_call_secret_anywhere "calls: numbers and token never in argv log, output, config or state"
+assert_eq 1 "$(nmatch 'logout' "$T/npx.log")" "calls: wrangler logout still runs"
+# rotate mode asks too
+printf 'rotate\n\n%s\n%s\n' "$CN1" "$CTOK" > "$T/in.rotate"; : > "$T/npx.log"; rm -rf "$T/secrets"; mkdir -p "$T/secrets"
+GITZILLA_INSTALL_STOP_AFTER=worker bash "$INSTALL" --from-step worker < "$T/in.rotate" >"$T/out" 2>&1; echo $? > "$T/rc"
+assert_eq 0 "$(rc)" "calls: rotate ok"
+assert_eq "$CN1" "$(cat "$T/secrets/NTFY_CALL_NUMBERS")" "calls: rotate puts the numbers"
+assert_eq 4 "$(nmatch 'secret put' "$T/npx.log")" "calls: rotate without Slack puts four secrets"
+no_call_secret_anywhere "calls: rotate leaks nothing"
+# keep mode: no call prompt, no secret
+: > "$T/npx.log"
+GITZILLA_INSTALL_STOP_AFTER=worker runin '\n' --from-step worker
+case "$(out)" in *"$NUM_PROMPT"*) _bad "calls: keep mode must not ask for numbers" ;; *) _ok ;; esac
+assert_eq 0 "$(nmatch 'NTFY_CALL' "$T/npx.log")" "calls: keep mode puts no call secret"
+# skip: Enter at the numbers prompt -> no token prompt, no call secrets
+reset
+mkkey notekey ecdsa; cp "$T/keys/notekey.pub" "$GITZILLA_CONFIG_DIR/push-note.pub"
+GITZILLA_INSTALL_STOP_AFTER=worker runin "$SLACK\n\n" --from-step worker
+assert_eq 0 "$(rc)" "calls: skip ok"
+assert_contains "$(out)" "$NUM_PROMPT" "calls: skip still asks for numbers"
+case "$(out)" in *"$TOK_PROMPT"*) _bad "calls: no token prompt without numbers" ;; *) _ok ;; esac
+assert_eq 0 "$(nmatch 'NTFY_CALL' "$T/npx.log")" "calls: skip puts no call secret"
+assert_eq 3 "$(nmatch 'secret put' "$T/npx.log")" "calls: skip puts the other three"
+assert_contains "$(out)" "Calls skipped" "calls: says calls were skipped"
+# invalid inputs die before any secret put, and never echo the value
+for bad in "0788123442" "+0123456789" "+1234" "+1234567890123456" "$CN1,,$CN2" "$CN1;$CN2" \
+           "+14155550101,+14155550102,+14155550103,+14155550104,+14155550105,+14155550106"; do
+  reset
+  mkkey notekey ecdsa; cp "$T/keys/notekey.pub" "$GITZILLA_CONFIG_DIR/push-note.pub"
+  GITZILLA_INSTALL_STOP_AFTER=worker runin "$SLACK\n$bad\n$CTOK\n" --from-step worker
+  assert_eq 1 "$(rc)" "calls: invalid numbers '$bad' fail"
+  assert_eq 0 "$(nmatch 'secret put' "$T/npx.log")" "calls: no secret put for '$bad'"
+  case "$(out)" in *"${bad#+}"*) _bad "calls: invalid input '$bad' echoed" ;; *) _ok ;; esac
+  assert_eq "" "$(step_file)" "calls: step not recorded for '$bad'"
+done
+assert_contains "$(out)" "at most 5" "calls: too many numbers says the limit"
+reset
+mkkey notekey ecdsa; cp "$T/keys/notekey.pub" "$GITZILLA_CONFIG_DIR/push-note.pub"
+GITZILLA_INSTALL_STOP_AFTER=worker runin "$SLACK\n0788\n" --from-step worker
+assert_eq 1 "$(rc)" "calls: a local-format number fails"
+assert_contains "$(out)" "+E164" "calls: invalid number message says +E164"
+for badtok in "tk_short" "tk_AbCdEfGhIjKlMnOpQrStUvWxYz0123" "xx_AbCdEfGhIjKlMnOpQrStUvWxYz012" "tk_AbCdEfGhIjKlMnOpQrStUvWxY-012" ""; do
+  reset
+  mkkey notekey ecdsa; cp "$T/keys/notekey.pub" "$GITZILLA_CONFIG_DIR/push-note.pub"
+  GITZILLA_INSTALL_STOP_AFTER=worker runin "$SLACK\n$CN1\n$badtok\n" --from-step worker
+  assert_eq 1 "$(rc)" "calls: invalid token '$badtok' fails"
+  assert_contains "$(out)" "ntfy access token" "calls: says the token is invalid ('$badtok')"
+  assert_eq 0 "$(nmatch 'secret put' "$T/npx.log")" "calls: no secret put for token '$badtok'"
+  case "$badtok" in ?*) case "$(out)" in *"$badtok"*) _bad "calls: token '$badtok' echoed" ;; *) _ok ;; esac ;; esac
+  no_call_secret_anywhere "calls: nothing leaked on a bad token"
+done
 # alert time zone: GITZILLA_ALERT_TZ wins, the config value is kept on a rerun, no usable zone -> UTC
 reset
 mkkey notekey ecdsa; cp "$T/keys/notekey.pub" "$GITZILLA_CONFIG_DIR/push-note.pub"
@@ -984,6 +1055,41 @@ GITZILLA_INSTALL_STOP_AFTER=known-keys run --from-step known-keys
 assert_eq 0 "$(rc)" "known-keys: existing file skipped"
 assert_contains "$(cat "$STATE/known-keys.txt")" "marker" "known-keys: existing file untouched"
 
+# --- 9b. self-test row 3: test alert to every channel
+ROW3="Send a test alert to every channel (rings the phone if calls are set up)?"
+cat > "$S/notify-test" <<STUB
+#!/bin/sh
+echo run >> "$T/notify-test.log"
+[ -f "$T/nt.fail" ] && { echo "test alert not sent: worker returned 401" >&2; exit 1; }
+echo "test alert sent"
+STUB
+chmod +x "$S/notify-test"
+export GITZILLA_NOTIFY_TEST_CMD="$S/notify-test"
+reset; write_config
+runin 'y\ny\ny\ny\n' --from-step self-test
+assert_eq 0 "$(rc)" "row3: self-test ok"
+assert_contains "$(out)" "$ROW3" "row3: asks to send a test alert"
+assert_eq 1 "$(nmatch run "$T/notify-test.log")" "row3: runs notify-test once"
+assert_contains "$(out)" "test alert sent" "row3: shows the notify-test result"
+assert_contains "$(out)" "every channel" "row3: asks whether every channel received it"
+assert_contains "$(cat "$STATE/install-selftest.log")" "row3 pass" "row3: pass recorded"
+assert_contains "$(out)" "self-test passed" "row3: all rows passed"
+reset; write_config
+runin 'y\ny\ny\nn\n' --from-step self-test
+assert_contains "$(cat "$STATE/install-selftest.log")" "row3 FAIL" "row3: a channel missing -> FAIL"
+reset; write_config; : > "$T/nt.fail"
+runin 'y\ny\ny\ny\n' --from-step self-test
+assert_eq 0 "$(rc)" "row3: a failing notify-test is not fatal"
+assert_contains "$(out)" "worker returned 401" "row3: shows why the test alert failed"
+assert_contains "$(cat "$STATE/install-selftest.log")" "row3 FAIL" "row3: send failure recorded"
+rm -f "$T/nt.fail"
+reset; write_config
+runin 'y\ny\nn\n' --from-step self-test
+assert_eq 0 "$(nmatch run "$T/notify-test.log")" "row3: declined -> notify-test not run"
+assert_contains "$(cat "$STATE/install-selftest.log")" "row3 skipped" "row3: declined -> skipped"
+assert_contains "$(out)" "self-test passed" "row3: skipping row 3 still passes"
+unset GITZILLA_NOTIFY_TEST_CMD
+
 # --- 10. launchd + first-rotation + self-test; rerun idempotent
 reset
 write_config
@@ -1044,6 +1150,7 @@ assert_eq "gh" "$(cat "$T/rotate.log")" "chain: first-rotation runs rotate gh"
 assert_contains "$(cat "$STATE/install-selftest.log")" "row2 FAIL" "self-test: failure recorded"
 assert_contains "$(cat "$STATE/install-selftest.log")" "row1 pass" "self-test: pass recorded"
 assert_contains "$(out)" "Row 2 result: an orange (🟠) alert reached your phone within 30 seconds?" "M11: self-test row 2 targets the phone within 30 s"
+assert_contains "$(cat "$STATE/install-selftest.log")" "row3 skipped" "self-test: no answer -> row 3 skipped"
 # finished install: plain rerun does nothing
 run
 assert_eq 0 "$(rc)" "rerun after completion: exit 0"

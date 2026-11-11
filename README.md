@@ -15,8 +15,8 @@ no credential that can push code.
 - **Webhook.** A private GitHub App (read-only: Contents, Metadata) sends push events to the same Worker.
   A push with no matching note is an alert: orange for one stray push, red for a force-push, a burst across
   repos, or the app being uninstalled / losing repos ("gitzilla disarmed").
-- **Alerts** go to ntfy (phone) and, if you set it up, Slack. They carry repo, ref, SHAs and flags, never commit
-  content.
+- **Alerts** go to ntfy (phone) and, if you set it up, Slack; red alerts can also ring your phone (ntfy Pro). They
+  carry repo, ref, SHAs and flags, never commit content.
 - **Mac agent** (`bin/agent`, every 5 min) drains the Worker queue, keeps bare mirrors of all repos up to date,
   deep-checks suspicious pushes (unsigned commits, scanner hits) and can upgrade orange to red.
 - **Restore** (`bin/restore`) rewinds the affected branches from the local mirrors, after you confirm.
@@ -37,6 +37,7 @@ Design record: `docs/design.md`.
 - a Cloudflare account (the free plan is enough); the installer logs in with `wrangler login` and logs out again
 - the [ntfy](https://ntfy.sh) app on your phone
 - optional: a Slack incoming-webhook URL
+- optional: an [ntfy Pro](https://ntfy.sh/#pricing) account with verified phone numbers, for voice calls on red alerts
 - strongly recommended: SSH-signed commits (see "Commit signing" below)
 
 ### Secretive SSH setup
@@ -94,7 +95,7 @@ hook stops scanning and sending notes (pushes still go through, each one an oran
 |---|---|
 | `prereqs` | checks the tools, Secretive, `gh auth status` and `~/.ssh/github-auth.pub` |
 | `note-key` | you create a key named `push-note` in Secretive (Authentication: **Not Required**, so the hook can sign without a prompt) and copy its public key; it is saved to `~/.config/gitzilla/push-note.pub` |
-| `worker` | `npm ci`, `wrangler login` (browser), deploys the Worker with the note public key, then prints the webhook secret and a random ntfy topic **once** and puts them as Worker secrets. Asks for the Slack URL (hidden; press Enter to skip Slack). Runs `wrangler logout` and checks no Cloudflare token is left on disk. Alerts show times in UTC and in your zone: the deploy passes `ALERT_TZ` (the Mac's zone from `/etc/localtime`, or `GITZILLA_ALERT_TZ=Europe/Paris ./install.sh --from-step worker`; an unknown zone falls back to UTC). Writes `~/.config/gitzilla/config` (`OWNER`, `GITZILLA_URL`, `APP_NAME`, `DRILL_REPO`, `ALERT_TZ`, ...). On a rerun it asks whether to keep the secrets (default, redeploy only) or `rotate` them |
+| `worker` | `npm ci`, `wrangler login` (browser), deploys the Worker with the note public key, then prints the webhook secret and a random ntfy topic **once** and puts them as Worker secrets. Asks for the Slack URL (hidden; press Enter to skip Slack), then the phone numbers for red-alert calls (hidden; comma-separated `+E164`, 1 to 5; press Enter to skip calls) and, if you gave numbers, the ntfy access token (hidden; `tk_` and 29 letters or digits). A malformed number or token stops the step before any secret is put. Runs `wrangler logout` and checks no Cloudflare token is left on disk. Alerts show times in UTC and in your zone: the deploy passes `ALERT_TZ` (the Mac's zone from `/etc/localtime`, or `GITZILLA_ALERT_TZ=Europe/Paris ./install.sh --from-step worker`; an unknown zone falls back to UTC). Writes `~/.config/gitzilla/config` (`OWNER`, `GITZILLA_URL`, `APP_NAME`, `DRILL_REPO`, `ALERT_TZ`, ...). On a rerun it asks whether to keep the secrets (default, redeploy only) or `rotate` them |
 | `github-app` | prints the exact settings for your GitHub App (`gitzilla-<your login>`, cut to 34 characters) and opens the new-app page; you create it, generate a private key (GitHub requires one before install) and install it on **all** repositories. The installer then deletes the downloaded `<app-name>.*.private-key*.pem` from `~/Downloads` after you confirm. If your drill repo does not exist it offers to create it (private). You push one commit to the drill repo; the installer waits until the push shows up in the Worker queue |
 | `hook` | installs the push note in your global `pre-push` hook (see below) |
 | `repos` | `gh repo list` into `repos.txt` (`<owner/repo> public\|private` per line) |
@@ -102,7 +103,7 @@ hook stops scanning and sending notes (pushes still go through, each one an oran
 | `known-keys` | shows the SSH keys GitHub lists for you; you type `yes` to trust them as the baseline |
 | `launchd` | installs three LaunchAgents: `agent` (every 5 min), `reconcile` (hourly), `rotate` (daily 10:00) |
 | `first-rotation` | `rotate gh`: replaces your gh login with a fine-grained, 7-day, read-mostly token |
-| `self-test` | a signed push (no alert) and a `--no-verify` push (orange alert on the phone) |
+| `self-test` | a signed push (no alert), a `--no-verify` push (orange alert on the phone) and, if you say yes, a test alert to every channel (`bin/notify-test`; rings the phone if calls are set up) |
 
 In the ntfy app, subscribe to the topic printed in the `worker` step.
 
@@ -159,8 +160,30 @@ set up once, the old `SLACK_WEBHOOK_URL` secret stays in the Worker and alerts k
 `cd worker && npx wrangler login && npx wrangler secret delete SLACK_WEBHOOK_URL && npx wrangler logout`
 (then revoke the webhook in Slack).
 
+Calls work the same way: pressing Enter at the phone-number prompt only skips setting `NTFY_CALL_NUMBERS` and
+`NTFY_CALL_TOKEN`. To stop calls that were set up before:
+`cd worker && npx wrangler login && npx wrangler secret delete NTFY_CALL_NUMBERS && npx wrangler secret delete NTFY_CALL_TOKEN && npx wrangler logout`
+(then delete the token at https://ntfy.sh/account). To change the numbers or the token, rerun
+`./install.sh --from-step worker` and type `rotate` (this also regenerates the webhook secret and ntfy topic).
+
 Files: config in `~/.config/gitzilla/`, state and logs in `~/.local/state/gitzilla/`
 (`log/agent.out`, `log/reconcile.out`, `log/rotate.out`, `log/gitzilla.log`).
+
+## Alert channels
+
+| Channel | Gets | Setup |
+|---|---|---|
+| ntfy push | every alert (red, orange, restore reports, account alerts) | free; subscribe to the topic printed in the `worker` step |
+| Slack | the same alerts as ntfy | optional incoming-webhook URL in the `worker` step |
+| Voice call | red alerts only (critical pushes, "gitzilla disarmed", a new key on your account) and the test alert | optional; needs [ntfy Pro](https://ntfy.sh/#pricing), an access token, and each number verified in the ntfy web app (Account, Phone numbers) first |
+
+- Calls say only what happened (for example "Possible stolen GitHub credential. 2 events in owner/repo"), never
+  SHAs or commit content; then check Slack or the ntfy app for details. The voice is English only.
+- Each number gets at most one call per 10 minutes, however many events arrive; the test alert calls at most once
+  per hour per number. ntfy Pro plans also cap calls per day (see their pricing page); calls beyond the quota fail
+  quietly, and push and Slack still arrive. A failing call never blocks the push or Slack alert.
+- `bin/notify-test` sends a signed test alert (`🔴 gitzilla: test alert`) to every channel and prints
+  `test alert sent` or why it failed. Run it after changing a channel.
 
 ## Drill
 
@@ -227,6 +250,7 @@ stolen token short-lived, so there is no longer snooze).
 |---|---|---|
 | Webhook secret | Worker secret (printed once at install) | Send fake webhooks to your Worker (false alerts). Cannot read or change code. |
 | ntfy topic, Slack webhook URL | Worker secrets | Read / send alerts (repo names, SHAs, no content). |
+| ntfy call token, call phone numbers | Worker secrets (`NTFY_CALL_TOKEN`, `NTFY_CALL_NUMBERS`), typed hidden at install, piped on stdin, never on disk or in logs (Worker logs show masked numbers) | Place calls on your ntfy account to your verified numbers (uses up your call quota) and learn the numbers. Delete the token at https://ntfy.sh/account |
 | `push-note` key | Secure Enclave (Secretive), **no Touch ID** | Not exportable. Only malware *on this Mac* could sign notes. |
 | `github-auth` key | Secure Enclave (Secretive), Touch ID per use | Not exportable. Used for deep checks, mirrors and restore pushes. |
 | GitHub App private key | **Not kept.** GitHub requires one to install the app and stores only the public half; the downloaded `.pem` is deleted right after install | nothing |
@@ -257,7 +281,7 @@ done
    directory in that file): undo it with `git config --global --unset core.hooksPath`.
 2. Delete the GitHub App: https://github.com/settings/apps, your `gitzilla-<login>` app, Advanced, Delete.
 3. Delete the Worker: `cd worker && npx wrangler login && npx wrangler delete && npx wrangler logout`.
-4. Delete the `push-note` key in Secretive, the ntfy subscription and the Slack webhook (if any); delete the drill
+4. Delete the `push-note` key in Secretive, the ntfy subscription, the ntfy call token (if any) and the Slack webhook (if any); delete the drill
    repo if you like.
 5. `rm -rf ~/.config/gitzilla ~/.local/state/gitzilla`, then delete the clone.
 

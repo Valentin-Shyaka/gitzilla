@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# notify-test: sends one signed test alert (POST /alert, kind "test", namespace gitzilla-alert). The Worker posts it
+# to ntfy and Slack and, if calls are set up, rings every number (at most once an hour per number).
+# Prints "test alert sent" and exits 0, or prints the reason and exits 1.
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$here/lib.sh"
+
+if wd_send_alert test </dev/null; then
+  wd_log "notify-test: test alert sent"
+  echo "test alert sent"
+  exit 0
+fi
+wd_log "notify-test: test alert not sent: $WD_REASON"
+echo "test alert not sent: $WD_REASON" >&2
+exit 1

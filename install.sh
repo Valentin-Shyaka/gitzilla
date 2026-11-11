@@ -5,10 +5,11 @@
 # $STATE/install-step holds the last completed step; a rerun resumes after it. --from-step <name> forces the start.
 #
 # No secret is ever written to disk or to the log: WEBHOOK_SECRET and NTFY_TOPIC are printed once and piped to
-# `wrangler secret put` on stdin; the (optional) Slack URL is read silently and piped the same way.
+# `wrangler secret put` on stdin; the (optional) Slack URL, red-alert call numbers and ntfy call token are read
+# silently and piped the same way.
 #
 # Env overrides (tests): GITZILLA_GH_CMD, GITZILLA_NPM_CMD, GITZILLA_NPX_CMD, GITZILLA_OPEN_CMD, GITZILLA_PBPASTE_CMD,
-# GITZILLA_CURL, GITZILLA_LAUNCHCTL_CMD, GITZILLA_RM_CMD, GITZILLA_LAUNCHD_POLL/RETRY, GITZILLA_RECONCILE_CMD, GITZILLA_ROTATE_CMD, GITZILLA_SECRETIVE_APP,
+# GITZILLA_CURL, GITZILLA_LAUNCHCTL_CMD, GITZILLA_NOTIFY_TEST_CMD, GITZILLA_RM_CMD, GITZILLA_LAUNCHD_POLL/RETRY, GITZILLA_RECONCILE_CMD, GITZILLA_ROTATE_CMD, GITZILLA_SECRETIVE_APP,
 # GITZILLA_REMOTE_URL_TEMPLATE, GITZILLA_POLL_INTERVAL, GITZILLA_POLL_TIMEOUT, GITZILLA_INSTALL_STOP_AFTER (stop
 # after that step).
 # Install-time setting: GITZILLA_DRILL_REPO (name of the throwaway drill repo; default gitzilla-drill), saved in the
@@ -30,6 +31,7 @@ LPOLL="${GITZILLA_LAUNCHD_POLL:-0.25}"
 LRETRY="${GITZILLA_LAUNCHD_RETRY:-1}"
 RECONCILE="${GITZILLA_RECONCILE_CMD:-$GITZILLA_HOME/bin/reconcile}"
 ROTATE="${GITZILLA_ROTATE_CMD:-$GITZILLA_HOME/bin/rotate}"
+NOTIFY_TEST="${GITZILLA_NOTIFY_TEST_CMD:-$GITZILLA_HOME/bin/notify-test}"
 SECRETIVE_APP="${GITZILLA_SECRETIVE_APP:-/Applications/Secretive.app}"
 REMOTE_TPL="${GITZILLA_REMOTE_URL_TEMPLATE:-git@github.com:%s.git}"
 POLL_INTERVAL="${GITZILLA_POLL_INTERVAL:-5}"
@@ -161,9 +163,22 @@ step_index() { # name -> 1-based index in STEPS, 0 if unknown
   echo 0
 }
 
+# check_call_numbers <comma-separated list>: 1-5 numbers, each +E164 (^\+[1-9][0-9]{6,14}$). Sets CALL_ERR (which
+# never contains the input) and returns 1 on failure. Builtins only, so the numbers never reach argv.
+check_call_numbers() {
+  local rest="$1," x n=0 re='^\+[1-9][0-9]{6,14}$'
+  CALL_ERR=""
+  while [ -n "$rest" ]; do
+    x="${rest%%,*}"; rest="${rest#*,}"; n=$((n + 1))
+    [[ $x =~ $re ]] || { CALL_ERR="invalid phone number #$n: use +E164 (a + then the country code and number, e.g. +14155550100), comma-separated"; return 1; }
+  done
+  [ "$n" -le 5 ] || { CALL_ERR="too many phone numbers: at most 5"; return 1; }
+  return 0
+}
+
 step_worker() {
   [ -s "$PUBFILE" ] || die "no $PUBFILE: run the note-key step first"
-  local owner pub out url wsec topic slack left last mode=fresh ans drill app tz
+  local owner pub out url wsec topic slack nums ctok tre left last mode=fresh ans drill app tz
   owner="${OWNER:-$("$GH" api user --jq .login 2>/dev/null)}"
   [ -n "$owner" ] || die "cannot determine the GitHub login (gh api user)"
   app="$(app_name_for "$owner")"
@@ -210,14 +225,31 @@ step_worker() {
     printf 'Slack incoming-webhook URL, or press Enter to skip Slack (input hidden): '
     read -rs slack || slack=""; echo
     case "$slack" in ''|https://*) ;; *) worker_die "the Slack webhook URL must start with https://" ;; esac
+    printf 'Phone numbers for red-alert calls, comma-separated +E164 (ntfy Pro; Enter to skip) (input hidden): '
+    read -rs nums || nums=""; echo
+    nums="${nums// /}"; ctok=""
+    if [ -n "$nums" ]; then
+      check_call_numbers "$nums" || { nums=""; worker_die "$CALL_ERR"; }
+      printf 'ntfy access token (tk_...) (input hidden): '
+      read -rs ctok || ctok=""; echo
+      tre='^tk_[A-Za-z0-9]{29}$'
+      [[ $ctok =~ $tre ]] \
+        || { nums=""; ctok=""; worker_die "invalid ntfy access token: it must be tk_ followed by 29 letters or digits (ntfy.sh > Account > Access tokens)"; }
+    fi
     ( cd "$here/worker" || exit 1
       printf '%s' "$wsec" | "$NPX" wrangler secret put WEBHOOK_SECRET || exit 1
       printf '%s' "$topic" | "$NPX" wrangler secret put NTFY_TOPIC || exit 1
       # the Worker treats SLACK_WEBHOOK_URL as optional (notify.js posts to Slack only when it is set)
       if [ -n "$slack" ]; then printf '%s' "$slack" | "$NPX" wrangler secret put SLACK_WEBHOOK_URL || exit 1; fi
-    ) || worker_die "wrangler secret put failed"
+      # calls are optional too (notify.js calls only with a valid token and at least one valid number)
+      if [ -n "$nums" ]; then
+        printf '%s' "$nums" | "$NPX" wrangler secret put NTFY_CALL_NUMBERS || exit 1
+        printf '%s' "$ctok" | "$NPX" wrangler secret put NTFY_CALL_TOKEN || exit 1
+      fi
+    ) || { wsec=""; topic=""; slack=""; nums=""; ctok=""; worker_die "wrangler secret put failed"; }
     [ -n "$slack" ] || say "Slack skipped: alerts go to the phone (ntfy) only"
-    wsec=""; topic=""; slack=""
+    [ -n "$nums" ] || say "Calls skipped: red alerts do not ring the phone"
+    wsec=""; topic=""; slack=""; nums=""; ctok=""
     # Only an app that already exists needs its webhook secret edited; before that the create flow uses the new secret.
     if [ "$mode" = rotate ]; then
       if [ -n "$last" ] && [ "$(step_index "$last")" -ge "$(step_index github-app)" ] || [ -f "$STATE/queue-cursor" ]; then
@@ -643,6 +675,19 @@ step_self_test() {
     echo "row2 pass" >> "$log"
   else
     echo "row2 FAIL" >> "$log"; bad=1
+  fi
+  if ask_yes "  Row 3: Send a test alert to every channel (rings the phone if calls are set up)?"; then
+    if "$NOTIFY_TEST" </dev/null; then
+      if ask_yes "  Row 3 result: did every channel (ntfy, Slack and the call, as set up) receive the test alert?"; then
+        echo "row3 pass" >> "$log"
+      else
+        echo "row3 FAIL" >> "$log"; bad=1
+      fi
+    else
+      echo "row3 FAIL" >> "$log"; bad=1
+    fi
+  else
+    echo "row3 skipped" >> "$log"
   fi
   if [ "$bad" -eq 0 ]; then say "self-test passed"; else say "self-test: a row failed (recorded in $log); investigate before relying on the watchdog"; fi
   return 0

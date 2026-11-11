@@ -191,6 +191,7 @@ wd_send_report() {
 
 # wd_send_alert new-key <key_type> <fingerprint> <auth|signing>
 # wd_send_alert missed-webhook <refs> <repos>
+# wd_send_alert test                       (bin/notify-test: exactly {kind, ts, nonce})
 # Signed account alert to the Worker (POST /alert -> phone + Slack; the Worker writes the text). 0 on 204; on
 # failure sets WD_REASON, returns 1.
 wd_send_alert() {
@@ -207,6 +208,8 @@ wd_send_alert() {
     missed-webhook)
       jq -cn --argjson r "$2" --argjson p "$3" --argjson ts "$(date +%s)" --arg nonce "$(openssl rand -hex 16)" \
         '{kind:"missed-webhook",ts:$ts,nonce:$nonce,refs:$r,repos:$p}' ;;
+    test)
+      jq -cn --argjson ts "$(date +%s)" --arg nonce "$(openssl rand -hex 16)" '{kind:"test",ts:$ts,nonce:$nonce}' ;;
     *) false ;;
   esac 2>/dev/null | tr -d '\n' > "$dir/payload"
   if [ ! -s "$dir/payload" ]; then WD_REASON="payload build failed"; rm -rf "$dir"; return 1; fi

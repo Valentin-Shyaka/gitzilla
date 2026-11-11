@@ -136,6 +136,14 @@ cases = {
     "reposfloat": M(repos=1.5),
     "missedextra": M(text="hi"),
     "missednonce": M(nonce="xyz"),
+    # test alerts (bin/notify-test): exactly {kind, ts, nonce}
+    "test": dict(B, kind="test", nonce="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    "test2": dict(B, kind="test", nonce="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+    "test-later": dict(B, kind="test", ts=B["ts"] + 3600, nonce="cccccccccccccccccccccccccccccccc"),
+    "test-extra": dict(B, kind="test", nonce="dddddddddddddddddddddddddddddddd", message="hi"),
+    "test-keyfields": dict(K(), kind="test", nonce="eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+    "test-nonce": dict(B, kind="test", nonce="xyz"),
+    "test-nots": {"kind": "test", "nonce": "ffffffffffffffffffffffffffffffff"},
 }
 for k, v in cases.items():
     open("alert-%s-payload.json" % k, "w").write(json.dumps(v, separators=(",", ":")))

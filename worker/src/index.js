@@ -123,7 +123,8 @@ async function handleReport(request, env) {
 }
 
 // POST /alert: account alerts from the Mac's reconcile, signed in their own namespace. Strict shape: exactly
-// these keys, fixed values; the Worker writes the message text itself (no free text from the Mac).
+// these keys, fixed values; the Worker writes the message text itself (no free text from the Mac). kind "test"
+// (bin/notify-test) is exactly {kind, ts, nonce}; its calls use the hourly test gate.
 const ALERT_SKEW_MS = 300_000;
 const ALERT_FIELDS = {
   "new-key": {
@@ -131,6 +132,7 @@ const ALERT_FIELDS = {
     fingerprint: (v) => typeof v === "string" && /^SHA256:[A-Za-z0-9+/]{43}$/.test(v),
     source: (v) => v === "auth" || v === "signing",
   },
+  test: {},
   "missed-webhook": {
     refs: (v) => Number.isInteger(v) && v >= 1 && v <= 100_000,
     repos: (v) => Number.isInteger(v) && v >= 1 && v <= 100_000,
@@ -173,7 +175,7 @@ async function handleAlert(request, env) {
   const now = Date.now();
   if (Math.abs(a.ts * 1000 - now) > ALERT_SKEW_MS) return new Response("ts out of range", { status: 422 });
   if (!(await getHub(env).useNonce(a.nonce, a.ts, now))) return new Response("replayed", { status: 409 });
-  try { await notifyAccountAlert(a, env, 8000, (n) => getHub(env).callAllowed(n)); } catch (e) { console.error("alert notify failed", e); }
+  try { await notifyAccountAlert(a, env, 8000, (n) => getHub(env).callAllowed(n, Date.now(), a.kind === "test")); } catch (e) { console.error("alert notify failed", e); }
   return new Response(null, { status: 204 });
 }
 

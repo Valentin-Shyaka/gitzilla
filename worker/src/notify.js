@@ -67,6 +67,13 @@ export function formatAlert(events, tz = "UTC") {
 export function formatAccountAlert(a, tz = "UTC") {
   tz = alertTz(tz);
   const time = `Time: ${utc(a.ts)} / ${local(a.ts, tz)}`;
+  if (a.kind === "test") {
+    return {
+      title: "🔴 gitzilla: test alert",
+      body: ["This is a test of every alert channel.", time, "", REVOKE].join("\n"),
+      priority: 5,
+    };
+  }
   if (a.kind === "new-key") {
     const src = a.source === "signing" ? "signing" : "authentication";
     return {
@@ -139,7 +146,7 @@ const spokenNames = (events) => {
   const all = [...new Set(events.map((e) => spokenName(e.repo)).filter(Boolean))];
   const shown = all.slice(0, 3);
   const more = all.length - shown.length;
-  if (!shown.length) return "";
+  if (!shown.length) return "your repositories";
   if (more > 0) return `${shown.join(", ")} and ${more} more`;
   return shown.length > 1 ? `${shown.slice(0, -1).join(", ")} and ${shown[shown.length - 1]}` : shown[0];
 };
@@ -157,7 +164,7 @@ export function formatCall(events) {
 }
 
 export function formatAccountCall(alert) {
-  void alert;
+  if (alert?.kind === "test") return "gitzilla test call. Your alert channels work.";
   return `gitzilla critical alert. A new key was added to your GitHub account. ${SPOKEN_TAIL}`;
 }
 
