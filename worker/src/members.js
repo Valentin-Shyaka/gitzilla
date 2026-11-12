@@ -8,6 +8,7 @@ export const MAX_PENDING = 200;
 export const MAX_BOTS = 200;
 export const PENDING_TTL_MS = 7 * 86_400_000;
 export const ENROLL_PER_HOUR = 10;
+export const ENROLL_GLOBAL_PER_HOUR = 100;
 
 const LOGIN_RE = /^[a-z0-9](?:[a-z0-9-]{0,38})$/;
 // GitHub App bots push as "<name>[bot]"
@@ -83,18 +84,41 @@ export async function fingerprint(pubkeyLine) {
 
 // ADMIN_PUBKEYS: newline- or comma-separated key lines, at most MAX_ADMIN_KEYS. Anything malformed or more than
 // MAX_ADMIN_KEYS keys fails closed (no admin keys at all) rather than silently trusting a subset.
+// Memoized per isolate on the string value, so a bad value is parsed (and logged) once, not on every request.
+let adminCache = { str: undefined, keys: [] };
 export function parseAdminKeys(str) {
-  const lines = String(str ?? "").split(/[\n,]/).map((l) => l.trim()).filter(Boolean);
+  str = String(str ?? "");
+  if (adminCache.str === str) return adminCache.keys;
+  const lines = str.split(/[\n,]/).map((l) => l.trim()).filter(Boolean);
+  let keys = lines.map(cleanPubkey);
   if (lines.length > MAX_ADMIN_KEYS) {
     console.error(`ADMIN_PUBKEYS has ${lines.length} keys (max ${MAX_ADMIN_KEYS}); admin auth disabled`);
-    return [];
-  }
-  const keys = lines.map(cleanPubkey);
-  if (keys.some((k) => k === null)) {
+    keys = [];
+  } else if (keys.some((k) => k === null)) {
     console.error("ADMIN_PUBKEYS has a malformed key; admin auth disabled");
-    return [];
+    keys = [];
   }
-  return keys;
+  adminCache = { str, keys: Object.freeze(keys) };
+  return adminCache.keys;
+}
+
+// Rate-limit bucket for a client address: IPv4 as is, IPv6 by its /64 prefix (a single host usually holds a
+// whole /64, so per-address buckets would be free to rotate). IPv4-mapped IPv6 counts as the IPv4 address.
+// Anything unparsable shares one "?" bucket.
+export function ipBucket(ip) {
+  ip = String(ip ?? "").trim().toLowerCase();
+  const v4 = /^(?:::ffff:)?((?:\d{1,3}\.){3}\d{1,3})$/.exec(ip);
+  if (v4) return v4[1];
+  if (ip.length > 45 || !/^[0-9a-f:]+$/.test(ip) || !ip.includes(":")) return "?";
+  const halves = ip.split("::");
+  if (halves.length > 2) return "?";
+  const head = halves[0] ? halves[0].split(":") : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
+  const fill = 8 - head.length - tail.length;
+  if (halves.length === 2 ? fill < 1 : fill !== 0) return "?";
+  const groups = [...head, ...Array(fill).fill("0"), ...tail];
+  if (groups.some((g) => !/^[0-9a-f]{1,4}$/.test(g))) return "?";
+  return groups.slice(0, 4).map((g) => g.replace(/^0+(?=.)/, "")).join(":") + "::/64";
 }
 
 const exactKeys = (o, want) => {

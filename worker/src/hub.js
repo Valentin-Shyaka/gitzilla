@@ -2,7 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { classify, BURST_WINDOW_S } from "./classify.js";
 import { notifyEvents } from "./notify.js";
 import {
-  MAX_MEMBERS, MAX_KEYS_PER_MEMBER, MAX_PENDING, MAX_BOTS, PENDING_TTL_MS, ENROLL_PER_HOUR,
+  MAX_MEMBERS, MAX_KEYS_PER_MEMBER, MAX_PENDING, MAX_BOTS, PENDING_TTL_MS, ENROLL_PER_HOUR, ENROLL_GLOBAL_PER_HOUR,
 } from "./members.js";
 
 export const TTL_MS = 600_000;
@@ -22,6 +22,9 @@ const pendingKey = (login, fp) => `pending:${login}:${fp}`;
 const fpKey = (fp) => `fp:${fp}`; // fingerprint -> login of the member that owns it (one login per key)
 const botKey = (login) => `bot:${login}`;
 const rlKey = (ip, hour) => `rl:${ip}:${hour}`;
+const RL_ALL = "all"; // global bucket: rl:all:<hour> (never a client bucket, which always holds "." or ":")
+const RL_PRUNED = "rlpruned"; // hour of the last rl:/enonce: sweep (outside both prefixes)
+const enonceKey = (nonce) => `enonce:${nonce}`;
 
 // Single instance (idFromName("main")). Stores signed push notes and replay nonces,
 // each with an expiry timestamp (ms). `now` is injectable for tests.
@@ -85,25 +88,41 @@ export class Hub extends DurableObject {
     return rows.size - dead.length;
   }
 
-  // Enrollment rate limit: ENROLL_PER_HOUR requests per client IP per clock hour. Counts every request,
-  // including ones that fail later. Counters of past hours are dropped.
-  async enrollRateOk(ip, now = Date.now()) {
+  // Enrollment rate limits, checked before any parsing or crypto, so junk requests use up the budget too:
+  // first ENROLL_GLOBAL_PER_HOUR attempts per clock hour across all clients, then ENROLL_PER_HOUR per client
+  // bucket (IPv4 address or IPv6 /64). The global cap bounds every row an unauthenticated client can create
+  // (rl:, enonce:, pending:) and the enrollment alerts, however many addresses are used. Past-hour rl: rows and
+  // expired enonce: rows are swept at most once per hour, never on every request.
+  async enrollRateOk(bucket, now = Date.now()) {
     const hour = Math.floor(now / 3_600_000);
     const st = this.ctx.storage;
-    const old = [...(await st.list({ prefix: "rl:" }))]
-      .filter(([k]) => Number(k.slice(k.lastIndexOf(":") + 1)) < hour).map(([k]) => k);
-    if (old.length) await st.delete(old);
-    const key = rlKey(ip, hour);
+    if (((await st.get(RL_PRUNED)) ?? -1) < hour) await this.#sweepEnroll(hour, now);
+    const allKey = rlKey(RL_ALL, hour);
+    const all = (await st.get(allKey)) ?? 0;
+    if (all >= ENROLL_GLOBAL_PER_HOUR) return false;
+    await st.put(allKey, all + 1);
+    const key = rlKey(bucket, hour);
     const n = (await st.get(key)) ?? 0;
     if (n >= ENROLL_PER_HOUR) return false;
     await st.put(key, n + 1);
     return true;
   }
 
+  async #sweepEnroll(hour, now) {
+    const st = this.ctx.storage;
+    const dead = [...(await st.list({ prefix: "rl:" })).keys()]
+      .filter((k) => Number(k.slice(k.lastIndexOf(":") + 1)) < hour);
+    for (const [k, exp] of await st.list({ prefix: "enonce:" })) if (exp <= now) dead.push(k);
+    for (let i = 0; i < dead.length; i += 128) await st.delete(dead.slice(i, i + 128));
+    await st.put(RL_PRUNED, hour);
+  }
+
   // A signed, verified enrollment. Returns "replay" | "member" | "full" | "new" | "refreshed".
   async enroll(login, pubkey, fp, nonce, ts, now = Date.now()) {
-    if (!(await this.useNonce(nonce, ts, now))) return "replay";
     const st = this.ctx.storage;
+    // own nonce space: unauthenticated enrollers never write to the nonce: rows that #prune walks on every call
+    if ((await st.get(enonceKey(nonce))) !== undefined) return "replay";
+    await st.put(enonceKey(nonce), Math.max(now, ts * 1000) + TTL_MS);
     if ((await st.get(fpKey(fp))) !== undefined) return "member";
     const live = await this.#prunePending(now);
     const key = pendingKey(login, fp);

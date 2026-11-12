@@ -1,7 +1,7 @@
 import { verifySshSig } from "./sshsig.js";
 import { verifyGithubSignature } from "./hmac.js";
 import { notifyReport, notifyAccountAlert, notifyEnrollment } from "./notify.js";
-import { fingerprint, parseAdminKeys, cleanEnroll, cleanAdmin } from "./members.js";
+import { fingerprint, parseAdminKeys, cleanEnroll, cleanAdmin, ipBucket } from "./members.js";
 
 export { Hub } from "./hub.js";
 
@@ -262,10 +262,41 @@ async function handleQueue(request, env) {
 // ---- org mode (MODE = "org"): member enrollment and admin commands. Both 404 in personal mode.
 const ORG_SKEW_MS = 300_000;
 
+// Declared Content-Length over the cap: refuse before reading anything.
+const declaredTooLarge = (request) => {
+  const cl = request.headers.get("Content-Length");
+  return cl !== null && !(/^\d{1,15}$/.test(cl) && Number(cl) <= MAX_BODY);
+};
+
+// The body as bytes, reading at most max bytes (stops and returns null past that, whatever Content-Length said).
+async function readCapped(request, max) {
+  if (!request.body) return new Uint8Array(0);
+  const reader = request.body.getReader();
+  const chunks = [];
+  let n = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    n += value.byteLength;
+    if (n > max) {
+      try { await reader.cancel(); } catch { /* ignore */ }
+      return null;
+    }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(n);
+  let o = 0;
+  for (const c of chunks) { out.set(c, o); o += c.byteLength; }
+  return out;
+}
+
 // Shared envelope parsing for /enroll and /admin: {payload: base64(JSON), sig: armored SSHSIG}.
+// The MAX_BODY cap is on bytes, checked on Content-Length first and again while reading.
 async function readSigned(request) {
-  const text = await request.text();
-  if (text.length > MAX_BODY) return { error: json({ error: "too large" }, 400) };
+  if (declaredTooLarge(request)) return { error: json({ error: "too large" }, 400) };
+  const bytes = await readCapped(request, MAX_BODY);
+  if (!bytes) return { error: json({ error: "too large" }, 400) };
+  const text = new TextDecoder().decode(bytes);
   let body;
   try { body = JSON.parse(text); } catch { return { error: json({ error: "bad json" }, 400) }; }
   if (!body || typeof body.payload !== "string" || typeof body.sig !== "string") {
@@ -281,10 +312,12 @@ async function readSigned(request) {
 // POST /enroll: a member asks to join. The payload is signed by the key being enrolled (proof of possession).
 // Nothing becomes trusted here: the key waits in pending until an admin approves it. Rejections send no alert.
 async function handleEnroll(request, env) {
-  const ip = (request.headers.get("CF-Connecting-IP") || "unknown").slice(0, 64);
+  if (declaredTooLarge(request)) return json({ error: "too large" }, 400);
   const hub = getHub(env);
-  // counted before any parsing or crypto, so junk requests use up the budget too
-  if (!(await hub.enrollRateOk(ip, Date.now()))) return json({ error: "rate limited" }, 429);
+  // global then per-client budget, before reading the body or any crypto, so junk requests use it up too
+  if (!(await hub.enrollRateOk(ipBucket(request.headers.get("CF-Connecting-IP")), Date.now()))) {
+    return json({ error: "rate limited" }, 429);
+  }
   const r = await readSigned(request);
   if (r.error) return r.error;
   const e = cleanEnroll(r.parsed);

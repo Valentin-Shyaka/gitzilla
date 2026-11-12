@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
 import worker, { verifyAny } from "../src/index.js";
-import { fingerprint, parseAdminKeys, cleanLogin, cleanBotLogin, cleanPubkey } from "../src/members.js";
+import { fingerprint, parseAdminKeys, cleanLogin, cleanBotLogin, cleanPubkey, ipBucket } from "../src/members.js";
 import ADMIN from "./fixtures/org/admin.pub?raw";
 import ADMIN2 from "./fixtures/org/admin2.pub?raw";
 import ALICE from "./fixtures/org/alice.pub?raw";
@@ -15,6 +15,8 @@ import QUEUE_ADMIN from "./fixtures/org/queue-auth-admin.txt?raw";
 import QUEUE_NOTE from "./fixtures/queue-auth-ok.txt?raw";
 import ALERT_ADMIN from "./fixtures/org/alert-test-admin.json";
 import ALERT_NOTE from "./fixtures/alert-test.json";
+import REPORT_ADMIN from "./fixtures/org/report-admin.json";
+import REPORT_NOTE from "./fixtures/report-ok.json";
 import E_ALICE from "./fixtures/org/enroll-alice.json";
 import E_ALICE_AGAIN from "./fixtures/org/enroll-alice-again.json";
 import E_ALICE2 from "./fixtures/org/enroll-alice2.json";
@@ -60,10 +62,10 @@ const org = { ...base, MODE: "org", ADMIN_PUBKEYS: `${ADMIN.trim()}\n${ADMIN2.tr
 const personal = { ...base, MODE: "personal" };
 
 let ipn = 0;
-const post = (path, body, e = org, ip) =>
+const post = (path, body, e = org, ip, headers = {}) =>
   worker.fetch(new Request(`https://w.test${path}`, {
     method: "POST", body: typeof body === "string" ? body : JSON.stringify(body),
-    headers: { "CF-Connecting-IP": ip ?? `203.0.113.${++ipn % 250}` },
+    headers: { "CF-Connecting-IP": ip ?? `203.0.113.${++ipn % 250}`, ...headers },
   }), e);
 const enroll = (body, e, ip) => post("/enroll", body, e, ip);
 const admin = (body, e) => post("/admin", body, e);
@@ -118,6 +120,14 @@ describe("members.js", () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     expect(parseAdminKeys(`${a}\n${b}\n${c}\n${d}`)).toEqual([]);
     expect(parseAdminKeys(`${a}\nssh-rsa AAAA`)).toEqual([]);
+  });
+  it("parseAdminKeys is memoized per value: a bad value logs once", () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const bad = `${ADMIN.trim()}\nssh-rsa AAAA # memo-test`;
+    for (let i = 0; i < 5; i++) expect(parseAdminKeys(bad)).toEqual([]);
+    expect(err).toHaveBeenCalledTimes(1);
+    expect(parseAdminKeys(ADMIN)).toEqual([cleanPubkey(ADMIN)]);
+    expect(err).toHaveBeenCalledTimes(1);
   });
   it("verifyAny returns the key that verified, or null", async () => {
     const r = JSON.parse(atob(A_LIST_ADMIN2.payload));
@@ -192,12 +202,79 @@ describe("POST /enroll", () => {
     expect((await enroll(E_ALICE, org, ip)).status).toBe(429);
     expect(f).not.toHaveBeenCalled();
     expect((await enroll(E_ALICE, org, "198.51.100.8")).status).toBe(202);
-    // next clock hour: the counter resets and the old one is dropped
+    // next clock hour: the counter resets and the first request sweeps past-hour counters
     vi.setSystemTime(Math.ceil((TS * 1000 + 1) / 3_600_000) * 3_600_000 + 1000);
     const hourNow = Math.floor(Date.now() / 3_600_000);
     expect(await hub().enrollRateOk(ip, Date.now())).toBe(true);
     const keys = [...(await storage((s) => s.list({ prefix: "rl:" }))).keys()];
-    expect(keys.every((k) => k.endsWith(`:${hourNow}`))).toBe(true);
+    expect(keys.sort()).toEqual([`rl:${ip}:${hourNow}`, `rl:all:${hourNow}`]);
+  });
+  it("a global cap of 100 attempts per hour across all IPs comes first: 429, no alert, no row", async () => {
+    for (let i = 0; i < 100; i++) expect((await enroll(E_BADSIG, org, `192.0.2.${i}`)).status).toBe(401);
+    expect((await enroll(E_ALICE, org, "198.51.100.200")).status).toBe(429);
+    expect(f).not.toHaveBeenCalled();
+    const rl = await storage((s) => s.list({ prefix: "rl:" }));
+    expect(rl.size).toBe(101); // 100 client buckets + the global one; the refused client got no row
+    expect(rl.has("rl:198.51.100.200:" + Math.floor(Date.now() / 3_600_000))).toBe(false);
+    expect((await storage((s) => s.list({ prefix: "pending:" }))).size).toBe(0);
+  }, 20_000);
+  it("IPv6 addresses in one /64 share a bucket; another /64 does not", async () => {
+    for (let i = 0; i < 10; i++) {
+      expect((await enroll(E_BADSIG, org, `2001:db8:1:2::${(i + 1).toString(16)}`)).status).toBe(401);
+    }
+    expect((await enroll(E_ALICE, org, "2001:db8:1:2:ffff:ffff:ffff:ffff")).status).toBe(429);
+    expect((await enroll(E_ALICE, org, "2001:db8:1:3::1")).status).toBe(202);
+  });
+  it("ipBucket: IPv4 as is, IPv6 by /64, mapped IPv4 as IPv4, junk in one bucket", () => {
+    expect(ipBucket("198.51.100.7")).toBe("198.51.100.7");
+    expect(ipBucket("2001:DB8:0001:0002:aaaa::1")).toBe("2001:db8:1:2::/64");
+    expect(ipBucket("2001:db8:1:2:3:4:5:6")).toBe("2001:db8:1:2::/64");
+    expect(ipBucket("2001:db8::")).toBe("2001:db8:0:0::/64");
+    expect(ipBucket("::1")).toBe("0:0:0:0::/64");
+    expect(ipBucket("::ffff:198.51.100.7")).toBe("198.51.100.7");
+    for (const junk of [null, "", "unknown", "1::2::3", "1:2:3:4:5:6:7:8:9", "12345::", "a:b", "x".repeat(60)]) {
+      expect(ipBucket(junk)).toBe("?");
+    }
+  });
+  it("past-hour rl: rows and expired enonce: rows are swept once per hour, not on every request", async () => {
+    const hour = Math.floor(Date.now() / 3_600_000);
+    expect((await enroll(E_BADSIG)).status).toBe(401); // first request this hour: sweep runs, marker set
+    // stale rows planted after this hour's sweep survive further requests in the same hour
+    await storage((s) => s.put({ [`rl:192.0.2.9:${hour - 1}`]: 3, "enonce:stale": Date.now() - 1 }));
+    for (let i = 0; i < 3; i++) expect((await enroll(E_BADSIG)).status).toBe(401);
+    expect(await storage((s) => s.get(`rl:192.0.2.9:${hour - 1}`))).toBe(3);
+    expect(await storage((s) => s.get("enonce:stale"))).toBeDefined();
+    // first request of the next hour sweeps them
+    vi.setSystemTime((hour + 1) * 3_600_000 + 1000);
+    expect((await enroll(E_BADSIG)).status).toBe(401);
+    expect(await storage((s) => s.get(`rl:192.0.2.9:${hour - 1}`))).toBeUndefined();
+    expect(await storage((s) => s.get("enonce:stale"))).toBeUndefined();
+  });
+  it("enrollment nonces live under enonce:, never the shared nonce: store", async () => {
+    expect((await enroll(E_ALICE)).status).toBe(202);
+    const n = JSON.parse(atob(E_ALICE.payload)).nonce;
+    expect(await storage((s) => s.get(`enonce:${n}`))).toBeGreaterThan(Date.now());
+    expect((await storage((s) => s.list({ prefix: "nonce:" }))).size).toBe(0);
+  });
+  it("rejects bodies over 8192 bytes: by Content-Length before reading, and by bytes read", async () => {
+    // declared too large: refused before the rate limiter or the body is touched
+    const r1 = await post("/enroll", E_ALICE, org, "198.51.100.50", { "Content-Length": "9000" });
+    expect(r1.status).toBe(400);
+    expect((await storage((s) => s.list({ prefix: "rl:" }))).size).toBe(0);
+    expect((await post("/admin", A_LIST0, org, undefined, { "Content-Length": "9000" })).status).toBe(400);
+    // 3000 three-byte characters: 3000 UTF-16 units but 9000 bytes
+    const multibyte = JSON.stringify({ payload: "€".repeat(3000), sig: "x" });
+    const stream = () => new ReadableStream({
+      start(c) { c.enqueue(new TextEncoder().encode(multibyte)); c.close(); },
+    });
+    for (const path of ["/enroll", "/admin"]) {
+      const req = new Request(`https://w.test${path}`, {
+        method: "POST", body: stream(), duplex: "half", headers: { "CF-Connecting-IP": "198.51.100.51" },
+      });
+      const r = await worker.fetch(req, org);
+      expect(r.status).toBe(400);
+      expect((await r.json()).error).toBe("too large");
+    }
   });
   it("refuses a new pending entry beyond 200 with 429 and keeps the existing ones", async () => {
     await storage(async (s) => {
@@ -378,6 +455,12 @@ describe("control-route auth by mode", () => {
     expect((await queue(QUEUE_NOTE, personal)).status).toBe(200);
     expect((await queue(QUEUE_ADMIN, personal)).status).toBe(401);
     expect((await queue(QUEUE_NOTE, env)).status).toBe(200);
+  });
+  it("report: admin keys in org mode, NOTE_PUBKEY in personal mode", async () => {
+    expect((await post("/report", REPORT_NOTE, org)).status).toBe(401);
+    expect((await post("/report", REPORT_ADMIN, personal)).status).toBe(401);
+    expect((await post("/report", REPORT_ADMIN, org)).status).toBe(204);
+    expect((await post("/report", REPORT_NOTE, personal)).status).toBe(204);
   });
   it("alert: admin keys in org mode, NOTE_PUBKEY in personal mode", async () => {
     expect((await post("/alert", ALERT_NOTE, org)).status).toBe(401);

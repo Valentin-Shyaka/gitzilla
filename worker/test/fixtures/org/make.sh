@@ -86,4 +86,5 @@ b = lambda x: base64.b64encode(x).decode()
 q = b'{"ts":%d}' % TS
 open("queue-auth-admin.txt", "w").write(b(q) + "." + b(sign("admin", "gitzilla-queue", q).encode()))
 body("alert-test-admin", "admin", "gitzilla-alert", {"kind": "test", "ts": TS, "nonce": nonce()})
+body("report-admin", "admin", "gitzilla-report", {"ts": TS, "nonce": nonce(), "restored": [{"repo": "owner/name", "ref": "refs/heads/main"}], "skipped": [], "restored_total": 1, "skipped_total": 0})
 PY
