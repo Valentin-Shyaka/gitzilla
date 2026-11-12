@@ -172,12 +172,25 @@ Files: config in `~/.config/gitzilla/`, state and logs in `~/.local/state/gitzil
 ### Profiles
 
 One Mac can run more than one gitzilla (for example your personal one and an organization's). Each extra instance is
-a profile: `GITZILLA_PROFILE=<name>` (1 to 40 lower-case letters, digits or hyphens, starting with a letter or digit;
-not `log`, `mirrors` or `incidents`) in front of `./install.sh` and the `bin/` commands. A profile keeps its config in
-`~/.config/gitzilla/<name>/`, its state, logs and mirrors in `~/.local/state/gitzilla/<name>/`, and its launchd jobs
-as `io.github.gitzilla.<name>.agent|reconcile|rotate` (the jobs carry `GITZILLA_PROFILE`). It never reads or writes
-the personal files or jobs. Without `GITZILLA_PROFILE` everything is as described above (the personal instance).
-The global pre-push hook belongs to the personal instance: the `hook` step refuses to run in a profile.
+a profile: `GITZILLA_PROFILE=<name>` in front of `./install.sh` and the `bin/` commands (do not `export` it). The
+name is 1 to 40 lower-case letters, digits or hyphens, starting with a letter or digit, and not one of the names
+gitzilla uses for its own files in `~/.config/gitzilla/` or `~/.local/state/gitzilla/` (`config`, `jq-path`, `log`,
+`mirrors`, `incidents`, `install-step`, `install-set-hookspath`, `install-secrets-rotated`, `queue-cursor`,
+`queue-fail-since`, `queue-notified`, `health-notified`, `health-fail-since`, `reconcile-all-at`). A profile keeps
+its config in `~/.config/gitzilla/<name>/`, its state, logs and mirrors in `~/.local/state/gitzilla/<name>/`, and its
+launchd jobs as `io.github.gitzilla.<name>.agent|reconcile` (the jobs carry `GITZILLA_PROFILE`). It never reads or
+writes the personal files or jobs. Without `GITZILLA_PROFILE` everything is as described above (the personal
+instance).
+
+What a profile does not do (yet):
+
+- **No Worker of its own yet.** The `worker` step refuses in a profile, before any `wrangler` call or prompt: it would
+  deploy over the personal Worker `gitzilla` and replace its secrets. Worker deploys for an org profile arrive with
+  `./install.sh --org`. Until then a plain `GITZILLA_PROFILE=<name> ./install.sh` stops at the `worker` step and
+  changes nothing remote.
+- **No rotation.** The gh login and `~/.ssh/github-auth.pub` are shared by the whole Mac, so only the personal
+  instance rotates them: a profile gets no rotate job, `first-rotation` is skipped, and `bin/rotate` refuses.
+- **No hook.** The global pre-push hook belongs to the personal instance: the `hook` step is skipped in a profile.
 
 ## Alert channels
 
@@ -283,8 +296,9 @@ for j in agent reconcile rotate; do
 done
 ```
 
-For a profile, use `io.github.gitzilla.<name>.$j` above and remove only `~/.config/gitzilla/<name>` and
-`~/.local/state/gitzilla/<name>` in step 5 (the personal directories hold the profiles' directories too).
+For a profile, use `io.github.gitzilla.<name>.$j` above (jobs `agent reconcile` only) and remove only
+`~/.config/gitzilla/<name>` and `~/.local/state/gitzilla/<name>` in step 5 (the personal directories hold the
+profiles' directories too).
 
 1. The global hook, first (before deleting the clone): in `git config --global --includes core.hooksPath`
    (usually `~/.config/git/hooks`), if the installer created `pre-push`, delete it; if it moved your hook aside,

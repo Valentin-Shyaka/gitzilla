@@ -23,6 +23,12 @@
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SELF="$here/$(basename "${BASH_SOURCE[0]}")"
 . "$here/lib.sh"
+# The gh login and ~/.ssh/github-auth.pub are shared by the whole Mac, so only the personal profile rotates them
+# (a profile's rotate would also open a Terminal that runs without the profile's environment).
+if [ -n "$GITZILLA_PROFILE" ]; then
+  printf 'rotate: profile %s: rotation belongs to the personal profile (run bin/rotate without GITZILLA_PROFILE); nothing changed\n' "$GITZILLA_PROFILE" >&2
+  exit 1
+fi
 OPEN="${GITZILLA_OPEN_CMD:-open}"
 PBPASTE="${GITZILLA_PBPASTE_CMD:-pbpaste}"
 PBCOPY="${GITZILLA_PBCOPY_CMD:-pbcopy}"

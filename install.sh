@@ -2,7 +2,9 @@
 # install.sh [--from-step <name>] — guided, resumable install of the gitzilla. Compatible with macOS bash 3.2.
 #
 # GITZILLA_PROFILE=<name> installs a separate instance (bin/lib.sh: its own config, state and launchd labels
-# io.github.gitzilla.<name>.<job>); unset = personal. The hook step refuses in a profile.
+# io.github.gitzilla.<name>.<job>); unset = personal. In a profile the worker step refuses (it would deploy over the
+# personal Worker; profile Workers come with --org), the hook and first-rotation steps are skipped (both belong to the
+# personal profile), and launchd loads only the agent and reconcile jobs (no rotate job).
 #
 # Steps (in order): prereqs note-key worker github-app hook repos mirrors known-keys launchd first-rotation self-test
 # $STATE/install-step holds the last completed step; a rerun resumes after it. --from-step <name> forces the start.
@@ -219,6 +221,8 @@ ask_hidden_valid() {
 }
 
 step_worker() {
+  # wrangler deploy / secret put have no --name yet, so in a profile they would hit the personal Worker "gitzilla"
+  [ -z "$GITZILLA_PROFILE" ] || die "profile $GITZILLA_PROFILE: the worker step is not available in a profile yet (it would deploy over the personal Worker 'gitzilla' and replace its secrets); Worker deploys for an org profile arrive with ./install.sh --org. Nothing changed. If this profile already has a config for its own Worker in $GITZILLA_CONFIG_DIR/config, continue with: GITZILLA_PROFILE=$GITZILLA_PROFILE ./install.sh --from-step github-app"
   [ -s "$PUBFILE" ] || die "no $PUBFILE: run the note-key step first"
   local owner pub out url wsec topic slack nums ctok left last mode=fresh ans drill app tz
   owner="${OWNER:-$("$GH" api user --jq .login 2>/dev/null)}"
@@ -283,7 +287,14 @@ step_worker() {
         printf '%s' "$ctok" | "$NPX" wrangler secret put NTFY_CALL_TOKEN || exit 1
       fi
     ) || { wsec=""; topic=""; slack=""; nums=""; ctok=""; worker_die "wrangler secret put failed"; }
-    [ -n "$slack" ] || say "Slack skipped: alerts go to the phone (ntfy) only"
+    if [ -z "$slack" ]; then
+      # a rotate keeps any SLACK_WEBHOOK_URL a previous run put, so Slack may still be on
+      if [ "$mode" = rotate ]; then
+        say "Slack setting unchanged in the Worker; to remove it: npx wrangler secret delete SLACK_WEBHOOK_URL"
+      else
+        say "Slack skipped: alerts go to the phone (ntfy) only"
+      fi
+    fi
     if [ -z "$nums" ]; then
       # a rotate keeps any NTFY_CALL_* secrets a previous run put, so calls may still be on
       if [ "$mode" = rotate ]; then
@@ -456,7 +467,10 @@ install_standalone() {
 # Also records the absolute node (scanner/node-path) and jq ($GITZILLA_CONFIG_DIR/jq-path) for hooks run by GUI clients.
 step_hook() {
   # one global pre-push hook serves every profile; routing notes per profile comes later
-  [ -z "$GITZILLA_PROFILE" ] || die "profile $GITZILLA_PROFILE: the hook is installed by the personal profile (run ./install.sh --from-step hook without GITZILLA_PROFILE); nothing changed"
+  if [ -n "$GITZILLA_PROFILE" ]; then
+    say "hook step skipped in profile $GITZILLA_PROFILE: the hook is installed by the personal profile (./install.sh --from-step hook without GITZILLA_PROFILE)"
+    return 0
+  fi
   case "$GITZILLA_HOME" in *\"*|*\$*|*\`*|*\\*) die "unsupported characters in $GITZILLA_HOME" ;; esac
   [ -f "$here/hooks/pre-push" ] || die "hooks/pre-push not found next to install.sh"
   local dir set_path=0 tmp prev link existing
@@ -678,11 +692,17 @@ render() {
 }
 
 step_launchd() {
-  local dir="$HOME/Library/LaunchAgents" job label plist uid out n
+  local dir="$HOME/Library/LaunchAgents" job label plist uid out n jobs="agent reconcile rotate"
   case "$GITZILLA_HOME$STATE$GITZILLA_CONFIG_DIR" in *\&*|*\|*|*\<*|*\>*|*\\*) die "unsupported characters in install paths" ;; esac
   mkdir -p "$dir" "$STATE/log" || die "cannot create $dir"
   uid="$(id -u)"
-  for job in agent reconcile rotate; do
+  if [ -n "$GITZILLA_PROFILE" ]; then
+    # rotation belongs to the personal profile: no rotate job here, and one an earlier install loaded is removed
+    jobs="agent reconcile"; label="$LABEL_PREFIX.rotate"
+    "$LAUNCHCTL" bootout "gui/$uid/$label" >/dev/null 2>&1 || true
+    rm -f "$dir/$label.plist"
+  fi
+  for job in $jobs; do
     label="$LABEL_PREFIX.$job"; plist="$dir/$label.plist"
     render "$here/launchd/$job.plist.tmpl" "$plist" "$label" || die "cannot render $job"
     plutil -lint "$plist" >/dev/null || die "rendered $plist is not a valid plist"
@@ -700,10 +720,18 @@ step_launchd() {
       "$LAUNCHCTL" bootstrap "gui/$uid" "$plist" || die "launchctl bootstrap failed for $label"
     }
   done
-  say "launchd jobs loaded: agent (5 min), reconcile (hourly), rotate (daily 10:00)"
+  if [ -n "$GITZILLA_PROFILE" ]; then
+    say "launchd jobs loaded: agent (5 min), reconcile (hourly); no rotate job in a profile"
+  else
+    say "launchd jobs loaded: agent (5 min), reconcile (hourly), rotate (daily 10:00)"
+  fi
 }
 
 step_first_rotation() {
+  if [ -n "$GITZILLA_PROFILE" ]; then
+    say "first-rotation skipped in profile $GITZILLA_PROFILE: rotation belongs to the personal profile"
+    return 0
+  fi
   require_config
   "$ROTATE" gh || die "rotate gh did not finish; rerun with --from-step first-rotation"
 }

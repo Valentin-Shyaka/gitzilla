@@ -5,17 +5,20 @@
 # Profiles: GITZILLA_PROFILE=<p> runs a separate instance (an org's, next to the personal one) with its config in
 # ~/.config/gitzilla/<p>, its state, log and mirrors in ~/.local/state/gitzilla/<p>, and its own launchd labels.
 # Unset or empty = personal: today's paths. GITZILLA_CONFIG_DIR / GITZILLA_STATE_DIR, when set, still win (the
-# launchd jobs set both). A profile may not be named like a personal state directory (log, mirrors, incidents),
-# since its state directory would then be that one.
+# launchd jobs set both). A profile may not be named like an entry bin/* or install.sh writes directly in the
+# personal config dir or state dir (WD_RESERVED_NAMES), since its directory would then be that file or directory.
+# Entries with a dot (repos.txt, rotation.json, ...) cannot collide: a profile name has no dot. Keep this list
+# complete when a new file is added under $GITZILLA_CONFIG_DIR or $STATE.
+WD_RESERVED_NAMES="config jq-path log mirrors incidents install-step install-set-hookspath install-secrets-rotated
+queue-cursor queue-fail-since queue-notified health-notified health-fail-since reconcile-all-at"
 GITZILLA_PROFILE="${GITZILLA_PROFILE:-}"
 if [ -n "$GITZILLA_PROFILE" ]; then
-  case "$GITZILLA_PROFILE" in
-    log|mirrors|incidents) _wd_ok=0 ;;
-    *) _wd_ok='^[a-z0-9][a-z0-9-]{0,39}$'
-       if [[ $GITZILLA_PROFILE =~ $_wd_ok ]]; then _wd_ok=1; else _wd_ok=0; fi ;;
-  esac
+  _wd_ok='^[a-z0-9][a-z0-9-]{0,39}$'
+  if [[ $GITZILLA_PROFILE =~ $_wd_ok ]]; then _wd_ok=1; else _wd_ok=0; fi
+  for _wd_r in $WD_RESERVED_NAMES; do [ "$GITZILLA_PROFILE" = "$_wd_r" ] && _wd_ok=0; done
+  unset _wd_r
   if [ "$_wd_ok" != 1 ]; then
-    printf 'gitzilla: invalid GITZILLA_PROFILE: use 1-40 lower-case letters, digits or hyphens, starting with a letter or digit (not log, mirrors or incidents)\n' >&2
+    printf 'gitzilla: invalid GITZILLA_PROFILE: use 1-40 lower-case letters, digits or hyphens, starting with a letter or digit, and not a name gitzilla uses for its own files (%s)\n' "$(echo $WD_RESERVED_NAMES)" >&2
     exit 2
   fi
   unset _wd_ok

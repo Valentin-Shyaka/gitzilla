@@ -479,6 +479,23 @@ assert_eq 0 "$(rc)" "calls skipped (rotate): ok"
 assert_contains "$(out)" "$CALLS_KEPT" "calls skipped (rotate): says the call settings are unchanged and how to remove them"
 case "$(out)" in *"do not ring the phone"*) _bad "calls skipped (rotate): must not claim calls are off" ;; *) _ok ;; esac
 assert_eq 0 "$(nmatch 'NTFY_CALL' "$T/npx.log")" "calls skipped (rotate): no call secret put or deleted"
+# Slack skipped on rotate: an older SLACK_WEBHOOK_URL may still be in the Worker, so do not claim Slack is off
+SLACK_KEPT="Slack setting unchanged in the Worker; to remove it: npx wrangler secret delete SLACK_WEBHOOK_URL"
+reset
+mkkey notekey ecdsa; cp "$T/keys/notekey.pub" "$GITZILLA_CONFIG_DIR/push-note.pub"
+GITZILLA_INSTALL_STOP_AFTER=worker runin "$SLACK\n\n" --from-step worker
+case "$(out)" in *"$SLACK_KEPT"*) _bad "slack (fresh, set): no 'unchanged' message" ;; *) _ok ;; esac
+: > "$T/npx.log"
+GITZILLA_INSTALL_STOP_AFTER=worker runin "rotate\n\n\n" --from-step worker
+assert_eq 0 "$(rc)" "slack skipped (rotate): ok"
+assert_contains "$(out)" "$SLACK_KEPT" "slack skipped (rotate): says the Slack setting is unchanged and how to remove it"
+case "$(out)" in *"phone (ntfy) only"*) _bad "slack skipped (rotate): must not claim alerts go to the phone only" ;; *) _ok ;; esac
+assert_eq 0 "$(nmatch 'SLACK_WEBHOOK_URL' "$T/npx.log")" "slack skipped (rotate): no Slack secret put or deleted"
+reset
+mkkey notekey ecdsa; cp "$T/keys/notekey.pub" "$GITZILLA_CONFIG_DIR/push-note.pub"
+GITZILLA_INSTALL_STOP_AFTER=worker runin '\n\n' --from-step worker
+case "$(out)" in *"$SLACK_KEPT"*) _bad "slack skipped (fresh): no 'unchanged' message" ;; *) _ok ;; esac
+assert_contains "$(out)" "Slack skipped: alerts go to the phone (ntfy) only" "slack skipped (fresh): says Slack is off"
 # alert time zone: GITZILLA_ALERT_TZ wins, the config value is kept on a rerun, no usable zone -> UTC
 reset
 mkkey notekey ecdsa; cp "$T/keys/notekey.pub" "$GITZILLA_CONFIG_DIR/push-note.pub"
