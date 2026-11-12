@@ -1,6 +1,7 @@
 import { verifySshSig } from "./sshsig.js";
 import { verifyGithubSignature } from "./hmac.js";
-import { notifyReport, notifyAccountAlert } from "./notify.js";
+import { notifyReport, notifyAccountAlert, notifyEnrollment } from "./notify.js";
+import { fingerprint, parseAdminKeys, cleanEnroll, cleanAdmin } from "./members.js";
 
 export { Hub } from "./hub.js";
 
@@ -17,6 +18,18 @@ function b64decode(s) {
     return null;
   }
 }
+
+// The key (one of `keys`) whose signature over raw in `namespace` verifies, or null.
+export async function verifyAny(sig, raw, namespace, keys) {
+  for (const k of keys) {
+    if (k && (await verifySshSig(sig, raw, namespace, k))) return k;
+  }
+  return null;
+}
+
+const orgMode = (env) => env.MODE === "org";
+// Keys that may sign /queue, /report and /alert: the admin keys in org mode, the note key otherwise.
+const controlKeys = (env) => (orgMode(env) ? parseAdminKeys(env.ADMIN_PUBKEYS) : [env.NOTE_PUBKEY || ""]);
 
 function validNote(n) {
   return (
@@ -106,7 +119,7 @@ async function handleReport(request, env) {
   }
   const raw = b64decode(body.payload);
   if (!raw) return new Response("bad base64", { status: 400 });
-  if (!(await verifySshSig(body.sig, raw, "gitzilla-report", env.NOTE_PUBKEY || ""))) {
+  if (!(await verifyAny(body.sig, raw, "gitzilla-report", controlKeys(env)))) {
     return new Response("bad signature", { status: 401 });
   }
   let parsed;
@@ -165,7 +178,7 @@ async function handleAlert(request, env) {
   }
   const raw = b64decode(body.payload);
   if (!raw) return new Response("bad base64", { status: 400 });
-  if (!(await verifySshSig(body.sig, raw, "gitzilla-alert", env.NOTE_PUBKEY || ""))) {
+  if (!(await verifyAny(body.sig, raw, "gitzilla-alert", controlKeys(env)))) {
     return new Response("bad signature", { status: 401 });
   }
   let parsed;
@@ -236,7 +249,7 @@ async function queueAuthorized(request, env) {
   } catch { return false; }
   if (!Number.isInteger(ts) || Math.abs(ts * 1000 - Date.now()) > QUEUE_SKEW_MS) return false;
   const sig = new TextDecoder().decode(sigBytes);
-  return verifySshSig(sig, raw, "gitzilla-queue", env.NOTE_PUBKEY || "");
+  return (await verifyAny(sig, raw, "gitzilla-queue", controlKeys(env))) !== null;
 }
 
 async function handleQueue(request, env) {
@@ -244,6 +257,67 @@ async function handleQueue(request, env) {
   const raw = new URL(request.url).searchParams.get("after") ?? "0";
   if (!/^\d{1,15}$/.test(raw)) return new Response("bad after", { status: 400 });
   return json(await getHub(env).events(Number(raw)));
+}
+
+// ---- org mode (MODE = "org"): member enrollment and admin commands. Both 404 in personal mode.
+const ORG_SKEW_MS = 300_000;
+
+// Shared envelope parsing for /enroll and /admin: {payload: base64(JSON), sig: armored SSHSIG}.
+async function readSigned(request) {
+  const text = await request.text();
+  if (text.length > MAX_BODY) return { error: json({ error: "too large" }, 400) };
+  let body;
+  try { body = JSON.parse(text); } catch { return { error: json({ error: "bad json" }, 400) }; }
+  if (!body || typeof body.payload !== "string" || typeof body.sig !== "string") {
+    return { error: json({ error: "bad body" }, 400) };
+  }
+  const raw = b64decode(body.payload);
+  if (!raw) return { error: json({ error: "bad base64" }, 400) };
+  let parsed;
+  try { parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw)); } catch { parsed = undefined; }
+  return { raw, sig: body.sig, parsed };
+}
+
+// POST /enroll: a member asks to join. The payload is signed by the key being enrolled (proof of possession).
+// Nothing becomes trusted here: the key waits in pending until an admin approves it. Rejections send no alert.
+async function handleEnroll(request, env) {
+  const ip = (request.headers.get("CF-Connecting-IP") || "unknown").slice(0, 64);
+  const hub = getHub(env);
+  // counted before any parsing or crypto, so junk requests use up the budget too
+  if (!(await hub.enrollRateOk(ip, Date.now()))) return json({ error: "rate limited" }, 429);
+  const r = await readSigned(request);
+  if (r.error) return r.error;
+  const e = cleanEnroll(r.parsed);
+  if (!e) return json({ error: "bad payload" }, 400);
+  if (!(await verifySshSig(r.sig, r.raw, "gitzilla-enroll", e.pubkey))) return json({ error: "bad signature" }, 401);
+  const now = Date.now();
+  if (Math.abs(e.ts * 1000 - now) > ORG_SKEW_MS) return json({ error: "ts out of range" }, 401);
+  const fp = await fingerprint(e.pubkey);
+  const res = await hub.enroll(e.login, e.pubkey, fp, e.nonce, e.ts, now);
+  if (res === "replay") return json({ error: "replayed" }, 401);
+  if (res === "member") return json({ error: "already a member" }, 409);
+  if (res === "full") return json({ error: "too many pending enrollments" }, 429);
+  if (res === "new") {
+    try { await notifyEnrollment({ login: e.login, fp }, env); } catch (err) { console.error("enroll notify failed", err); }
+  }
+  return json({ ok: true, fingerprint: fp }, 202);
+}
+
+// POST /admin: {cmd, args, ts, nonce} signed by one of ADMIN_PUBKEYS in namespace gitzilla-admin.
+async function handleAdmin(request, env) {
+  const r = await readSigned(request);
+  if (r.error) return r.error;
+  const key = await verifyAny(r.sig, r.raw, "gitzilla-admin", parseAdminKeys(env.ADMIN_PUBKEYS));
+  if (!key) return json({ error: "bad signature" }, 401);
+  const a = cleanAdmin(r.parsed);
+  if (a.error === "bad payload") return json({ error: a.error }, 400);
+  const now = Date.now();
+  if (Math.abs(a.ts * 1000 - now) > ORG_SKEW_MS) return json({ error: "ts out of range" }, 401);
+  const hub = getHub(env);
+  if (!(await hub.useNonce(a.nonce, a.ts, now))) return json({ error: "replayed" }, 401);
+  if (a.error) return json({ error: a.error }, 400);
+  const out = await hub.admin(a.cmd, a.args, await fingerprint(key), now);
+  return json(out.body, out.status);
 }
 
 export default {
@@ -254,6 +328,8 @@ export default {
     if (url.pathname === "/alert" && request.method === "POST") return handleAlert(request, env);
     if (url.pathname === "/webhook" && request.method === "POST") return handleWebhook(request, env);
     if (url.pathname === "/queue" && request.method === "GET") return handleQueue(request, env);
+    if (orgMode(env) && url.pathname === "/enroll" && request.method === "POST") return handleEnroll(request, env);
+    if (orgMode(env) && url.pathname === "/admin" && request.method === "POST") return handleAdmin(request, env);
     if (url.pathname === "/health" && request.method === "GET") return json({ ok: true });
     return new Response("not found", { status: 404 });
   },

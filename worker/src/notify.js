@@ -91,6 +91,16 @@ export function formatAccountAlert(a, tz = "UTC") {
   };
 }
 
+// Pure. Org-mode enrollment request: a warning (priority 3, so never a phone call). login and fp are validated
+// by the caller (login charset [a-z0-9-], fp "SHA256:" + base64).
+export function formatEnrollment({ login, fp }) {
+  return {
+    title: "🟠 gitzilla: enrollment request",
+    body: [`Login: ${cap(login)}`, `Key: ${cap(fp)}`, "", REVOKE].join("\n"),
+    priority: 3,
+  };
+}
+
 async function post(name, url, payload, timeoutMs) {
   try {
     const res = await fetch(url, {
@@ -188,6 +198,11 @@ export async function notifyAccountAlert(a, env, timeoutMs = 8000, callGate) {
 
 export async function notifyReport(report, env, timeoutMs = 8000) {
   return send(formatReport(report), env, timeoutMs);
+}
+
+// No callGate: an enrollment alert can never place a call.
+export async function notifyEnrollment(e, env, timeoutMs = 8000) {
+  return send(formatEnrollment(e), env, timeoutMs);
 }
 
 const mask = (n) => `+${"*".repeat(Math.max(n.length - 3, 0))}${n.slice(-2)}`;

@@ -1,6 +1,9 @@
 import { DurableObject } from "cloudflare:workers";
 import { classify, BURST_WINDOW_S } from "./classify.js";
 import { notifyEvents } from "./notify.js";
+import {
+  MAX_MEMBERS, MAX_KEYS_PER_MEMBER, MAX_PENDING, MAX_BOTS, PENDING_TTL_MS, ENROLL_PER_HOUR,
+} from "./members.js";
 
 export const TTL_MS = 600_000;
 
@@ -13,6 +16,12 @@ const PAGE = 100;
 const evKey = (seq) => `ev:${String(seq).padStart(12, "0")}`;
 const unKey = (ts, delivery) => `un:${String(ts).padStart(12, "0")}:${delivery}`;
 const noteKey = (repo, ref, sha) => `note:${repo}|${ref}|${sha}`;
+// org mode
+const memberKey = (login) => `member:${login}`;
+const pendingKey = (login, fp) => `pending:${login}:${fp}`;
+const fpKey = (fp) => `fp:${fp}`; // fingerprint -> login of the member that owns it (one login per key)
+const botKey = (login) => `bot:${login}`;
+const rlKey = (ip, hour) => `rl:${ip}:${hour}`;
 
 // Single instance (idFromName("main")). Stores signed push notes and replay nonces,
 // each with an expiry timestamp (ms). `now` is injectable for tests.
@@ -65,6 +74,109 @@ export class Hub extends DurableObject {
   async hasNote(repo, ref, newSha, now = Date.now()) {
     await this.#prune(now);
     return (await this.ctx.storage.get(noteKey(repo, ref, newSha))) !== undefined;
+  }
+
+  // ---- org mode: enrollment and members. Every limit is enforced with a refusal, never by dropping data.
+
+  async #prunePending(now) {
+    const rows = await this.ctx.storage.list({ prefix: "pending:" });
+    const dead = [...rows].filter(([, p]) => p.ts * 1000 + PENDING_TTL_MS <= now).map(([k]) => k);
+    if (dead.length) await this.ctx.storage.delete(dead);
+    return rows.size - dead.length;
+  }
+
+  // Enrollment rate limit: ENROLL_PER_HOUR requests per client IP per clock hour. Counts every request,
+  // including ones that fail later. Counters of past hours are dropped.
+  async enrollRateOk(ip, now = Date.now()) {
+    const hour = Math.floor(now / 3_600_000);
+    const st = this.ctx.storage;
+    const old = [...(await st.list({ prefix: "rl:" }))]
+      .filter(([k]) => Number(k.slice(k.lastIndexOf(":") + 1)) < hour).map(([k]) => k);
+    if (old.length) await st.delete(old);
+    const key = rlKey(ip, hour);
+    const n = (await st.get(key)) ?? 0;
+    if (n >= ENROLL_PER_HOUR) return false;
+    await st.put(key, n + 1);
+    return true;
+  }
+
+  // A signed, verified enrollment. Returns "replay" | "member" | "full" | "new" | "refreshed".
+  async enroll(login, pubkey, fp, nonce, ts, now = Date.now()) {
+    if (!(await this.useNonce(nonce, ts, now))) return "replay";
+    const st = this.ctx.storage;
+    if ((await st.get(fpKey(fp))) !== undefined) return "member";
+    const live = await this.#prunePending(now);
+    const key = pendingKey(login, fp);
+    const had = (await st.get(key)) !== undefined;
+    if (!had && live >= MAX_PENDING) return "full";
+    await st.put(key, { pubkey, ts: Math.floor(now / 1000) });
+    return had ? "refreshed" : "new";
+  }
+
+  async isMemberKey(login, fp) {
+    return (await this.ctx.storage.get(fpKey(fp))) === login;
+  }
+
+  // Admin command, already authenticated and validated. Returns { status, body }.
+  async admin(cmd, args, adminFp, now = Date.now()) {
+    const st = this.ctx.storage;
+    const ok = { status: 200, body: { ok: true } };
+    const err = (status, error) => ({ status, body: { error } });
+    await this.#prunePending(now);
+
+    if (cmd === "approve") {
+      const { login, fingerprint: fp } = args;
+      const p = await st.get(pendingKey(login, fp));
+      if (p === undefined) return err(404, "no such pending enrollment");
+      const owner = await st.get(fpKey(fp));
+      if (owner !== undefined && owner !== login) return err(409, "key belongs to another member");
+      const keys = (await st.get(memberKey(login))) ?? [];
+      if (!keys.some((k) => k.fp === fp)) {
+        if (keys.length >= MAX_KEYS_PER_MEMBER) return err(409, `member has ${MAX_KEYS_PER_MEMBER} keys`);
+        if (!keys.length && (await st.list({ prefix: "member:" })).size >= MAX_MEMBERS) {
+          return err(409, `org has ${MAX_MEMBERS} members`);
+        }
+        keys.push({ pubkey: p.pubkey, fp, added_ts: Math.floor(now / 1000), added_by: adminFp });
+      }
+      await st.put({ [memberKey(login)]: keys, [fpKey(fp)]: login });
+      await st.delete(pendingKey(login, fp));
+      return ok;
+    }
+    if (cmd === "revoke") {
+      const { login, fingerprint: fp } = args;
+      const keys = (await st.get(memberKey(login))) ?? [];
+      const gone = keys.filter((k) => fp === undefined || k.fp === fp);
+      const pend = [...(await st.list({ prefix: `pending:${login}:` })).keys()]
+        .filter((k) => fp === undefined || k === pendingKey(login, fp));
+      if (!gone.length && !pend.length) return err(404, "no such member or key");
+      const left = keys.filter((k) => !gone.includes(k));
+      if (left.length) await st.put(memberKey(login), left);
+      else await st.delete(memberKey(login));
+      await st.delete([...gone.map((k) => fpKey(k.fp)), ...pend]);
+      return ok;
+    }
+    if (cmd === "list") {
+      const members = [...(await st.list({ prefix: "member:" }))]
+        .map(([k, v]) => ({ login: k.slice("member:".length), fps: v.map((e) => e.fp) }));
+      const pending = [...(await st.list({ prefix: "pending:" }))].map(([k, v]) => {
+        const rest = k.slice("pending:".length), i = rest.indexOf(":");
+        return { login: rest.slice(0, i), fp: rest.slice(i + 1), ts: v.ts };
+      });
+      const bots = [...(await st.list({ prefix: "bot:" })).keys()].map((k) => k.slice("bot:".length));
+      return { status: 200, body: { members, pending, bots } };
+    }
+    if (cmd === "allow-bot") {
+      if ((await st.get(botKey(args.login))) === undefined) {
+        if ((await st.list({ prefix: "bot:" })).size >= MAX_BOTS) return err(409, `org has ${MAX_BOTS} bots`);
+        await st.put(botKey(args.login), { added_ts: Math.floor(now / 1000), added_by: adminFp });
+      }
+      return ok;
+    }
+    if (cmd === "disallow-bot") {
+      if (!(await st.delete(botKey(args.login)))) return err(404, "no such bot");
+      return ok;
+    }
+    return err(400, "unknown command");
   }
 
   // The Hub has ONE alarm: it is only ever moved earlier here, and re-armed for the
