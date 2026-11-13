@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regenerates the org-mode SSHSIG fixtures (POST /enroll, POST /admin, org-mode queue/alert auth).
+# Regenerates the org-mode SSHSIG fixtures (POST /enroll, POST /admin, member-signed POST /note, org-mode queue/alert auth).
 # Every key is new on each run; private keys live only in a temp dir that is removed on exit.
 # Run with an isolated HOME (ssh-keygen never needs the real one).
 set -euo pipefail
@@ -7,7 +7,7 @@ cd "$(dirname "$0")"
 W=$(mktemp -d)
 trap 'rm -rf "$W"' EXIT
 rm -f ./*.pub ./*.fp ./*.json ./*.txt
-for k in admin admin2 alice alice2 bob; do
+for k in admin admin2 alice alice2 bob carol; do
   ssh-keygen -q -t ecdsa -b 256 -N '' -C "$k" -f "$W/$k"
   cp "$W/$k.pub" "$k.pub"
   # fingerprint exactly as ssh-keygen -lf prints it (field 2)
@@ -57,6 +57,8 @@ body("enroll-badlogin", "alice", "gitzilla-enroll", E("al_ice!", "alice"))
 body("enroll-dashlogin", "alice", "gitzilla-enroll", E("-alice", "alice"))
 body("enroll-extra", "alice", "gitzilla-enroll", E("alice", "alice", note="hi"))
 body("enroll-later", "alice", "gitzilla-enroll", E("alice", "alice", ts=TS + 600))
+# carol enrolls but is never approved: her notes must never verify
+body("enroll-carol", "carol", "gitzilla-enroll", E("carol", "carol"))
 
 # --- admin commands: namespace gitzilla-admin
 A = lambda cmd, args, **o: dict({"cmd": cmd, "args": args, "ts": TS, "nonce": nonce()}, **o)
@@ -80,6 +82,19 @@ body("admin-by-member", "alice", "gitzilla-admin", A("list", {}))
 body("admin-approve-by-member", "alice", "gitzilla-admin", A("approve", {"login": "alice", "fingerprint": fp("alice")}))
 body("admin-wrongns", "admin", "gitzilla-enroll", A("list", {}))
 body("admin-late", "admin", "gitzilla-admin", A("list", {}, ts=TS + 360))
+
+# --- member-signed push notes (namespace gitzilla-note), all for the same push acme/app refs/heads/main -> 4444...
+N = lambda **o: dict({"repo": "acme/app", "ref": "refs/heads/main", "old_sha": "1" * 40, "new_sha": "4" * 40,
+                      "ts": TS, "nonce": nonce()}, **o)
+body("note-alice", "alice", "gitzilla-note", N())
+body("note-alice-again", "alice", "gitzilla-note", N())
+body("note-alice2", "alice2", "gitzilla-note", N())
+body("note-bob", "bob", "gitzilla-note", N())
+body("note-carol", "carol", "gitzilla-note", N())
+body("note-admin", "admin", "gitzilla-note", N())
+body("note-alice-wrongns", "alice", "gitzilla-admin", N())
+# a login claimed in the payload is ignored: the signer is whoever owns the key
+body("note-alice-claims-bob", "alice", "gitzilla-note", N(login="bob"))
 
 # --- org-mode auth for the existing routes, signed by the admin key
 b = lambda x: base64.b64encode(x).decode()

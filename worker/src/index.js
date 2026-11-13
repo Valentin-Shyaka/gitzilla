@@ -1,7 +1,7 @@
-import { verifySshSig } from "./sshsig.js";
+import { verifySshSig, sigPublicKey } from "./sshsig.js";
 import { verifyGithubSignature } from "./hmac.js";
 import { notifyReport, notifyAccountAlert, notifyEnrollment } from "./notify.js";
-import { fingerprint, parseAdminKeys, cleanEnroll, cleanAdmin, ipBucket } from "./members.js";
+import { fingerprint, parseAdminKeys, cleanEnroll, cleanAdmin, cleanBotLogin, ipBucket } from "./members.js";
 
 export { Hub } from "./hub.js";
 
@@ -53,7 +53,17 @@ async function handleNote(request, env) {
   const raw = b64decode(body.payload);
   if (!raw) return new Response("bad base64", { status: 400 });
 
-  if (!(await verifySshSig(body.sig, raw, "gitzilla-note", env.NOTE_PUBKEY || ""))) {
+  // Org mode: the signature names its key; that key must be an active member key, and the signer is the member
+  // the Hub records for it (never a login from the payload). Pending or revoked keys are unknown here.
+  let signer = null;
+  if (orgMode(env)) {
+    const fp = await fingerprint(sigPublicKey(body.sig) ?? "");
+    const m = fp ? await getHub(env).memberByFp(fp) : null;
+    if (!m || !(await verifySshSig(body.sig, raw, "gitzilla-note", m.pubkey))) {
+      return new Response("bad signature", { status: 401 });
+    }
+    signer = { login: m.login, fp };
+  } else if (!(await verifySshSig(body.sig, raw, "gitzilla-note", env.NOTE_PUBKEY || ""))) {
     return new Response("bad signature", { status: 401 });
   }
   let note;
@@ -63,10 +73,12 @@ async function handleNote(request, env) {
   const now = Date.now();
   if (Math.abs(note.ts * 1000 - now) > SKEW_MS) return new Response("ts out of range", { status: 422 });
 
-  const hub = env.HUB.get(env.HUB.idFromName("main"));
-  if (!(await hub.addNote(note.repo, note.ref, note.new_sha, note.nonce, note.ts, now))) {
-    return new Response("replayed", { status: 409 });
-  }
+  const hub = getHub(env);
+  const added = signer
+    ? await hub.addNote(note.repo, note.ref, note.new_sha, note.nonce, note.ts, now, signer)
+    : await hub.addNote(note.repo, note.ref, note.new_sha, note.nonce, note.ts, now);
+  if (added === null) return new Response("bad signature", { status: 401 }); // key revoked meanwhile
+  if (!added) return new Response("replayed", { status: 409 });
   return new Response(null, { status: 204 });
 }
 
@@ -196,6 +208,16 @@ const json = (obj, status = 200) =>
   new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json" } });
 const getHub = (env) => env.HUB.get(env.HUB.idFromName("main"));
 
+// Org mode: who pushed (validated, lowercased login; null when missing or malformed, which classifies as
+// unenrolled) and whether every commit was made by GitHub's web-flow (the web UI).
+function orgPushFields(p, env) {
+  const login = cleanBotLogin(p.sender?.login);
+  const sender = login ? { login, type: p.sender.type === "Bot" ? "Bot" : "User" } : null;
+  const commits = Array.isArray(p.commits) ? p.commits : [];
+  const webflow = commits.length > 0 && commits.every((c) => c?.committer?.username === "web-flow");
+  return { org: true, sender, webflow, web_flow: env.WEB_FLOW === "silent" ? "silent" : "orange" };
+}
+
 async function handleWebhook(request, env) {
   const body = new Uint8Array(await request.arrayBuffer());
   if (!env.WEBHOOK_SECRET ||
@@ -217,9 +239,9 @@ async function handleWebhook(request, env) {
     if (typeof repo !== "string" || typeof p.ref !== "string" || !HEX40.test(p.before) || !HEX40.test(p.after)) {
       return new Response("bad payload", { status: 400 });
     }
-    await hub.receivePush(delivery, {
-      repo: repo.toLowerCase(), ref: p.ref, before: p.before, after: p.after, forced: p.forced === true,
-    }, now);
+    const push = { repo: repo.toLowerCase(), ref: p.ref, before: p.before, after: p.after, forced: p.forced === true };
+    if (orgMode(env)) Object.assign(push, orgPushFields(p, env));
+    await hub.receivePush(delivery, push, now);
     return new Response(null, { status: 202 });
   }
   // a suspended app stops every delivery: as bad as an uninstall

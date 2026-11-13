@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { classify, BURST_WINDOW_S } from "./classify.js";
+import { classify, classifyOrg, BURST_WINDOW_S } from "./classify.js";
 import { notifyEvents } from "./notify.js";
 import {
   MAX_MEMBERS, MAX_KEYS_PER_MEMBER, MAX_PENDING, MAX_BOTS, PENDING_TTL_MS, ENROLL_PER_HOUR, ENROLL_GLOBAL_PER_HOUR,
@@ -16,6 +16,9 @@ const PAGE = 100;
 const evKey = (seq) => `ev:${String(seq).padStart(12, "0")}`;
 const unKey = (ts, delivery) => `un:${String(ts).padStart(12, "0")}:${delivery}`;
 const noteKey = (repo, ref, sha) => `note:${repo}|${ref}|${sha}`;
+// A note row is its expiry (personal mode) or {exp, logins} (org mode: the members who signed it).
+const noteExp = (v) => (typeof v === "number" ? v : v?.exp ?? 0);
+export const MAX_NOTE_LOGINS = 8;
 // org mode
 const memberKey = (login) => `member:${login}`;
 const pendingKey = (login, fp) => `pending:${login}:${fp}`;
@@ -32,7 +35,7 @@ export class Hub extends DurableObject {
   async #prune(now) {
     for (const prefix of ["note:", "nonce:"]) {
       const rows = await this.ctx.storage.list({ prefix });
-      const dead = [...rows].filter(([, exp]) => exp <= now).map(([k]) => k);
+      const dead = [...rows].filter(([, v]) => noteExp(v) <= now).map(([k]) => k);
       if (dead.length) await this.ctx.storage.delete(dead);
     }
     for (const prefix of ["call:", "testcall:"]) {
@@ -54,14 +57,33 @@ export class Hub extends DurableObject {
 
   // Returns false if the nonce was already seen (replay), true if the note was stored.
   // The nonce is kept until ts+TTL too, so it outlives the window in which its note's ts is accepted.
-  async addNote(repo, ref, newSha, nonce, ts, now = Date.now()) {
+  // Org mode passes signer {login, fp}: the key must still belong to that member (else null, nothing stored),
+  // and the note row records the signer's login next to any other member who noted the same push.
+  async addNote(repo, ref, newSha, nonce, ts, now = Date.now(), signer = null) {
+    const st = this.ctx.storage;
     await this.#prune(now);
-    if ((await this.ctx.storage.get(`nonce:${nonce}`)) !== undefined) return false;
+    if (signer && (await st.get(fpKey(signer.fp))) !== signer.login) return null;
+    if ((await st.get(`nonce:${nonce}`)) !== undefined) return false;
     const exp = now + TTL_MS;
     const nonceExp = Math.max(exp, ts * 1000 + TTL_MS);
-    await this.ctx.storage.put({ [`nonce:${nonce}`]: nonceExp, [noteKey(repo, ref, newSha)]: exp });
+    const key = noteKey(repo, ref, newSha);
+    let value = exp;
+    if (signer) {
+      const old = await st.get(key);
+      const logins = Array.isArray(old?.logins) ? [...old.logins] : [];
+      if (!logins.includes(signer.login) && logins.length < MAX_NOTE_LOGINS) logins.push(signer.login);
+      value = { exp: Math.max(exp, noteExp(old)), logins };
+    }
+    await st.put({ [`nonce:${nonce}`]: nonceExp, [key]: value });
     await this.#armAt(exp + 1000);
     return true;
+  }
+
+  // Org mode: the logins that signed a live note for this exact push ([] if none).
+  async noteLogins(repo, ref, newSha, now = Date.now()) {
+    await this.#prune(now);
+    const v = await this.ctx.storage.get(noteKey(repo, ref, newSha));
+    return Array.isArray(v?.logins) ? v.logins : [];
   }
 
   // Single-use nonce for other signed routes; same retention as addNote. False on replay.
@@ -134,6 +156,15 @@ export class Hub extends DurableObject {
 
   async isMemberKey(login, fp) {
     return (await this.ctx.storage.get(fpKey(fp))) === login;
+  }
+
+  // The active member key with this fingerprint: {login, pubkey}, or null (unknown, pending or revoked).
+  async memberByFp(fp) {
+    const st = this.ctx.storage;
+    const login = await st.get(fpKey(fp));
+    if (login === undefined) return null;
+    const k = ((await st.get(memberKey(login))) ?? []).find((e) => e.fp === fp);
+    return k ? { login, pubkey: k.pubkey } : null;
   }
 
   // Admin command, already authenticated and validated. Returns { status, body }.
@@ -209,7 +240,7 @@ export class Hub extends DurableObject {
     const st = this.ctx.storage;
     const c = [];
     for (const [, p] of await st.list({ prefix: "pend:" })) c.push(p.at + GRACE_MS);
-    for (const prefix of ["note:", "nonce:"]) for (const [, exp] of await st.list({ prefix })) c.push(exp + 1000);
+    for (const prefix of ["note:", "nonce:"]) for (const [, v] of await st.list({ prefix })) c.push(noteExp(v) + 1000);
     for (const [, u] of await st.list({ prefix: "un:", limit: 1 })) c.push(u.ts * 1000 + BURST_WINDOW_S * 1000 + 1000);
     for (const [, e] of await st.list({ prefix: "ev:", limit: 1 })) c.push(e.ts * 1000 + EVENT_TTL_MS + 1000);
     return c.length ? Math.min(...c) : null;
@@ -277,10 +308,24 @@ export class Hub extends DurableObject {
     const out = [];
     for (const [key, p] of due) {
       const push = { repo: p.repo, ref: p.ref, before: p.before, after: p.after, forced: p.forced, ts: Math.floor(p.at / 1000) };
-      const noted = await this.hasNote(p.repo, p.ref, p.after, now);
       const recent = [...(await st.list({ prefix: "un:" }))].map(([, u]) => u);
-      const { level, flags } = classify(push, noted, recent);
-      if (!noted) await st.put(unKey(push.ts, p.delivery), { repo: p.repo, ref: p.ref, ts: push.ts });
+      let level, flags;
+      if (p.org) {
+        // org mode: the note must be signed by the pusher; the push record carries sender, webflow, web_flow
+        const login = p.sender?.login ?? null;
+        const ctx = {
+          logins: await this.noteLogins(p.repo, p.ref, p.after, now),
+          enrolled: login !== null && (await st.get(memberKey(login))) !== undefined,
+          allowlisted: login !== null && (await st.get(botKey(login))) !== undefined,
+          webFlow: p.web_flow,
+        };
+        ({ level, flags } = classifyOrg({ ...push, sender: p.sender ?? null, webflow: p.webflow === true }, ctx, recent));
+        push.pusher = login;
+      } else {
+        ({ level, flags } = classify(push, await this.hasNote(p.repo, p.ref, p.after, now), recent));
+      }
+      // burst window: every non-silent push (personal mode: silent exactly when noted)
+      if (level !== "silent") await st.put(unKey(push.ts, p.delivery), { repo: p.repo, ref: p.ref, ts: push.ts });
       const event = await this.#append({ delivery: p.delivery, kind: "push", ...push, level, flags }, p.at);
       await st.delete(key);
       out.push(event);

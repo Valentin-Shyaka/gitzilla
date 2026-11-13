@@ -50,6 +50,7 @@ export function formatAlert(events, tz = "UTC") {
     return [
       `Repo: ${cap(e.repo)}`,
       `Ref: ${cap(e.ref)}${e.forced ? " (forced)" : ""}`,
+      ...(e.pusher ? [`Pusher: ${cap(e.pusher)}`] : []),
       `Commits: ${short(e.before)} → ${short(e.after)}`,
       `Time: ${utc(e.ts)} / ${local(e.ts, tz)}`,
       `Flags: ${flags}`,
