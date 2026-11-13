@@ -78,6 +78,7 @@ async function handleNote(request, env) {
     ? await hub.addNote(note.repo, note.ref, note.new_sha, note.nonce, note.ts, now, signer)
     : await hub.addNote(note.repo, note.ref, note.new_sha, note.nonce, note.ts, now);
   if (added === null) return new Response("bad signature", { status: 401 }); // key revoked meanwhile
+  if (added === "full") return new Response("too many signers", { status: 409 });
   if (!added) return new Response("replayed", { status: 409 });
   return new Response(null, { status: 204 });
 }

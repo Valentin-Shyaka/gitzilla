@@ -118,7 +118,7 @@ describe("classifyOrg", () => {
   });
   it("Bot sender type or allowlisted login -> silent bot", () => {
     const bot = { login: "renovate[bot]", type: "Bot" };
-    expect(classifyOrg(P({ sender: bot, forced: true }), C({ enrolled: false }), [])).toEqual({ level: "silent", flags: ["bot"] });
+    expect(classifyOrg(P({ sender: bot }), C({ enrolled: false }), [])).toEqual({ level: "silent", flags: ["bot"] });
     expect(classifyOrg(P({ sender: { login: "ci-user", type: "User" } }), C({ enrolled: false, allowlisted: true }), []))
       .toEqual({ level: "silent", flags: ["bot"] });
     expect(classifyOrg(P({ sender: bot, after: Z }), C(), [])).toEqual({ level: "silent", flags: ["bot", "deleted"] });
@@ -128,6 +128,27 @@ describe("classifyOrg", () => {
     expect(classifyOrg(P({ webflow: true }), C({ webFlow: undefined }), [])).toEqual({ level: "warning", flags: ["web-flow"] });
     expect(classifyOrg(P({ webflow: true }), C({ webFlow: "silent" }), [])).toEqual({ level: "silent", flags: ["web-flow"] });
     expect(classifyOrg(P({ webflow: true, forced: true }), C(), [])).toEqual({ level: "critical", flags: ["web-flow", "forced"] });
+  });
+  it("a forced push is never silenced by the bot or web-flow rules", () => {
+    const bot = { login: "renovate[bot]", type: "Bot" };
+    expect(classifyOrg(P({ sender: bot, forced: true }), C({ enrolled: false }), [])).toEqual({ level: "critical", flags: ["bot", "forced"] });
+    expect(classifyOrg(P({ sender: { login: "ci-user", type: "User" }, forced: true }), C({ allowlisted: true }), []))
+      .toEqual({ level: "critical", flags: ["bot", "forced"] });
+    expect(classifyOrg(P({ webflow: true, forced: true }), C({ webFlow: "silent" }), []))
+      .toEqual({ level: "critical", flags: ["web-flow", "forced"] });
+    expect(classifyOrg(P({ sender: bot, webflow: true, forced: true, after: Z }), C({ webFlow: "silent" }), []))
+      .toEqual({ level: "critical", flags: ["bot", "forced", "deleted"] });
+    // the sender's own note still silences (unchanged)
+    expect(classifyOrg(P({ webflow: true, forced: true }), C({ logins: ["bob"], webFlow: "silent" }), []))
+      .toEqual({ level: "silent", flags: [] });
+  });
+  it("forced bot pushes count towards a burst; non-forced bot and web-flow pushes are silent", () => {
+    const bot = { login: "x[bot]", type: "Bot" };
+    const r = classifyOrg(P({ sender: bot, forced: true }), C(), [un("o/x", "refs/heads/a"), un("o/y", "refs/heads/a")]);
+    expect(r).toEqual({ level: "critical", flags: ["bot", "forced", "burst"] });
+    expect(classifyOrg(P({ sender: bot }), C(), [un("o/x", "refs/heads/a"), un("o/y", "refs/heads/a")]).level).toBe("silent");
+    expect(classifyOrg(P({ webflow: true }), C({ webFlow: "silent" }), [un("o/x", "refs/heads/a"), un("o/y", "refs/heads/a")]).level)
+      .toBe("silent");
   });
   it("table order: own note beats bot, bot beats web-flow", () => {
     expect(classifyOrg(P({ sender: { login: "x[bot]", type: "Bot" }, webflow: true }), C(), []).flags).toEqual(["bot"]);
@@ -167,9 +188,13 @@ describe("formatAlert Pusher line", () => {
     expect(lines[lines.indexOf("Ref: refs/heads/main") + 1]).toBe("Pusher: mallory");
     expect(body.endsWith("\n\n" + REVOKE)).toBe(true);
   });
-  it("is absent when no pusher (personal mode, or org push without a sender)", () => {
+  it("is absent when the event has no pusher field (personal mode)", () => {
     expect(formatAlert([ev()]).body).not.toContain("Pusher:");
-    expect(formatAlert([ev({ pusher: null })]).body).not.toContain("Pusher:");
+  });
+  it("says unknown for an org push without a usable sender (pusher null)", () => {
+    const { body } = formatAlert([ev({ pusher: null })]);
+    expect(body).toContain("Ref: refs/heads/main\nPusher: unknown\nCommits:");
+    expect(body.endsWith("\n\n" + REVOKE)).toBe(true);
   });
 });
 
@@ -217,6 +242,22 @@ describe("org /note", () => {
     await bob();
     expect((await note(N_CLAIMS_BOB)).status).toBe(204);
     expect((await row()).logins).toEqual(["alice"]);
+  });
+  it("a note already signed by 8 members refuses a 9th login with 409 and records nothing", async () => {
+    await alice();
+    const eight = ["m1", "m2", "m3", "m4", "m5", "m6", "m7", "m8"];
+    const full = { exp: TS * 1000 + 600_000, logins: eight };
+    await storage((s) => s.put(`note:acme/app|refs/heads/main|${NEW}`, full));
+    const r = await note(N_ALICE);
+    expect(r.status).toBe(409);
+    expect(await row()).toEqual(full);
+    const nonce = JSON.parse(atob(N_ALICE.payload)).nonce;
+    expect(await storage((s) => s.get(`nonce:${nonce}`))).toBeUndefined();
+    // a login already on the full note may still refresh it
+    await storage((s) => s.put(`note:acme/app|refs/heads/main|${NEW}`, { ...full, logins: [...eight.slice(1), "alice"] }));
+    vi.setSystemTime((TS + 30) * 1000);
+    expect((await note(N_ALICE)).status).toBe(204);
+    expect((await row()).exp).toBe((TS + 30) * 1000 + 600_000);
   });
   it("two members noting the same push: both logins, deduped across a member's keys; replay is 409", async () => {
     await alice();
@@ -279,8 +320,25 @@ describe("org push classification", () => {
     expect(calls()).toHaveLength(0);
   });
   it("Bot sender type -> silent bot", async () => {
-    await push({ sender: { login: "renovate[bot]", type: "Bot" }, forced: true });
+    await push({ sender: { login: "renovate[bot]", type: "Bot" } });
     expect(await lastEvent()).toMatchObject({ pusher: "renovate[bot]", level: "silent", flags: ["bot"] });
+    expect(slack()).toHaveLength(0);
+  });
+  it("forced push by a Bot sender -> critical alert and a phone call", async () => {
+    await push({ sender: { login: "renovate[bot]", type: "Bot" }, forced: true });
+    expect(await lastEvent()).toMatchObject({ pusher: "renovate[bot]", level: "critical", flags: ["bot", "forced"] });
+    const red = pushNtfy();
+    expect(red).toHaveLength(1);
+    expect(red[0].priority).toBe(5);
+    expect(red[0].message).toContain("Pusher: renovate[bot]");
+    expect(red[0].message.endsWith(REVOKE)).toBe(true);
+    expect(calls()).toHaveLength(1);
+  });
+  it("forced web-flow push with WEB_FLOW=silent -> critical", async () => {
+    const wf = { commits: [{ committer: { username: "web-flow" } }], forced: true };
+    await push(wf, { ...org, WEB_FLOW: "silent" });
+    expect(await lastEvent()).toMatchObject({ level: "critical", flags: ["web-flow", "forced"] });
+    expect(calls()).toHaveLength(1);
   });
   it("allowlisted bot login -> silent bot; not allowlisted -> unenrolled", async () => {
     await push({ sender: { login: "dependabot[bot]", type: "User" } });
@@ -316,10 +374,10 @@ describe("org push classification", () => {
     expect(calls()).toHaveLength(1);
     expect(calls()[0].call).toBe("+250788000001");
   });
-  it("missing or malformed sender -> unenrolled, no Pusher line", async () => {
+  it("missing or malformed sender -> unenrolled, Pusher: unknown", async () => {
     await push({ sender: undefined });
     expect(await lastEvent()).toMatchObject({ pusher: null, level: "warning", flags: ["unenrolled"] });
-    expect(slack()[0].text).not.toContain("Pusher:");
+    expect(slack()[0].text).toContain("Ref: refs/heads/main\nPusher: unknown\nCommits:");
     vi.setSystemTime((TS + 30) * 1000);
     await push({ sender: { login: "<b>evil</b>", type: "Bot" } });
     expect(await lastEvent(60)).toMatchObject({ pusher: null, level: "warning", flags: ["unenrolled"] });

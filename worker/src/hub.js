@@ -58,7 +58,8 @@ export class Hub extends DurableObject {
   // Returns false if the nonce was already seen (replay), true if the note was stored.
   // The nonce is kept until ts+TTL too, so it outlives the window in which its note's ts is accepted.
   // Org mode passes signer {login, fp}: the key must still belong to that member (else null, nothing stored),
-  // and the note row records the signer's login next to any other member who noted the same push.
+  // and the note row records the signer's login next to any other member who noted the same push. A row that
+  // already holds MAX_NOTE_LOGINS other logins refuses a new one ("full", nothing stored, nonce not used).
   async addNote(repo, ref, newSha, nonce, ts, now = Date.now(), signer = null) {
     const st = this.ctx.storage;
     await this.#prune(now);
@@ -71,7 +72,10 @@ export class Hub extends DurableObject {
     if (signer) {
       const old = await st.get(key);
       const logins = Array.isArray(old?.logins) ? [...old.logins] : [];
-      if (!logins.includes(signer.login) && logins.length < MAX_NOTE_LOGINS) logins.push(signer.login);
+      if (!logins.includes(signer.login)) {
+        if (logins.length >= MAX_NOTE_LOGINS) return "full";
+        logins.push(signer.login);
+      }
       value = { exp: Math.max(exp, noteExp(old)), logins };
     }
     await st.put({ [`nonce:${nonce}`]: nonceExp, [key]: value });

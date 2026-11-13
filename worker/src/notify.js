@@ -50,7 +50,8 @@ export function formatAlert(events, tz = "UTC") {
     return [
       `Repo: ${cap(e.repo)}`,
       `Ref: ${cap(e.ref)}${e.forced ? " (forced)" : ""}`,
-      ...(e.pusher ? [`Pusher: ${cap(e.pusher)}`] : []),
+      // org mode always sets pusher: the login, or null when GitHub sent no usable sender
+      ...(e.pusher ? [`Pusher: ${cap(e.pusher)}`] : e.pusher === null ? ["Pusher: unknown"] : []),
       `Commits: ${short(e.before)} → ${short(e.after)}`,
       `Time: ${utc(e.ts)} / ${local(e.ts, tz)}`,
       `Flags: ${flags}`,
