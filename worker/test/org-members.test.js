@@ -469,3 +469,19 @@ describe("control-route auth by mode", () => {
     expect((await post("/alert", ALERT_NOTE, personal)).status).toBe(204);
   });
 });
+
+describe("GET /health (org mode)", () => {
+  const health = (e) => worker.fetch(new Request("https://w.test/health"), e);
+  it("reports mode and lowercased org login in org mode", async () => {
+    const r = await health({ ...org, ORG: "Acme-Corp" });
+    expect(r.status).toBe(200);
+    expect(await r.json()).toEqual({ ok: true, mode: "org", org: "acme-corp" });
+  });
+  it("reports org null when ORG is unset or invalid", async () => {
+    expect(await (await health({ ...org, ORG: "" })).json()).toEqual({ ok: true, mode: "org", org: null });
+    expect(await (await health({ ...org, ORG: "-bad" })).json()).toEqual({ ok: true, mode: "org", org: null });
+  });
+  it("is unchanged in personal mode", async () => {
+    expect(await (await health({ ...personal, ORG: "acme" })).json()).toEqual({ ok: true });
+  });
+});

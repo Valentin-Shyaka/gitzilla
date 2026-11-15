@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # note <remote-name> <remote-url>: pre-push helper. Reads "<lref> <lsha> <rref> <rsha>" lines on stdin,
-# sends a signed push note per owned-repo line, copies pushed objects into the local mirror.
+# sends a signed push note per line for the owner's repos (personal Worker) and for the repos of an org this Mac
+# joined (that org's Worker, ORG_WORKERS), and copies pushed objects into the local mirror if there is one.
 # Always exits 0 (fail-open).
+# The hook belongs to the personal profile: an exported GITZILLA_PROFILE (left over from running an org profile's
+# tools in this shell) must not send notes with an org profile's config, or stop the note with an invalid name.
+unset GITZILLA_PROFILE
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$here/lib.sh"
 
@@ -9,11 +13,17 @@ url="${2:-}"
 slug="$(repo_slug "$url")"
 ZERO=0000000000000000000000000000000000000000
 
-owner="$(printf '%s' "${OWNER:-}" | tr '[:upper:]' '[:lower:]')"
+# Which Worker gets the note: the personal one for the owner's repos, an org's (ORG_WORKERS) for that org's repos,
+# none for anything else.
+owner="$(wd_lc "${OWNER:-}")"
+target=""
+if [ -n "$slug" ] && [ -n "$owner" ] && [ -n "${GITZILLA_URL:-}" ]; then
+  if [ "${slug%%/*}" = "$owner" ]; then target="$GITZILLA_URL"; else target="$(wd_org_worker "${slug%%/*}")"; fi
+fi
 if [ -n "$slug" ] && { [ -z "$owner" ] || [ -z "${GITZILLA_URL:-}" ]; }; then
   wd_log "not configured; note skipped for $slug"
   echo "gitzilla: note not sent (not configured) — this push will raise a warning" >&2
-elif [ -n "$slug" ] && [ "${slug%%/*}" = "$owner" ]; then
+elif [ -n "$target" ]; then
   top="$(git rev-parse --show-toplevel 2>/dev/null || git rev-parse --absolute-git-dir 2>/dev/null)"
   mirror="$(mirror_path "$slug")"
   input="$(cat)"
@@ -24,7 +34,7 @@ elif [ -n "$slug" ] && [ "${slug%%/*}" = "$owner" ]; then
       WD_REASON="worker unreachable"
       wd_log "note skipped for $slug $rref: $WD_REASON"
       echo "gitzilla: note not sent ($WD_REASON) — this push will raise a warning" >&2
-    elif ! wd_send_note "$slug" "$rref" "$rsha" "$lsha" </dev/null; then
+    elif ! wd_send_note "$target" "$slug" "$rref" "$rsha" "$lsha" </dev/null; then
       wd_log "note failed for $slug $rref: $WD_REASON"
       echo "gitzilla: note not sent ($WD_REASON) — this push will raise a warning" >&2
       [ "$WD_REASON" = "worker unreachable" ] && dead=1

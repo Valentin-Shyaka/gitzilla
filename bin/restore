@@ -178,7 +178,7 @@ while IFS="$(printf '\t')" read -r repo ref before after ts mx; do
   fi
   # old = what is on the remote now, new = what we are about to put there
   # no note, no push: an un-noted restore would itself be classified critical
-  if ! wd_send_note "$repo" "$ref" "$after" "$before" </dev/null; then
+  if ! wd_send_note "${GITZILLA_URL:-}" "$repo" "$ref" "$after" "$before" </dev/null; then
     wd_log "restore note failed for $repo $ref: $WD_REASON"
     skip "$repo" "$ref" "could not send note${WD_REASON:+ ($WD_REASON)}"; write_result; continue
   fi

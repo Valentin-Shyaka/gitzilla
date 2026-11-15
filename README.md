@@ -190,7 +190,66 @@ What a profile does not do (yet):
   changes nothing remote.
 - **No rotation.** The gh login and `~/.ssh/github-auth.pub` are shared by the whole Mac, so only the personal
   instance rotates them: a profile gets no rotate job, `first-rotation` is skipped, and `bin/rotate` refuses.
-- **No hook.** The global pre-push hook belongs to the personal instance: the `hook` step is skipped in a profile.
+- **No hook.** The global pre-push hook belongs to the personal instance: the `hook` step is skipped in a profile. Its
+  push note always uses the personal config (and its `ORG_WORKERS`, below), even if `GITZILLA_PROFILE` is exported in
+  the shell you push from.
+
+## Organizations
+
+An organization can run its own gitzilla Worker (org mode) that watches the org's repositories. Each developer keeps
+their personal gitzilla and *joins* the org's: from then on, a push to one of the org's repos sends its push note to
+the org's Worker, signed with the same `push-note` key. In org mode a note only silences pushes made by the member
+who signed it, and a key counts only after an admin approves it.
+
+### Join an org (members)
+
+Your admin gives you the org Worker's URL. With your personal gitzilla installed (no `GITZILLA_PROFILE`):
+
+```
+./install.sh --join-org https://gitzilla-acme.example.workers.dev
+```
+
+It checks that the URL is an org Worker (its `/health` reports mode `org` and the org's login), asks it to enroll
+your `push-note` key under your GitHub login, records `<org>=<url>` in `ORG_WORKERS` in
+`~/.config/gitzilla/config`, and prints:
+
+```
+Tell your gitzilla admin this fingerprint: SHA256:...
+```
+
+Give that fingerprint to your admin yourself (in person, or over a channel where they know it is you). Until they
+approve it, your pushes to the org's repos raise alerts like any unannounced push. Rerunning the command is safe: it
+only asks the Worker again and says whether you are pending or already a member. To point a joined org at a new URL,
+run it with the new URL and confirm. It only accepts `https://` URLs and refuses to run in a profile.
+
+Notes for the org's repos fail open exactly like personal ones: if the org Worker cannot be reached the push still
+goes through, with a warning, and the org's Worker alerts on it.
+
+### Admin commands (admins)
+
+Admins run `bin/org` in the org's profile; each command is signed with the profile's `push-note` key, which must be
+one of the Worker's admin keys:
+
+```
+GITZILLA_PROFILE=<org-profile> bin/org list
+GITZILLA_PROFILE=<org-profile> bin/org approve <login> <fingerprint>
+GITZILLA_PROFILE=<org-profile> bin/org revoke <login> [<fingerprint>]
+GITZILLA_PROFILE=<org-profile> bin/org allow-bot <login>       # e.g. dependabot[bot]
+GITZILLA_PROFILE=<org-profile> bin/org disallow-bot <login>
+```
+
+- `list` shows the members and their key fingerprints, the pending enrollments (login, fingerprint, age) and the
+  allowed bots. Pending requests expire after 7 days.
+- `approve` needs the fingerprint as well as the login. **Anyone can ask to enroll under any login**, so a pending
+  entry proves nothing about who sent it: approve only a fingerprint the member gave you directly (the one
+  `--join-org` printed for them), and only if it matches the pending entry for that login exactly.
+- `revoke <login>` removes every key of that login and clears its pending requests; with a fingerprint, only that key
+  (or that pending request). Use it for a departing member, a lost Mac, or a request you did not expect.
+- On an error the command prints the Worker's message (for example `no such pending enrollment`) and exits non-zero.
+
+### Set up an org Worker (admins)
+
+<!-- Task 7: ./install.sh --org -->
 
 ## Alert channels
 
@@ -280,7 +339,7 @@ stolen token short-lived, so there is no longer snooze).
 | Cloudflare login | **Not kept.** `wrangler logout` after each deploy, checked on disk | nothing |
 | `gh` token | `gh`'s own credential store; fine-grained PAT, 7-day expiry, rotated every 5 days; Contents and Metadata read-only (plus pull requests and issues) | Usable for at most 7 days; it cannot push, and any push it could cause would raise an alert anyway |
 
-What is stored where: `~/.config/gitzilla/config` (mode 600) holds only non-secret settings (login,
+What is stored where: `~/.config/gitzilla/config` (mode 600) holds only non-secret settings (login, joined org Workers,
 Worker URL, app name, drill repo, paths) and `push-note.pub`. `~/.local/state/gitzilla/` holds the queue
 cursor, `repos.txt`, `known-keys.txt`, the bare mirrors, incident files and logs. No secret is written to disk,
 logs or command lines: the Worker secrets go to `wrangler secret put` on stdin, the gh token to `gh` on stdin.

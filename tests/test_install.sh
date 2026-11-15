@@ -303,6 +303,10 @@ assert_eq 3 "$(nmatch 'secret put' "$T/npx.log")" "worker: fresh install puts th
 W1="$(cat "$T/secrets/WEBHOOK_SECRET")"; : > "$T/npx.log"; rm -rf "$T/secrets"; mkdir -p "$T/secrets"
 GITZILLA_INSTALL_STOP_AFTER=worker runin '\n' --from-step worker
 assert_eq 0 "$(rc)" "worker rerun (keep) ok"
+printf 'ORG_WORKERS=%q\n' "acme=https://gz.acme.workers.dev beta=https://gz.beta.workers.dev" >> "$GITZILLA_CONFIG_DIR/config"
+GITZILLA_INSTALL_STOP_AFTER=worker runin '\n' --from-step worker
+assert_eq "acme=https://gz.acme.workers.dev beta=https://gz.beta.workers.dev" "$( . "$GITZILLA_CONFIG_DIR/config"; printf '%s' "$ORG_WORKERS")" "worker rerun keeps the orgs joined with --join-org"
+assert_eq 1 "$(grep -c '^ORG_WORKERS=' "$GITZILLA_CONFIG_DIR/config" | tr -d ' ')" "worker rerun: one ORG_WORKERS line"
 assert_contains "$(out)" "KEEP" "worker rerun asks"
 assert_eq 0 "$(nmatch 'secret' "$T/npx.log")" "worker keep: no secret put"
 assert_contains "$(cat "$T/npx.log")" "deploy --var NOTE_PUBKEY:" "worker keep: still redeploys with NOTE_PUBKEY"

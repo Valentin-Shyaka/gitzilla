@@ -140,6 +140,69 @@ SHA2="$(git -C "$R2" rev-parse HEAD)"
 echo "refs/heads/main $SHA2 refs/heads/main $OLD" | ( cd "$R2" && GIT_DIR="$R2/.git" bash "$WD_ROOT/bin/note" origin git@github.com:Alice/Repo.git 2>/dev/null )
 git -C "$(mirror_path alice/repo)" cat-file -e "$SHA2" 2>/dev/null
 assert_eq 0 "$?" "mirror receives commit with GIT_DIR set"
+
+# --- org routing: ORG_WORKERS sends notes for an org's repos to that org's Worker (the same stub under localhost)
+ORG_URL="http://localhost:$STUB_PORT"
+printf 'ORG_WORKERS=%q\n' "acme=$ORG_URL beta=https://beta.example.workers.dev" >> "$GITZILLA_CONFIG_DIR/config"
+host_of() { sed -n "${1}p" "$STUB_LOG" | jq -r .headers.host; }
+: > "$STUB_LOG"
+echo "refs/heads/main $SHA refs/heads/main $OLD" | run_note git@github.com:Alice/Repo.git
+assert_eq 1 "$(lines)" "routing: own repo, one note"
+assert_eq "127.0.0.1:$STUB_PORT" "$(host_of 1)" "routing: own repo -> personal Worker"
+: > "$STUB_LOG"
+echo "refs/heads/main $SHA refs/heads/main $OLD" | run_note git@github.com:ACME/Widget.git
+assert_eq 0 "$(cat "$T/rc")" "routing: org repo exit 0"
+assert_eq 1 "$(lines)" "routing: org repo, one note"
+assert_eq "localhost:$STUB_PORT" "$(host_of 1)" "routing: org repo -> the org's Worker (owner matched lower-cased)"
+assert_eq "/note" "$(sed -n 1p "$STUB_LOG" | jq -r .path)" "routing: org note path"
+sed -n 1p "$STUB_LOG" | jq -r .body | jq -r .payload | base64 -d > "$T/payload"
+sed -n 1p "$STUB_LOG" | jq -r .body | jq -r .sig > "$T/sig"
+ssh-keygen -Y verify -f "$T/allowed_signers" -I test-owner -n gitzilla-note -s "$T/sig" < "$T/payload" >/dev/null 2>&1
+assert_eq 0 "$?" "routing: org note signed with the push-note key in gitzilla-note"
+assert_eq "acme/widget" "$(jq -r .repo "$T/payload")" "routing: org note repo"
+: > "$STUB_LOG"
+echo "refs/heads/main $SHA refs/heads/main $OLD" | run_note git@github.com:acmeish/Widget.git
+assert_eq 0 "$(lines)" "routing: an owner that is neither OWNER nor a joined org gets no note"
+echo "refs/heads/main $SHA refs/heads/main $OLD" | run_note git@github.com:acme-x/Widget.git
+assert_eq 0 "$(lines)" "routing: prefix of an org login is not that org"
+# org Worker failure: fail-open exactly like the personal one
+echo 401 > "$STUB_STATUS_FILE"
+echo "refs/heads/main $SHA refs/heads/main $OLD" | run_note git@github.com:acme/widget
+assert_eq 0 "$(cat "$T/rc")" "routing: org 401 exit 0"
+assert_contains "$(cat "$T/err")" "note not sent (worker returned 401) — this push will raise a warning" "routing: org 401 warns"
+rm -f "$STUB_STATUS_FILE"
+echo "refs/heads/main $SHA refs/heads/main $OLD" | run_note git@github.com:beta/x
+assert_eq 0 "$(cat "$T/rc")" "routing: unreachable org Worker exit 0"
+assert_contains "$(cat "$T/err")" "note not sent (worker unreachable)" "routing: unreachable org Worker warns"
+# a malformed ORG_WORKERS entry (not https) is ignored, never used
+sed -i.bak '/^ORG_WORKERS=/d' "$GITZILLA_CONFIG_DIR/config"
+printf 'ORG_WORKERS=%q\n' "evil=http://evil.example.com acme=$ORG_URL" >> "$GITZILLA_CONFIG_DIR/config"
+: > "$STUB_LOG"
+echo "refs/heads/main $SHA refs/heads/main $OLD" | run_note git@github.com:evil/x
+assert_eq 0 "$(lines)" "routing: plain-http org URL ignored"
+assert_eq "" "$(cat "$T/err")" "routing: ignored entry is silent"
+
+# --- an exported GITZILLA_PROFILE never reaches the hook's note (Task 3 M5)
+: > "$STUB_LOG"
+echo "refs/heads/main $SHA refs/heads/main $OLD" | GITZILLA_PROFILE=Bad run_note git@github.com:Alice/Repo.git
+assert_eq 0 "$(cat "$T/rc")" "profile: invalid exported profile, exit 0"
+assert_eq 1 "$(lines)" "profile: invalid exported profile, note still sent"
+assert_eq "" "$(cat "$T/err")" "profile: no profile error"
+# real layout (no explicit dirs): the org profile's config points elsewhere; the note still uses the personal one
+PH="$T/phome"; mkdir -p "$PH/.config/gitzilla/org-acme"
+cp "$GITZILLA_CONFIG_DIR/config" "$PH/.config/gitzilla/config"
+printf 'OWNER=acme\nGITZILLA_URL=http://localhost:9\nNOTE_PUBKEY_FILE=%s\n' "$T/key.pub" > "$PH/.config/gitzilla/org-acme/config"
+: > "$STUB_LOG"
+echo "refs/heads/main $SHA refs/heads/main $OLD" | ( cd "$R" && HOME="$PH" GITZILLA_PROFILE=org-acme \
+  env -u GITZILLA_CONFIG_DIR -u GITZILLA_STATE_DIR bash "$WD_ROOT/bin/note" origin git@github.com:Alice/Repo.git 2>"$T/err" )
+assert_eq 1 "$(lines)" "profile: org-acme exported, own repo note sent"
+assert_eq "127.0.0.1:$STUB_PORT" "$(host_of 1)" "profile: own repo note went to the personal Worker"
+: > "$STUB_LOG"
+echo "refs/heads/main $SHA refs/heads/main $OLD" | ( cd "$R" && HOME="$PH" GITZILLA_PROFILE=org-acme \
+  env -u GITZILLA_CONFIG_DIR -u GITZILLA_STATE_DIR bash "$WD_ROOT/bin/note" origin git@github.com:acme/widget 2>"$T/err" )
+assert_eq "localhost:$STUB_PORT" "$(host_of 1)" "profile: org repo note routed by the personal ORG_WORKERS"
+assert_eq "" "$(cat "$T/err")" "profile: no warning"
+[ -e "$PH/.local/state/gitzilla/org-acme" ] && _bad "profile: the org profile's state was touched" || _ok
 stop_stub
 
 # not configured

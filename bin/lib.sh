@@ -132,11 +132,50 @@ wd_sign() {
   return "$rc"
 }
 
-# wd_send_note <repo> <ref> <old_sha> <new_sha> -> 0 on 204; on failure sets WD_REASON, returns 1
+# ---- organizations. The personal config's ORG_WORKERS holds space-separated "<org-login>=<worker-url>" pairs
+# (install.sh --join-org writes it): pushes to that org's repos send their note to that org's Worker.
+WD_LOGIN_RE='^[a-z0-9][a-z0-9-]{0,38}$'        # GitHub login, lower-cased (the Worker's LOGIN_RE)
+WD_BOT_RE='^[a-z0-9][a-z0-9-]{0,38}(\[bot\])?$' # an allow-listed bot login (the Worker's BOT_RE)
+WD_FP_RE='^SHA256:[A-Za-z0-9+/]{43}$'
+
+# wd_lc <s> -> lower-cased s
+wd_lc() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# wd_valid_worker_url <url>: an https origin with no path (http only for 127.0.0.1 / localhost, for tests).
+wd_valid_worker_url() {
+  local re_https='^https://[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?(:[0-9]{1,5})?$'
+  local re_local='^http://(127\.0\.0\.1|localhost)(:[0-9]{1,5})?$'
+  [[ $1 =~ $re_https ]] || [[ $1 =~ $re_local ]]
+}
+
+# wd_org_worker <org-login>: the Worker URL ORG_WORKERS holds for that org (compared lower-cased), or nothing.
+wd_org_worker() {
+  local want pair o u
+  want="$(wd_lc "$1")"
+  [ -n "$want" ] || return 0
+  for pair in ${ORG_WORKERS:-}; do
+    o="$(wd_lc "${pair%%=*}")"; u="${pair#*=}"
+    [ "$o" = "$want" ] && [ "$pair" != "$u" ] && wd_valid_worker_url "$u" && { printf '%s\n' "$u"; return 0; }
+  done
+  return 0
+}
+
+# wd_envelope <namespace> <payload-file> <body-file>: sign the payload; write {payload: base64, sig} to body-file.
+# Sets WD_REASON and returns 1 on failure.
+wd_envelope() {
+  local sig
+  if ! sig="$(wd_sign "$1" "$2")"; then WD_REASON="signing failed"; return 1; fi
+  if ! jq -cn --arg p "$(base64 < "$2" | tr -d '\n')" --arg s "$sig" '{payload:$p,sig:$s}' > "$3"; then
+    WD_REASON="body build failed"; return 1
+  fi
+}
+
+# wd_send_note <worker-url> <repo> <ref> <old_sha> <new_sha> -> 0 on 204; on failure sets WD_REASON, returns 1.
+# The note goes to <worker-url>/note: the personal Worker for the owner's repos, an org's Worker for its repos.
 wd_send_note() {
-  local repo="$1" ref="$2" old="$3" new="$4" dir payload sig body code
+  local url="$1" repo="$2" ref="$3" old="$4" new="$5" dir payload sig body code
   WD_REASON=""
-  if [ -z "${GITZILLA_URL:-}" ] || { [ -z "${GITZILLA_SIGN_KEY:-}" ] && [ -z "${NOTE_PUBKEY_FILE:-}" ]; }; then
+  if [ -z "$url" ] || { [ -z "${GITZILLA_SIGN_KEY:-}" ] && [ -z "${NOTE_PUBKEY_FILE:-}" ]; }; then
     WD_REASON="not configured"; return 1
   fi
   dir="$(mktemp -d)" || { WD_REASON="no temp dir"; return 1; }
@@ -152,7 +191,7 @@ wd_send_note() {
     WD_REASON="body build failed"; rm -rf "$dir"; return 1
   fi
   code="$(curl --max-time 5 -sS -o /dev/null -w '%{http_code}' -X POST \
-          -H 'Content-Type: application/json' --data-binary @"$dir/body" "$GITZILLA_URL/note" 2>/dev/null)"
+          -H 'Content-Type: application/json' --data-binary @"$dir/body" "$url/note" 2>/dev/null)"
   rm -rf "$dir"
   if [ "$code" = "204" ]; then return 0; fi
   case "$code" in ""|000) WD_REASON="worker unreachable" ;; *) WD_REASON="worker returned $code" ;; esac

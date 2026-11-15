@@ -18,6 +18,13 @@ const reportStatusFile = process.env.STUB_REPORT_STATUS_FILE;
 // STUB_ALERT_STATUS_FILE: optional file holding the status code for POST /alert (default 204).
 const alertStatusFile = process.env.STUB_ALERT_STATUS_FILE;
 
+// STUB_HEALTH_BODY_FILE: optional file holding the GET /health body (default {"ok":true}).
+const healthBodyFile = process.env.STUB_HEALTH_BODY_FILE;
+// STUB_ORG_DIR: optional dir; POST /enroll and POST /admin answer with <dir>/<enroll|admin>.status (default 202 /
+// 200) and <dir>/<enroll|admin>.body (default {"ok":true}).
+const orgDir = process.env.STUB_ORG_DIR;
+function readOr(f, d) { try { return fs.readFileSync(f, 'utf8').trim() || d; } catch { return d; } }
+
 // STUB_QUEUE_CTL: optional JSON file read per request: {"status":401} fails every /queue,
 // {"failAfterGte":N} fails /queue?after>=N with 500, {"raw":{...}} serves that body verbatim.
 const ctlFile = process.env.STUB_QUEUE_CTL;
@@ -60,7 +67,12 @@ const server = http.createServer((req, res) => {
       let status = 200;
       try { if (healthFile) status = parseInt(fs.readFileSync(healthFile, 'utf8').trim(), 10) || 200; } catch {}
       res.writeHead(status, { 'content-type': 'application/json' });
-      res.end('{"ok":true}');
+      res.end(healthBodyFile ? readOr(healthBodyFile, '{"ok":true}') : '{"ok":true}');
+    } else if (req.method === 'POST' && (req.url === '/enroll' || req.url === '/admin') && orgDir) {
+      const name = req.url.slice(1);
+      const status = parseInt(readOr(`${orgDir}/${name}.status`, name === 'enroll' ? '202' : '200'), 10);
+      res.writeHead(status, { 'content-type': 'application/json' });
+      res.end(readOr(`${orgDir}/${name}.body`, '{"ok":true}'));
     } else if (req.method === 'GET' && req.url.split('?')[0] === '/queue' && queueFile) {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(fs.readFileSync(queueFile));

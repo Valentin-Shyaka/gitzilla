@@ -1,7 +1,7 @@
 import { verifySshSig, sigPublicKey } from "./sshsig.js";
 import { verifyGithubSignature } from "./hmac.js";
 import { notifyReport, notifyAccountAlert, notifyEnrollment } from "./notify.js";
-import { fingerprint, parseAdminKeys, cleanEnroll, cleanAdmin, cleanBotLogin, ipBucket } from "./members.js";
+import { fingerprint, parseAdminKeys, cleanEnroll, cleanAdmin, cleanBotLogin, cleanLogin, ipBucket } from "./members.js";
 
 export { Hub } from "./hub.js";
 
@@ -376,6 +376,12 @@ async function handleAdmin(request, env) {
   return json(out.body, out.status);
 }
 
+// GET /health: {ok:true} in personal mode (unchanged). Org mode adds the mode and the org login (lowercased; null
+// when ORG is unset or not a valid login), which `install.sh --join-org` reads to know which repos the Worker covers.
+function health(env) {
+  return orgMode(env) ? { ok: true, mode: "org", org: cleanLogin(env.ORG) } : { ok: true };
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -386,7 +392,7 @@ export default {
     if (url.pathname === "/queue" && request.method === "GET") return handleQueue(request, env);
     if (orgMode(env) && url.pathname === "/enroll" && request.method === "POST") return handleEnroll(request, env);
     if (orgMode(env) && url.pathname === "/admin" && request.method === "POST") return handleAdmin(request, env);
-    if (url.pathname === "/health" && request.method === "GET") return json({ ok: true });
+    if (url.pathname === "/health" && request.method === "GET") return json(health(env));
     return new Response("not found", { status: 404 });
   },
 };

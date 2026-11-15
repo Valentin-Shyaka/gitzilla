@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # install.sh [--from-step <name>] — guided, resumable install of the gitzilla. Compatible with macOS bash 3.2.
+# install.sh --join-org <worker-url> — join an organization's gitzilla (personal profile; see join_org below).
 #
 # GITZILLA_PROFILE=<name> installs a separate instance (bin/lib.sh: its own config, state and launchd labels
 # io.github.gitzilla.<name>.<job>); unset = personal. In a profile the worker step refuses (it would deploy over the
@@ -326,6 +327,7 @@ step_worker() {
       printf 'APP_NAME=%q\n' "$app"
       printf 'DRILL_REPO=%q\n' "$drill"
       printf 'ALERT_TZ=%q\n' "$tz"
+      [ -z "${ORG_WORKERS:-}" ] || printf 'ORG_WORKERS=%q\n' "$ORG_WORKERS" # orgs joined with --join-org
     } | atomic_write "$GITZILLA_CONFIG_DIR/config" ) || die "cannot write the config"
   chmod 600 "$GITZILLA_CONFIG_DIR/config"
   # shellcheck disable=SC1090
@@ -771,15 +773,91 @@ step_self_test() {
 }
 
 # ---------------------------------------------------------------------------------------------------------------
-from=""
+# --join-org <worker-url>: this Mac's developer joins an organization's gitzilla. Personal profile only; needs the
+# personal config (OWNER) and push-note key. Reads the org login from <url>/health (which must report mode "org"),
+# asks the org Worker to enroll the push-note key under OWNER (POST /enroll, signed by that key in namespace
+# gitzilla-enroll; an admin approves it with bin/org approve), then records "<org>=<url>" in ORG_WORKERS so that
+# bin/note sends notes for that org's repos to that Worker. Rerunning is safe: the same org and URL only re-posts
+# /enroll (202 pending / 409 already a member); a new URL for a joined org asks first (default no).
+JOIN_USAGE="usage: install.sh --join-org <https-worker-url>"
+join_org() {
+  local url="${1%/}" login pubfile pub fp health mode org cur dir code err new pair
+  [ -z "$GITZILLA_PROFILE" ] || die "--join-org runs in the personal profile only (it records the org in the personal config, which the pre-push hook reads); run it without GITZILLA_PROFILE. Nothing changed."
+  wd_valid_worker_url "$url" || die "--join-org needs the org Worker's https URL with no path (e.g. https://gitzilla-acme.example.workers.dev). Nothing changed."
+  [ -n "${OWNER:-}" ] && [ -n "${GITZILLA_URL:-}" ] || die "no personal config ($GITZILLA_CONFIG_DIR/config): install gitzilla for your own account first (./install.sh), then join the org. Nothing changed."
+  login="$(wd_lc "$OWNER")"
+  [[ $login =~ $WD_LOGIN_RE ]] || die "OWNER '$OWNER' in $GITZILLA_CONFIG_DIR/config is not a GitHub login. Nothing changed."
+  pubfile="${NOTE_PUBKEY_FILE:-$PUBFILE}"
+  pub="$(head -n1 "$pubfile" 2>/dev/null | awk '{print $1" "$2}')"
+  case "$pub" in "ecdsa-sha2-nistp256 "?*) ;; *) die "the push-note key ($pubfile) is missing or not an ecdsa-sha2-nistp256 (Secretive) key; run ./install.sh --from-step note-key. Nothing changed." ;; esac
+  fp="$(printf '%s\n' "$pub" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}')"
+  [[ $fp =~ $WD_FP_RE ]] || die "ssh-keygen cannot read the push-note key ($pubfile). Nothing changed."
+
+  health="$("$CURL" --max-time 10 -sS -f "$url/health" </dev/null 2>/dev/null)" || die "cannot reach $url/health; check the URL your admin gave you. Nothing changed."
+  mode="$(printf '%s' "$health" | jq -r '.mode // empty' 2>/dev/null)"
+  org="$(printf '%s' "$health" | jq -r '.org // empty' 2>/dev/null)"
+  [ "$mode" = org ] || die "$url is not an organization's gitzilla Worker (its /health does not report mode \"org\"). Nothing changed."
+  org="$(wd_lc "$org")"
+  [[ $org =~ $WD_LOGIN_RE ]] || die "$url does not name its organization (/health has no valid org login; the admin must set ORG). Nothing changed."
+  [ "$org" != "$login" ] || die "$url watches $org, which is your own account (the personal Worker covers it). Nothing changed."
+
+  cur="$(wd_org_worker "$org")"
+  if [ -n "$cur" ] && [ "$cur" != "$url" ]; then
+    say "You already joined $org with the Worker $cur."
+    ask_yes "Replace it with $url?" || die "kept $org=$cur. Nothing changed."
+  fi
+
+  dir="$(mktemp -d)" || die "mktemp failed"
+  jq -cn --arg l "$login" --arg k "$pub" --argjson ts "$(date +%s)" --arg n "$(openssl rand -hex 16)" \
+    '{login:$l,pubkey:$k,ts:$ts,nonce:$n}' | tr -d '\n' > "$dir/payload"
+  [ -s "$dir/payload" ] || { rm -rf "$dir"; die "cannot build the enrollment request. Nothing changed."; }
+  wd_envelope gitzilla-enroll "$dir/payload" "$dir/body" || { rm -rf "$dir"; die "enrollment request: $WD_REASON (is Secretive running?). Nothing changed."; }
+  code="$("$CURL" --max-time 15 -sS -o "$dir/resp" -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+          --data-binary @"$dir/body" "$url/enroll" </dev/null 2>/dev/null)"
+  err="$(jq -r '.error // empty' "$dir/resp" 2>/dev/null | tr -cd 'A-Za-z0-9 ._:/()-' | cut -c1-200)"
+  rm -rf "$dir"
+  case "$code" in
+    202) say "enrollment requested: $login is pending approval by a $org gitzilla admin" ;;
+    409) say "already a member of $org's gitzilla with this key (nothing to approve)" ;;
+    ""|000) die "cannot reach $url/enroll. Nothing changed." ;;
+    *) die "the $org Worker refused the enrollment: ${err:-HTTP $code} (HTTP $code). Nothing changed." ;;
+  esac
+
+  if [ "$cur" != "$url" ]; then
+    new=""
+    for pair in ${ORG_WORKERS:-}; do [ "$(wd_lc "${pair%%=*}")" = "$org" ] || new="${new:+$new }$pair"; done
+    new="${new:+$new }$org=$url"
+    ( umask 077
+      { grep -v '^ORG_WORKERS=' "$GITZILLA_CONFIG_DIR/config"; printf 'ORG_WORKERS=%q\n' "$new"; } \
+        | atomic_write "$GITZILLA_CONFIG_DIR/config" ) || die "cannot write $GITZILLA_CONFIG_DIR/config"
+    chmod 600 "$GITZILLA_CONFIG_DIR/config"
+    ORG_WORKERS="$new"
+    wd_log "install: joined org $org ($url)"
+    say "push notes for $org/* repos now go to $url"
+  else
+    say "$org is already set up on this Mac ($url)"
+  fi
+  say ""
+  say "Tell your gitzilla admin this fingerprint: $fp"
+  say "  (in person or over a channel you trust; they approve it with: bin/org approve $login $fp)"
+}
+
+# ---------------------------------------------------------------------------------------------------------------
+from=""; join=""; join_set=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --from-step) [ $# -ge 2 ] || { echo "usage: install.sh [--from-step <name>]" >&2; exit 2; }; from="$2"; shift ;;
-    -h|--help) echo "usage: install.sh [--from-step <name>]  (steps: $STEPS)"; exit 0 ;;
+    --join-org) [ $# -ge 2 ] || { echo "$JOIN_USAGE" >&2; exit 2; }; join="$2"; join_set=1; shift ;;
+    -h|--help) echo "usage: install.sh [--from-step <name>]  (steps: $STEPS)"; echo "       install.sh --join-org <https-worker-url>"; exit 0 ;;
     *) echo "usage: install.sh [--from-step <name>]" >&2; exit 2 ;;
   esac
   shift
 done
+if [ "$join_set" = 1 ]; then
+  [ -z "$from" ] || { echo "install: --join-org and --from-step do not combine" >&2; exit 2; }
+  join_org "$join"
+  exit 0
+fi
 if [ -n "$from" ]; then
   case " $STEPS " in *" $from "*) ;; *) echo "install: unknown step '$from'. Valid steps: $STEPS" >&2; exit 2 ;; esac
 fi
