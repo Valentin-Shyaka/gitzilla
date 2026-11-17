@@ -150,10 +150,12 @@ wd_valid_worker_url() {
 
 # wd_org_worker <org-login>: the Worker URL ORG_WORKERS holds for that org (compared lower-cased), or nothing.
 wd_org_worker() {
-  local want pair o u
+  local want pair o u pairs=()
   want="$(wd_lc "$1")"
   [ -n "$want" ] || return 0
-  for pair in ${ORG_WORKERS:-}; do
+  # split without globbing: a hand-edited entry with * or ? must not expand to file names
+  IFS=$' \t\n' read -r -d '' -a pairs <<< "${ORG_WORKERS:-}" || true
+  for pair in ${pairs[@]+"${pairs[@]}"}; do
     o="$(wd_lc "${pair%%=*}")"; u="${pair#*=}"
     [ "$o" = "$want" ] && [ "$pair" != "$u" ] && wd_valid_worker_url "$u" && { printf '%s\n' "$u"; return 0; }
   done

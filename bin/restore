@@ -18,11 +18,17 @@
 # Double invocation: refs already in an existing result file are carried over and not touched again;
 # if nothing else remains there is no dialog and no push. Compatible with macOS bash 3.2.
 #
+# Org profile (config MODE=org, written by install.sh --org): before the note and the push of a ref, the admin's
+# own access to the repo is checked with `gh api repos/<repo> --jq '.permissions.push // .permissions.admin'`;
+# anything but `true` (no access, gh not logged in, network) skips every ref of that repo with "no push permission".
+# The personal profile does no such check.
+#
 # Env overrides (tests): GITZILLA_DIALOG_CMD <message> <Restore,Details,Ignore> (prints the button, or
 # TIMEOUT to simulate give-up),
-# GITZILLA_NOTIFY_CMD, GITZILLA_REMOTE_URL_TEMPLATE, ALLOWED_SIGNERS_FILE.
+# GITZILLA_NOTIFY_CMD, GITZILLA_REMOTE_URL_TEMPLATE, ALLOWED_SIGNERS_FILE, GITZILLA_GH_CMD.
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$here/lib.sh"
+GH="${GITZILLA_GH_CMD:-gh}"
 REMOTE_TPL="${GITZILLA_REMOTE_URL_TEMPLATE:-git@github.com:%s.git}"
 SIGNERS="${ALLOWED_SIGNERS_FILE:-$(wd_allowed_signers)}" # gpg.ssh.allowedSignersFile, else ~/.config/git/allowed_signers
 ZERO=0000000000000000000000000000000000000000
@@ -70,6 +76,18 @@ dialog() {
 tmp="$(mktemp -d)" || exit 1
 trap 'rm -rf "$tmp"' EXIT
 : > "$tmp/valid.tsv"; : > "$tmp/skipped.jsonl"; : > "$tmp/restored.jsonl"
+
+# can_push <repo>: org profile only; 0 when gh says this account may push to <repo>. One gh call per repo per run.
+can_push() {
+  local f="$tmp/perm.tsv" v
+  v="$(awk -F'\t' -v r="$1" '$1 == r {print $2; exit}' "$f" 2>/dev/null)"
+  if [ -z "$v" ]; then
+    v="$("$GH" api "repos/$1" --jq '.permissions.push // .permissions.admin' </dev/null 2>/dev/null | head -n1)"
+    [ "$v" = true ] || v=no
+    printf '%s\t%s\n' "$1" "$v" >> "$f"
+  fi
+  [ "$v" = true ]
+}
 
 SLUG_RE='^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
 SHA_RE='^[0-9a-f]{40}$'
@@ -175,6 +193,11 @@ while IFS="$(printf '\t')" read -r repo ref before after ts mx; do
     lease="--force-with-lease=$ref:"; spec="$before:$ref"
   else
     lease="--force-with-lease=$ref:$after"; spec="$before:$ref"
+  fi
+  # org profile: an admin without push access to this repo cannot restore it (and sends no note for it)
+  if [ "${MODE:-}" = org ] && ! can_push "$repo"; then
+    wd_log "restore: no push permission for $repo; $ref skipped"
+    skip "$repo" "$ref" "no push permission"; write_result; continue
   fi
   # old = what is on the remote now, new = what we are about to put there
   # no note, no push: an un-noted restore would itself be classified critical

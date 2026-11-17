@@ -89,12 +89,13 @@ const REPORT_REASONS = [
   "ref moved since the incident", "old commit not available locally", "could not send note",
   "not flagged critical — review manually", "interleaved with your own pushes", "invalid event",
   "no change", "push failed", "restore target not verified — review manually",
+  "no push permission", // org profile: the admin's account may not push to that repo
 ];
 
 const REASON_DETAIL = /^[A-Za-z0-9 ._:/-]{0,100}$/;
 const REPORT_TOTAL_MAX = 100_000;
 // Exact fixed reason, or fixed reason + " (" + detail + ")" with a restricted detail charset.
-function validReason(r) {
+export function validReason(r) {
   if (typeof r !== "string") return false;
   return REPORT_REASONS.some((p) =>
     r === p || (r.startsWith(p + " (") && r.endsWith(")") && REASON_DETAIL.test(r.slice(p.length + 2, -1))));

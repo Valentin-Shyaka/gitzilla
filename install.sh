@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
 # install.sh [--from-step <name>] — guided, resumable install of the gitzilla. Compatible with macOS bash 3.2.
 # install.sh --join-org <worker-url> — join an organization's gitzilla (personal profile; see join_org below).
+# install.sh --org <org-login> [--from-step <name>] — an org admin installs the organization's gitzilla (see below).
 #
 # GITZILLA_PROFILE=<name> installs a separate instance (bin/lib.sh: its own config, state and launchd labels
-# io.github.gitzilla.<name>.<job>); unset = personal. In a profile the worker step refuses (it would deploy over the
-# personal Worker; profile Workers come with --org), the hook and first-rotation steps are skipped (both belong to the
-# personal profile), and launchd loads only the agent and reconcile jobs (no rotate job).
+# io.github.gitzilla.<name>.<job>); unset = personal. In a plain profile the worker step refuses (it would deploy over
+# the personal Worker; profile Workers come with --org), the hook and first-rotation steps are skipped (both belong to
+# the personal profile), and launchd loads only the agent and reconcile jobs (no rotate job).
+#
+# --org <org-login>: the profile org-<login> (lower-cased) in org mode. Its steps are
+#   prereqs note-key worker github-app repos mirrors launchd self-test
+# (no hook, known-keys or first-rotation). The worker step deploys the Worker named gitzilla-<login> (every wrangler
+# deploy and secret call carries --name gitzilla-<login>, never touching the personal Worker "gitzilla") with
+# --var MODE:org --var ORG:<login> --var ADMIN_PUBKEYS:<the push-note key> and writes OWNER=<login>, MODE=org,
+# ORG=<login>, WORKER_NAME and WEB_FLOW into the profile's config. GITZILLA_WEB_FLOW=orange|silent (default: the
+# config's WEB_FLOW, else orange) is deployed as the Worker var WEB_FLOW. A rerun may name the profile instead
+# (GITZILLA_PROFILE=org-<login> ./install.sh ...): a profile whose config says MODE=org is in org mode too.
 #
 # Steps (in order): prereqs note-key worker github-app hook repos mirrors known-keys launchd first-rotation self-test
 # $STATE/install-step holds the last completed step; a rerun resumes after it. --from-step <name> forces the start.
@@ -23,6 +33,35 @@
 # config's ALERT_TZ, else the Mac's zone from /etc/localtime), deployed as the Worker var ALERT_TZ and saved in the
 # config. GITZILLA_LOCALTIME (tests) replaces /etc/localtime; GITZILLA_NODE_PATH_FILE (tests) replaces scanner/node-path.
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+USAGE="usage: install.sh [--from-step <name>]
+       install.sh --org <org-login> [--from-step <name>]
+       install.sh --join-org <https-worker-url>"
+# --org picks the profile, so it is read before bin/lib.sh chooses the config and state directories.
+ORG_LOGIN=""; org_set=0
+_args=("$@"); _i=0
+while [ "$_i" -lt "${#_args[@]}" ]; do
+  case "${_args[$_i]}" in
+    --from-step|--join-org) _i=$((_i + 1)) ;;
+    --org) org_set=1; ORG_LOGIN="${_args[$((_i + 1))]:-}"; _i=$((_i + 1)) ;;
+  esac
+  _i=$((_i + 1))
+done
+unset _args _i
+if [ "$org_set" = 1 ]; then
+  ORG_LOGIN="$(printf '%s' "$ORG_LOGIN" | tr '[:upper:]' '[:lower:]')"
+  _re='^[a-z0-9][a-z0-9-]{0,38}$' # the Worker's LOGIN_RE (WD_LOGIN_RE)
+  [[ $ORG_LOGIN =~ $_re ]] || { printf 'install: --org needs the organization'"'"'s GitHub login (1-39 letters, digits or hyphens, not starting with a hyphen)\n%s\n' "$USAGE" >&2; exit 2; }
+  unset _re
+  # the profile name org-<login> must be a valid profile name (at most 40 characters), the Worker name at most 63
+  [ "${#ORG_LOGIN}" -le 36 ] || { echo "install: the org login '$ORG_LOGIN' is too long: the profile name org-$ORG_LOGIN may have at most 40 characters" >&2; exit 2; }
+  _w="gitzilla-$ORG_LOGIN"
+  [ "${#_w}" -le 63 ] || { echo "install: the Worker name $_w is longer than 63 characters" >&2; exit 2; }
+  unset _w
+  if [ -n "${GITZILLA_PROFILE:-}" ] && [ "$GITZILLA_PROFILE" != "org-$ORG_LOGIN" ]; then
+    echo "install: --org $ORG_LOGIN installs the profile org-$ORG_LOGIN, but GITZILLA_PROFILE is '$GITZILLA_PROFILE'; drop GITZILLA_PROFILE" >&2; exit 2
+  fi
+  GITZILLA_PROFILE="org-$ORG_LOGIN"; export GITZILLA_PROFILE # the steps' child commands (reconcile seed, notify-test) too
+fi
 . "$here/bin/lib.sh"
 GITZILLA_HOME="$here"
 GH="${GITZILLA_GH_CMD:-gh}"
@@ -56,6 +95,18 @@ HOOK_PREV_LINK="gitzilla-prev/pre-push" # runs the moved hook under the name pre
 DRILL_DEFAULT="gitzilla-drill"
 APP_PREFIX="gitzilla-"
 APP_NAME_MAX=34 # GitHub's limit for a GitHub App name
+# Org mode: --org <login>, or a profile whose config (written by an earlier --org run) says MODE=org for that org.
+ORG_MODE=0; WORKER_NAME=""; WNAME=()
+if [ "$org_set" = 1 ]; then
+  ORG_MODE=1
+elif [ -n "$GITZILLA_PROFILE" ] && [ "${MODE:-}" = org ] && [ "org-$(wd_lc "${ORG:-}")" = "$GITZILLA_PROFILE" ]; then
+  ORG_MODE=1; ORG_LOGIN="$(wd_lc "$ORG")"
+fi
+if [ "$ORG_MODE" = 1 ]; then
+  STEPS="prereqs note-key worker github-app repos mirrors launchd self-test"
+  WORKER_NAME="gitzilla-$ORG_LOGIN"
+  WNAME=(--name "$WORKER_NAME") # on every wrangler deploy / secret call: never the personal Worker "gitzilla"
+fi
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR
 export GIT_TERMINAL_PROMPT=0
 
@@ -135,6 +186,11 @@ Create the note key in Secretive:
      the key only proves that a note came from this Mac, it cannot push code)
   3. Click the new key, then "Copy Public Key" (the clipboard now holds one line)
 EOF
+  if [ "$ORG_MODE" = 1 ]; then
+    say "For the $ORG_LOGIN organization use the SAME push-note key as your personal gitzilla (in Secretive click"
+    say "push-note, then \"Copy Public Key\"); create it as above only if you have none. It becomes the org Worker's"
+    say "admin key (ADMIN_PUBKEYS), and it must be an ECDSA (ecdsa-sha2-nistp256) Secretive key."
+  fi
   wait_enter "Press Enter when the public key is on the clipboard."
   local line
   line="$("$PBPASTE" 2>/dev/null | head -n1)"
@@ -221,12 +277,36 @@ ask_hidden_valid() {
   worker_die "$why. The WEBHOOK_SECRET and NTFY_TOPIC shown above are not saved: rerun ./install.sh --from-step worker and type rotate (when asked) to get new ones"
 }
 
+# admin_pubkey: the push-note key as the org Worker's ADMIN_PUBKEYS value ("ecdsa-sha2-nistp256 <base64>", comment
+# dropped). The Worker trusts no admin key at all when that value is malformed (it fails closed), so the file must hold
+# exactly one ecdsa-sha2-nistp256 key line that ssh-keygen can read. Returns 1 otherwise.
+admin_pubkey() {
+  local n line t b _rest re='^[A-Za-z0-9+/]+={0,2}$'
+  n="$(grep -c . "$PUBFILE" 2>/dev/null)"
+  [ "$n" = 1 ] || return 1
+  line="$(grep . "$PUBFILE")"
+  read -r t b _rest <<< "$line"
+  [ "$t" = ecdsa-sha2-nistp256 ] && [[ $b =~ $re ]] || return 1
+  printf '%s %s\n' "$t" "$b" | fp_of >/dev/null || return 1
+  printf '%s %s\n' "$t" "$b"
+}
+
 step_worker() {
-  # wrangler deploy / secret put have no --name yet, so in a profile they would hit the personal Worker "gitzilla"
-  [ -z "$GITZILLA_PROFILE" ] || die "profile $GITZILLA_PROFILE: the worker step is not available in a profile yet (it would deploy over the personal Worker 'gitzilla' and replace its secrets); Worker deploys for an org profile arrive with ./install.sh --org. Nothing changed. If this profile already has a config for its own Worker in $GITZILLA_CONFIG_DIR/config, continue with: GITZILLA_PROFILE=$GITZILLA_PROFILE ./install.sh --from-step github-app"
+  # a plain profile has no Worker of its own: without --name, deploy / secret put would hit the personal Worker "gitzilla"
+  [ -z "$GITZILLA_PROFILE" ] || [ "$ORG_MODE" = 1 ] || die "profile $GITZILLA_PROFILE: the worker step is not available in a profile yet (it would deploy over the personal Worker 'gitzilla' and replace its secrets); Worker deploys for an org profile come with ./install.sh --org <org-login>. Nothing changed. If this profile already has a config for its own Worker in $GITZILLA_CONFIG_DIR/config, continue with: GITZILLA_PROFILE=$GITZILLA_PROFILE ./install.sh --from-step github-app"
   [ -s "$PUBFILE" ] || die "no $PUBFILE: run the note-key step first"
-  local owner pub out url wsec topic slack nums ctok left last mode=fresh ans drill app tz
-  owner="${OWNER:-$("$GH" api user --jq .login 2>/dev/null)}"
+  local owner pub out url wsec topic slack nums ctok left last mode=fresh ans drill app tz admin="" orgvars=() wdel="" wf=""
+  if [ "$ORG_MODE" = 1 ]; then
+    owner="$ORG_LOGIN"
+    admin="$(admin_pubkey)" || die "the push-note key ($PUBFILE) must be exactly one ecdsa-sha2-nistp256 (Secretive) public key line: it becomes the org Worker's ADMIN_PUBKEYS, and the Worker trusts no admin key at all when that value is malformed. Fix it with --from-step note-key. Nothing deployed."
+    # pushes whose every commit GitHub's web UI made: orange (default) or silent (never a forced push)
+    wf="${GITZILLA_WEB_FLOW:-${WEB_FLOW:-orange}}"
+    case "$wf" in orange|silent) ;; *) die "GITZILLA_WEB_FLOW must be orange or silent, not '$wf'. Nothing deployed." ;; esac
+    orgvars=(--var "MODE:org" --var "ORG:$ORG_LOGIN" --var "WEB_FLOW:$wf" --var "ADMIN_PUBKEYS:$admin")
+    wdel=" --name $WORKER_NAME"
+  else
+    owner="${OWNER:-$("$GH" api user --jq .login 2>/dev/null)}"
+  fi
   [ -n "$owner" ] || die "cannot determine the GitHub login (gh api user)"
   app="$(app_name_for "$owner")"
   drill="${GITZILLA_DRILL_REPO:-${DRILL_REPO:-$DRILL_DEFAULT}}"
@@ -251,7 +331,11 @@ step_worker() {
     cd "$here/worker" || exit 1
     "$NPM" ci || exit 1
     "$NPX" wrangler login || exit 1
-    "$NPX" wrangler deploy --var "NOTE_PUBKEY:$pub" --var "ALERT_TZ:$tz" 2>&1 | tee "$out"
+    if [ "$ORG_MODE" = 1 ]; then
+      "$NPX" wrangler deploy "${WNAME[@]}" --var "ALERT_TZ:$tz" "${orgvars[@]}" 2>&1 | tee "$out"
+    else
+      "$NPX" wrangler deploy --var "NOTE_PUBKEY:$pub" --var "ALERT_TZ:$tz" 2>&1 | tee "$out"
+    fi
     exit "${PIPESTATUS[0]}"
   ) || { rm -f "$out"; worker_die "worker build/deploy failed"; }
   url="$(grep -Eo 'https://[A-Za-z0-9.-]+\.workers\.dev' "$out" | head -n1)"
@@ -278,20 +362,21 @@ step_worker() {
       ctok="$ASK_VAL"; ASK_VAL=""
     fi
     ( cd "$here/worker" || exit 1
-      printf '%s' "$wsec" | "$NPX" wrangler secret put WEBHOOK_SECRET || exit 1
-      printf '%s' "$topic" | "$NPX" wrangler secret put NTFY_TOPIC || exit 1
+      # "${WNAME[@]}": --name gitzilla-<org> in org mode, nothing for the personal Worker
+      printf '%s' "$wsec" | "$NPX" wrangler secret put WEBHOOK_SECRET "${WNAME[@]}" || exit 1
+      printf '%s' "$topic" | "$NPX" wrangler secret put NTFY_TOPIC "${WNAME[@]}" || exit 1
       # the Worker treats SLACK_WEBHOOK_URL as optional (notify.js posts to Slack only when it is set)
-      if [ -n "$slack" ]; then printf '%s' "$slack" | "$NPX" wrangler secret put SLACK_WEBHOOK_URL || exit 1; fi
+      if [ -n "$slack" ]; then printf '%s' "$slack" | "$NPX" wrangler secret put SLACK_WEBHOOK_URL "${WNAME[@]}" || exit 1; fi
       # calls are optional too (notify.js calls only with a valid token and at least one valid number)
       if [ -n "$nums" ]; then
-        printf '%s' "$nums" | "$NPX" wrangler secret put NTFY_CALL_NUMBERS || exit 1
-        printf '%s' "$ctok" | "$NPX" wrangler secret put NTFY_CALL_TOKEN || exit 1
+        printf '%s' "$nums" | "$NPX" wrangler secret put NTFY_CALL_NUMBERS "${WNAME[@]}" || exit 1
+        printf '%s' "$ctok" | "$NPX" wrangler secret put NTFY_CALL_TOKEN "${WNAME[@]}" || exit 1
       fi
     ) || { wsec=""; topic=""; slack=""; nums=""; ctok=""; worker_die "wrangler secret put failed"; }
     if [ -z "$slack" ]; then
       # a rotate keeps any SLACK_WEBHOOK_URL a previous run put, so Slack may still be on
       if [ "$mode" = rotate ]; then
-        say "Slack setting unchanged in the Worker; to remove it: npx wrangler secret delete SLACK_WEBHOOK_URL"
+        say "Slack setting unchanged in the Worker; to remove it: npx wrangler secret delete SLACK_WEBHOOK_URL$wdel"
       else
         say "Slack skipped: alerts go to the phone (ntfy) only"
       fi
@@ -299,7 +384,7 @@ step_worker() {
     if [ -z "$nums" ]; then
       # a rotate keeps any NTFY_CALL_* secrets a previous run put, so calls may still be on
       if [ "$mode" = rotate ]; then
-        say "Call settings unchanged in the Worker; to remove them: npx wrangler secret delete NTFY_CALL_NUMBERS / NTFY_CALL_TOKEN"
+        say "Call settings unchanged in the Worker; to remove them: npx wrangler secret delete NTFY_CALL_NUMBERS$wdel / NTFY_CALL_TOKEN$wdel"
       else
         say "Calls skipped: red alerts do not ring the phone"
       fi
@@ -328,11 +413,24 @@ step_worker() {
       printf 'DRILL_REPO=%q\n' "$drill"
       printf 'ALERT_TZ=%q\n' "$tz"
       [ -z "${ORG_WORKERS:-}" ] || printf 'ORG_WORKERS=%q\n' "$ORG_WORKERS" # orgs joined with --join-org
+      if [ "$ORG_MODE" = 1 ]; then
+        printf 'MODE=org\n'
+        printf 'ORG=%q\n' "$ORG_LOGIN"
+        printf 'WORKER_NAME=%q\n' "$WORKER_NAME"
+        printf 'WEB_FLOW=%q\n' "$wf"
+      fi
     } | atomic_write "$GITZILLA_CONFIG_DIR/config" ) || die "cannot write the config"
   chmod 600 "$GITZILLA_CONFIG_DIR/config"
   # shellcheck disable=SC1090
   . "$GITZILLA_CONFIG_DIR/config"
   say "worker deployed at $GITZILLA_URL; config written"
+  if [ "$ORG_MODE" = 1 ]; then
+    say ""
+    say "The $ORG_LOGIN Worker ($WORKER_NAME) is in org mode; your push-note key is its admin key."
+    say "Members join it from their personal gitzilla with:  ./install.sh --join-org $GITZILLA_URL"
+    say "Join it yourself the same way (personal install, no GITZILLA_PROFILE), then approve each member with:"
+    say "  GITZILLA_PROFILE=$GITZILLA_PROFILE bin/org approve <login> <fingerprint>"
+  fi
 }
 
 # queue_scan <after>: signed, paged read of /queue. Sets QMAX (highest seq seen, at least <after>) and QDRILL=1 if an
@@ -363,17 +461,40 @@ queue_scan() {
 
 step_github_app() {
   require_config
-  local rotated="$STATE/install-secrets-rotated"
+  local rotated="$STATE/install-secrets-rotated" apps="https://github.com/settings/apps"
+  # an org's app lives in the organization's settings
+  [ "$ORG_MODE" = 1 ] && apps="https://github.com/organizations/$OWNER/settings/apps"
   if [ -f "$rotated" ]; then
     cat <<EOF
 
 The Worker secrets were regenerated. The GitHub App already exists: do NOT create another one.
-  1. Edit the EXISTING app's webhook secret at https://github.com/settings/apps/$APP_NAME/advanced
+  1. Edit the EXISTING app's webhook secret at $apps/$APP_NAME/advanced
      (Webhook secret: paste the new WEBHOOK_SECRET printed in the worker step, then Save changes).
   2. Re-subscribe the phone to the new ntfy topic (printed in the worker step).
 EOF
-    "$OPEN" "https://github.com/settings/apps/$APP_NAME/advanced" >/dev/null 2>&1 || true
+    "$OPEN" "$apps/$APP_NAME/advanced" >/dev/null 2>&1 || true
     wait_enter "Press Enter once the webhook secret is updated and the phone is re-subscribed."
+  elif [ "$ORG_MODE" = 1 ]; then
+    cat <<EOF
+
+Create the organization's GitHub App at $apps/new (you must be an owner of $OWNER) with exactly these
+settings (if the app already exists, edit its webhook secret at $apps/$APP_NAME/advanced instead):
+  GitHub App name   : $APP_NAME
+  Homepage URL      : https://github.com/$OWNER
+  Webhook           : Active
+  Webhook URL       : $GITZILLA_URL/webhook
+  Webhook secret    : the WEBHOOK_SECRET printed in the worker step (shown only once; if you lost it, rerun
+                      --from-step worker and type rotate to regenerate the secrets)
+  Permissions       : Repository > Contents: Read-only ; Metadata: Read-only (nothing else)
+  Subscribe to events: Push (installation events are sent to every app; tick Installation and
+                      Installation repositories too if the form lists them)
+  Where installable : Only on this account (the $OWNER organization)
+After creating it: generate a private key (GitHub requires one before the app can be installed; the file
+lands in ~/Downloads and is deleted below), then install the app on the organization $OWNER with access to
+ALL repositories (Install App > $OWNER > All repositories).
+EOF
+    "$OPEN" "$apps/new" >/dev/null 2>&1 || true
+    wait_enter "Press Enter once the app is created, a key generated and the app installed on all of $OWNER's repos."
   else
     cat <<EOF
 
@@ -424,7 +545,12 @@ EOF
   local base="$QMAX"
   say "Verify: in your drill repo $OWNER/$DRILL_REPO make a commit and push it (any branch)."
   say "  (no clone yet?  gh repo clone $OWNER/$DRILL_REPO  or  git clone git@github.com:$OWNER/$DRILL_REPO.git)"
-  say "This push raises an orange (🟠) alert on your phone: expected, the hook that sends push notes is installed later."
+  if [ "$ORG_MODE" = 1 ]; then
+    say "This push raises an orange (🟠) alert on your phone: expected until you have joined the org from your personal"
+    say "gitzilla (./install.sh --join-org $GITZILLA_URL) and approved your own key with bin/org approve."
+  else
+    say "This push raises an orange (🟠) alert on your phone: expected, the hook that sends push notes is installed later."
+  fi
   say "Waiting up to ${POLL_TIMEOUT}s for the push to appear in the Worker queue..."
   local waited=0
   while :; do
@@ -743,6 +869,9 @@ step_self_test() {
   local log="$STATE/install-selftest.log" bad=0
   say ""
   say "Self-test (use your drill repo ${OWNER:+$OWNER/}${DRILL_REPO:-$DRILL_DEFAULT}):"
+  if [ "$ORG_MODE" = 1 ]; then
+    say "  (org: push from a Mac that joined the org with ./install.sh --join-org and whose key you approved, e.g. yours)"
+  fi
   say "  row 1: make a SIGNED commit and push it normally."
   if ask_yes "  Row 1 result: no alert appeared within 2 minutes?"; then
     echo "row1 pass" >> "$log"
@@ -781,7 +910,7 @@ step_self_test() {
 # /enroll (202 pending / 409 already a member); a new URL for a joined org asks first (default no).
 JOIN_USAGE="usage: install.sh --join-org <https-worker-url>"
 join_org() {
-  local url="${1%/}" login pubfile pub fp health mode org cur dir code err new pair
+  local url="${1%/}" login pubfile pub fp health mode org cur dir code err new pair rfp other="" pairs=()
   [ -z "$GITZILLA_PROFILE" ] || die "--join-org runs in the personal profile only (it records the org in the personal config, which the pre-push hook reads); run it without GITZILLA_PROFILE. Nothing changed."
   wd_valid_worker_url "$url" || die "--join-org needs the org Worker's https URL with no path (e.g. https://gitzilla-acme.example.workers.dev). Nothing changed."
   [ -n "${OWNER:-}" ] && [ -n "${GITZILLA_URL:-}" ] || die "no personal config ($GITZILLA_CONFIG_DIR/config): install gitzilla for your own account first (./install.sh), then join the org. Nothing changed."
@@ -801,10 +930,23 @@ join_org() {
   [[ $org =~ $WD_LOGIN_RE ]] || die "$url does not name its organization (/health has no valid org login; the admin must set ORG). Nothing changed."
   [ "$org" != "$login" ] || die "$url watches $org, which is your own account (the personal Worker covers it). Nothing changed."
 
+  # split without globbing: a hand-edited entry with * or ? must not expand to file names
+  IFS=$' \t\n' read -r -d '' -a pairs <<< "${ORG_WORKERS:-}" || true
   cur="$(wd_org_worker "$org")"
   if [ -n "$cur" ] && [ "$cur" != "$url" ]; then
     say "You already joined $org with the Worker $cur."
     ask_yes "Replace it with $url?" || die "kept $org=$cur. Nothing changed."
+  fi
+  if [ "$cur" != "$url" ]; then
+    # the same URL already recorded for another org: its /health now names $org (its ORG changed, or it is not who
+    # you think). Adding a second mapping would send $org's push notes there, so ask first.
+    for pair in ${pairs[@]+"${pairs[@]}"}; do
+      [ "${pair#*=}" = "$url" ] && [ "$(wd_lc "${pair%%=*}")" != "$org" ] && other="${other:+$other, }${pair%%=*}"
+    done
+    if [ -n "$other" ]; then
+      say "The Worker $url is already recorded for: $other. It now says it watches $org's repos."
+      ask_yes "This Worker watches $org's repos. Join $org with it as well?" || die "$org not joined. Nothing changed."
+    fi
   fi
 
   dir="$(mktemp -d)" || die "mktemp failed"
@@ -815,9 +957,18 @@ join_org() {
   code="$("$CURL" --max-time 15 -sS -o "$dir/resp" -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
           --data-binary @"$dir/body" "$url/enroll" </dev/null 2>/dev/null)"
   err="$(jq -r '.error // empty' "$dir/resp" 2>/dev/null | tr -cd 'A-Za-z0-9 ._:/()-' | cut -c1-200)"
+  rfp="$(jq -r '.fingerprint // empty' "$dir/resp" 2>/dev/null | tr -cd 'A-Za-z0-9+/:=' | cut -c1-100)"
   rm -rf "$dir"
   case "$code" in
-    202) say "enrollment requested: $login is pending approval by a $org gitzilla admin" ;;
+    202) say "enrollment requested: $login is pending approval by a $org gitzilla admin"
+         if [ "$rfp" != "$fp" ]; then
+           say ""
+           say "WARNING: FINGERPRINT MISMATCH. The $org Worker recorded ${rfp:-no fingerprint}, but your push-note key is $fp."
+           say "WARNING: something between this Mac and the Worker changed the request, or the Worker is not what it claims."
+           say "WARNING: do not ask your admin to approve anything; tell them about this mismatch instead."
+           say ""
+           wd_log "install: join $org: fingerprint mismatch (Worker: ${rfp:-none})"
+         fi ;;
     409) say "already a member of $org's gitzilla with this key (nothing to approve)" ;;
     ""|000) die "cannot reach $url/enroll. Nothing changed." ;;
     *) die "the $org Worker refused the enrollment: ${err:-HTTP $code} (HTTP $code). Nothing changed." ;;
@@ -825,7 +976,7 @@ join_org() {
 
   if [ "$cur" != "$url" ]; then
     new=""
-    for pair in ${ORG_WORKERS:-}; do [ "$(wd_lc "${pair%%=*}")" = "$org" ] || new="${new:+$new }$pair"; done
+    for pair in ${pairs[@]+"${pairs[@]}"}; do [ "$(wd_lc "${pair%%=*}")" = "$org" ] || new="${new:+$new }$pair"; done
     new="${new:+$new }$org=$url"
     ( umask 077
       { grep -v '^ORG_WORKERS=' "$GITZILLA_CONFIG_DIR/config"; printf 'ORG_WORKERS=%q\n' "$new"; } \
@@ -846,15 +997,17 @@ join_org() {
 from=""; join=""; join_set=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    --from-step) [ $# -ge 2 ] || { echo "usage: install.sh [--from-step <name>]" >&2; exit 2; }; from="$2"; shift ;;
+    --from-step) [ $# -ge 2 ] || { echo "$USAGE" >&2; exit 2; }; from="$2"; shift ;;
     --join-org) [ $# -ge 2 ] || { echo "$JOIN_USAGE" >&2; exit 2; }; join="$2"; join_set=1; shift ;;
-    -h|--help) echo "usage: install.sh [--from-step <name>]  (steps: $STEPS)"; echo "       install.sh --join-org <https-worker-url>"; exit 0 ;;
-    *) echo "usage: install.sh [--from-step <name>]" >&2; exit 2 ;;
+    --org) shift ;; # read (and checked) before bin/lib.sh, above
+    -h|--help) echo "$USAGE"; echo "steps: $STEPS"; exit 0 ;;
+    *) echo "$USAGE" >&2; exit 2 ;;
   esac
   shift
 done
 if [ "$join_set" = 1 ]; then
   [ -z "$from" ] || { echo "install: --join-org and --from-step do not combine" >&2; exit 2; }
+  [ "$org_set" = 0 ] || { echo "install: --join-org and --org do not combine (join from your personal gitzilla, without --org)" >&2; exit 2; }
   join_org "$join"
   exit 0
 fi

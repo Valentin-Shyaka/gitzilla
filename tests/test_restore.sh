@@ -595,6 +595,53 @@ rsn="$(jq -r '.skipped[0].reason' "$T/big.payload")"
 case "$rsn" in "could not send note ("*")") _ok ;; *) _bad "reason keeps fixed prefix: $rsn" ;; esac
 if printf '%s' "$rsn" | grep -Eq '^could not send note \([A-Za-z0-9 ._:/-]{0,100}\)$'; then _ok; else _bad "reason detail sanitised: $rsn"; fi
 
+# --- 10b. org profile (config MODE=org): restore checks the admin's push permission per repo before the note
+cat > "$T/gh.sh" <<STUB
+#!/bin/sh
+echo "\$*" >> "$T/gh.log"
+[ -f "$T/gh.fail" ] && exit 1
+cat "$T/gh.perm"
+STUB
+chmod +x "$T/gh.sh"; export GITZILLA_GH_CMD="$T/gh.sh"
+cp "$GITZILLA_CONFIG_DIR/config" "$T/config.personal"
+printf 'MODE=org\nORG=acme\n' >> "$GITZILLA_CONFIG_DIR/config"
+# push permission: restored as in personal mode; one gh call for the two refs of the repo
+setup; attack_main
+git -C "$WORK" checkout -q -b dev "$C1"; git -C "$WORK" push -q origin dev
+git -C "$WORK" checkout -q -B atk2 "$C1"; D2="$(commit g evil2)"; git -C "$WORK" push -q -f origin atk2:dev; git -C "$MIRROR" fetch -q --prune
+echo true > "$T/gh.perm"; rm -f "$T/gh.log"
+{ ts_event 1 alice/app refs/heads/main "$C1" "$C2"; ts_event 2 alice/app refs/heads/dev "$C1" "$D2"; } | write_inc
+run --yes "$INC"
+assert_eq 0 "$(cat "$T/rc")" "org push ok: exit 0"
+assert_eq 2 "$(result '.restored|length')" "org push ok: both refs restored"
+assert_eq "$C1" "$(head_of refs/heads/main)" "org push ok: main back"
+assert_eq "api repos/alice/app --jq .permissions.push // .permissions.admin" "$(cat "$T/gh.log")" "org push ok: one gh api call per repo, push or admin"
+# no push permission: skipped with the fixed reason, no note, nothing pushed, the report carries the reason
+for perm in false null nothing fail; do
+  setup; attack_main
+  rm -f "$T/gh.fail" "$T/gh.log"
+  case "$perm" in nothing) : > "$T/gh.perm" ;; fail) touch "$T/gh.fail" ;; *) echo "$perm" > "$T/gh.perm" ;; esac
+  ts_event 1 alice/app refs/heads/main "$C1" "$C2" | write_inc
+  run --yes "$INC"
+  assert_eq 0 "$(cat "$T/rc")" "org no push ($perm): exit 0"
+  assert_eq "no push permission" "$(result '.skipped[0].reason')" "org no push ($perm): skipped with 'no push permission'"
+  assert_eq 0 "$(result '.restored|length')" "org no push ($perm): nothing restored"
+  assert_eq "$C2" "$(head_of refs/heads/main)" "org no push ($perm): origin untouched"
+  assert_eq 0 "$(notes)" "org no push ($perm): no note sent"
+done
+assert_eq 1 "$(reports)" "org no push: the summary report is sent"
+grep -h '"path":"/report"' "$STUB_LOG" | head -1 | jq -r .body | jq -r .payload | base64 -d > "$T/rp.json"
+assert_eq "no push permission" "$(jq -r '.skipped[0].reason' "$T/rp.json")" "org no push: report reason is the fixed string"
+# personal profile: no permission check at all
+cp "$T/config.personal" "$GITZILLA_CONFIG_DIR/config"
+setup; attack_main
+echo false > "$T/gh.perm"; rm -f "$T/gh.log"
+ts_event 1 alice/app refs/heads/main "$C1" "$C2" | write_inc
+run --yes "$INC"
+assert_eq 1 "$(result '.restored|length')" "personal: restored without a permission check"
+assert_eq no "$([ -e "$T/gh.log" ] && echo yes || echo no)" "personal: gh never called"
+unset GITZILLA_GH_CMD
+
 # worker down entirely: exit 0
 setup; attack_main
 ts_event 1 alice/app refs/heads/main "$C1" "$C2" | write_inc

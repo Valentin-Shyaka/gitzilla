@@ -182,24 +182,34 @@ launchd jobs as `io.github.gitzilla.<name>.agent|reconcile` (the jobs carry `GIT
 writes the personal files or jobs. Without `GITZILLA_PROFILE` everything is as described above (the personal
 instance).
 
-What a profile does not do (yet):
+What a profile does not do:
 
-- **No Worker of its own yet.** The `worker` step refuses in a profile, before any `wrangler` call or prompt: it would
-  deploy over the personal Worker `gitzilla` and replace its secrets. Worker deploys for an org profile arrive with
-  `./install.sh --org`. Until then a plain `GITZILLA_PROFILE=<name> ./install.sh` stops at the `worker` step and
-  changes nothing remote.
+- **No Worker of a plain profile.** The `worker` step refuses in a profile made with `GITZILLA_PROFILE=<name>` alone,
+  before any `wrangler` call or prompt: it would deploy over the personal Worker `gitzilla` and replace its secrets.
+  A Worker of its own comes only with an org profile, made by `./install.sh --org <org-login>` (Organizations, below),
+  which deploys the separately named Worker `gitzilla-<org>`. A plain `GITZILLA_PROFILE=<name> ./install.sh` stops at
+  the `worker` step and changes nothing remote.
 - **No rotation.** The gh login and `~/.ssh/github-auth.pub` are shared by the whole Mac, so only the personal
   instance rotates them: a profile gets no rotate job, `first-rotation` is skipped, and `bin/rotate` refuses.
 - **No hook.** The global pre-push hook belongs to the personal instance: the `hook` step is skipped in a profile. Its
-  push note always uses the personal config (and its `ORG_WORKERS`, below), even if `GITZILLA_PROFILE` is exported in
-  the shell you push from.
+  push note always uses the personal config (and its `ORG_WORKERS`, below), even if `GITZILLA_PROFILE`,
+  `GITZILLA_CONFIG_DIR` or `GITZILLA_STATE_DIR` is exported in the shell you push from.
 
 ## Organizations
 
-An organization can run its own gitzilla Worker (org mode) that watches the org's repositories. Each developer keeps
-their personal gitzilla and *joins* the org's: from then on, a push to one of the org's repos sends its push note to
-the org's Worker, signed with the same `push-note` key. In org mode a note only silences pushes made by the member
-who signed it, and a key counts only after an admin approves it.
+An organization can run its own gitzilla Worker (org mode) that watches the org's repositories. An admin installs it
+(`./install.sh --org <org-login>`, below). Each developer keeps their personal gitzilla and *joins* the org's: from
+then on, a push to one of the org's repos sends its push note to the org's Worker, signed with the same `push-note`
+key. In org mode a note only silences pushes made by the member who signed it (GitHub's `sender` of the push), and a
+key counts only after an admin approves it. A pending enrollment never silences anything.
+
+In short:
+
+1. The admin runs `./install.sh --org acme` and gives the Worker URL it prints to the members.
+2. Each member (the admin too) runs `./install.sh --join-org <url>` from their personal install and tells the admin
+   the fingerprint it prints, in person or over a channel the admin trusts.
+3. The admin approves each one: `GITZILLA_PROFILE=org-acme bin/org approve <login> <fingerprint>`.
+4. Bots that push to the org's repos are allowed with `bin/org allow-bot`; web-UI commits follow the web-flow setting.
 
 ### Join an org (members)
 
@@ -249,7 +259,47 @@ GITZILLA_PROFILE=<org-profile> bin/org disallow-bot <login>
 
 ### Set up an org Worker (admins)
 
-<!-- Task 7: ./install.sh --org -->
+On the admin's Mac, next to (and after) the admin's personal gitzilla:
+
+```
+./install.sh --org <org-login>
+```
+
+This installs the profile `org-<org-login>` (the login lower-cased; at most 36 characters, so that the profile name
+fits in 40). Its steps are `prereqs note-key worker github-app repos mirrors launchd self-test`: no `hook`,
+`known-keys` or `first-rotation`, which belong to the personal install. It is resumable like the personal install:
+rerun the same command, add `--from-step <step>`, or use `GITZILLA_PROFILE=org-<org-login> ./install.sh` (a profile
+whose config says `MODE=org` stays in org mode). It never reads or writes the personal config, state or jobs.
+
+| Step | In the org profile |
+|---|---|
+| `note-key` | paste the **same** `push-note` public key as your personal install. It becomes the org Worker's only admin key (`ADMIN_PUBKEYS`). It must be a single `ecdsa-sha2-nistp256` line (Secretive's keys are): the Worker trusts no admin key at all when that value is malformed, so the `worker` step checks it and refuses before it deploys anything |
+| `worker` | deploys a separate Worker named `gitzilla-<org>` with `MODE=org`, `ORG=<org>`, `ADMIN_PUBKEYS=<your push-note key>` and `WEB_FLOW` (below). Every `wrangler deploy` and `wrangler secret` command carries `--name gitzilla-<org>`, so the personal Worker `gitzilla` is never touched. The org Worker gets its own webhook secret, ntfy topic, optional Slack URL and optional call numbers and token, asked and piped exactly as in the personal install. The config (`~/.config/gitzilla/org-<org>/config`) holds `OWNER=<org>`, `MODE=org`, `ORG`, `WORKER_NAME`, `WEB_FLOW` and the Worker URL. To remove an optional secret later: `npx wrangler secret delete <NAME> --name gitzilla-<org>` |
+| `github-app` | create the app `gitzilla-<org>` (cut to 34 characters) in the organization's settings (`https://github.com/organizations/<org>/settings/apps/new`, which needs an org owner), "Only on this account", then install it on the organization with access to **all** repositories. The drill repo is `<org>/gitzilla-drill`; when it does not exist, the installer creates it (private) only after you answer `y` |
+| `repos`, `mirrors` | every repository `gh repo list <org>` returns, mirrored in `~/.local/state/gitzilla/org-<org>/mirrors/` |
+| `launchd` | the profile's agent and reconcile jobs (no rotate job). The org's reconcile checks for missed webhooks only: an organization has no SSH keys, and your own account keys stay with your personal install |
+| `self-test` | the same rows, pushed from a Mac that joined the org (yours, once you have joined and approved yourself) |
+
+Then join your own org from your personal install (`./install.sh --join-org <url>`) and approve yourself with
+`bin/org approve`, like any member: the admin key signs admin commands, a member key signs push notes.
+
+What the admin's GitHub account needs:
+
+- Owner of the organization, to create the app and install it on the organization.
+- Push access to every repository restore should put back, and the right to bypass the branch protection rules or
+  rulesets of those branches (restore force-pushes with `--force-with-lease`). Before it sends a note or pushes, restore
+  in the org profile asks GitHub (`gh api repos/<repo>`, `.permissions.push` or `.permissions.admin`) whether your
+  account may push; when it may not, every ref of that repository is skipped with `no push permission`, and that
+  reason shows in the restore report.
+
+Bots and the web UI:
+
+- Bot pushes (`dependabot[bot]`, `github-actions[bot]`, ...) carry no note. `bin/org allow-bot <login>` silences the
+  non-forced pushes of that bot; a forced push is never silenced, by any rule.
+- Commits made in GitHub's web UI (merges, edits) carry no note either. `WEB_FLOW` decides what a push whose every
+  commit is by GitHub's `web-flow` gets: `orange` (the default) or `silent` (never for a forced push). Set it with
+  `GITZILLA_WEB_FLOW=silent ./install.sh --org <org> --from-step worker` (press Enter to keep the secrets); the value is
+  saved in the profile's config and kept on later redeploys.
 
 ## Alert channels
 
@@ -266,6 +316,11 @@ GITZILLA_PROFILE=<org-profile> bin/org disallow-bot <login>
   quietly, and push and Slack still arrive. A failing call never blocks the push or Slack alert.
 - `bin/notify-test` sends a signed test alert (`🔴 gitzilla: test alert`) to every channel and prints
   `test alert sent` or why it failed. Run it after changing a channel.
+- Push alerts list, per event, `Repo`, `Ref` (with `(forced)`), `Commits` (short SHAs), `Time` and `Flags`. An org
+  Worker adds `Pusher: <login>` (the GitHub account that pushed, as GitHub reports it; `Pusher: unknown` when GitHub
+  sent none). Org flags include `unenrolled` (the pusher is not a member), `no-note` (a member pushed without a note),
+  `bot` and `web-flow`. Every alert ends with the line
+  `If this wasn't you: revoke tokens at https://github.com/settings/applications`.
 
 ## Drill
 
@@ -282,6 +337,7 @@ rotation and restore dialogs. Each row says what must happen.
 | Red alert | Force-push, burst across repos, unsigned commit, polin-guard hit, or "gitzilla disarmed" (app uninstalled, suspended or repos removed) | Open the restore dialog (below), then revoke tokens at https://github.com/settings/applications and rotate keys |
 | Red alert + restore dialog for a GitHub web-UI merge or a bot commit | gitzilla only trusts commits signed by keys in your `allowed_signers`; GitHub's web-flow signature is not trusted, so these commits count as unsigned | If it was your own merge or your bot, choose **Ignore** |
 | "Restore N branches?" dialog | The agent found rewritten branches | **Restore** pushes the old tips back from the mirrors (`--force-with-lease`; branches that moved on are skipped and listed). **Details** shows them. **Ignore** does nothing. A typical incident costs up to 2 Touch IDs: one for the agent's deep check, and one for the restore push if you answer the dialog more than 2 minutes later |
+| Restore skipped "no push permission" (org profile) | Your account cannot push to that org repository, so restore sent no note and pushed nothing | Ask an org owner to restore it, or get push (and bypass) access and run `GITZILLA_PROFILE=org-<org> bin/restore --prompt <incident-file>` again |
 | Restore skipped "restore target not verified — review manually" | The commit a branch would go back to is not signed by your key (for example the attacker's first push was never deep-checked) | Find the last good commit yourself and use the manual restore below |
 | "N event(s) were lost while this Mac was offline" | The Mac was offline longer than the Worker keeps events (7 days) | Check the phone (and Slack) alerts for that period and run `bin/reconcile all` |
 | "Worker unreachable" notification | Health check failing for over an hour | Check the Cloudflare dashboard; `curl $GITZILLA_URL/health` |
@@ -299,7 +355,8 @@ bin/reconcile public | all | seed
 bin/agent poll | health
 ```
 
-Redeploying the Worker: only with `./install.sh --from-step worker` (press Enter to keep the
+Redeploying the Worker: only with `./install.sh --from-step worker` (an org's: `./install.sh --org <org> --from-step
+worker`) (press Enter to keep the
 secrets). Never run a plain `wrangler deploy`: `wrangler.toml` ships `NOTE_PUBKEY = ""`, so a plain deploy blanks the
 note key and every note and queue read then fails with 401.
 

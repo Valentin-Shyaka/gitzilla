@@ -432,6 +432,10 @@ assert_eq never "$(git -C "$M" config gc.pruneExpire)" "I3: agent clone sets gc.
 assert_eq always "$(git -C "$M" config core.logAllRefUpdates)" "I3: agent clone sets core.logAllRefUpdates always"
 git -C "$W" checkout -q -b noted "$BASE"; echo n > "$W/n.txt"; git -C "$W" add n.txt; GC -C "$W" commit -q -m noted
 NOTED="$(git -C "$W" rev-parse HEAD)"
+# bin/note reads only the personal layout (it ignores GITZILLA_CONFIG_DIR / GITZILLA_STATE_DIR): point it at the test dirs
+mkdir -p "$HOME/.config" "$HOME/.local/state"
+[ -e "$HOME/.config/gitzilla" ] || ln -s "$GITZILLA_CONFIG_DIR" "$HOME/.config/gitzilla"
+[ -e "$HOME/.local/state/gitzilla" ] || ln -s "$GITZILLA_STATE_DIR" "$HOME/.local/state/gitzilla"
 ( cd "$W" && printf 'refs/heads/noted %s refs/heads/noted %s\n' "$NOTED" "$Z" | bash "$WD_ROOT/bin/note" origin git@github.com:alice/app.git >/dev/null 2>&1 )
 assert_eq commit "$(git -C "$M" cat-file -t "$NOTED" 2>/dev/null)" "I3: note copied the commit into the mirror"
 # the copied objects are unreferenced; age them past git's default 2-week prune window, then gc as auto-gc would

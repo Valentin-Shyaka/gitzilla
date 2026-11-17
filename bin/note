@@ -3,9 +3,10 @@
 # sends a signed push note per line for the owner's repos (personal Worker) and for the repos of an org this Mac
 # joined (that org's Worker, ORG_WORKERS), and copies pushed objects into the local mirror if there is one.
 # Always exits 0 (fail-open).
-# The hook belongs to the personal profile: an exported GITZILLA_PROFILE (left over from running an org profile's
-# tools in this shell) must not send notes with an org profile's config, or stop the note with an invalid name.
-unset GITZILLA_PROFILE
+# The hook belongs to the personal profile: an exported GITZILLA_PROFILE, GITZILLA_CONFIG_DIR or GITZILLA_STATE_DIR
+# (left over from running an org profile's tools, or copied from its launchd job, in this shell) must not send notes
+# with an org profile's config, or stop the note with an invalid name. Personal routing only: ~/.config/gitzilla.
+unset GITZILLA_PROFILE GITZILLA_CONFIG_DIR GITZILLA_STATE_DIR
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$here/lib.sh"
 

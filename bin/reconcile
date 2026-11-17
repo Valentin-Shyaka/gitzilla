@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # reconcile public|all|seed — hourly backup check. Catches pushes whose webhooks never arrived (git ls-remote vs
-# the known heads) and new SSH authentication/signing keys on the GitHub account. Compatible with macOS bash 3.2.
+# the known heads) and new SSH authentication/signing keys on the GitHub account (not in an org profile, config
+# MODE=org: an organization has no account keys). Compatible with macOS bash 3.2.
 #
 #   public  hourly: public repos + account keys (no Touch ID)
 #   all     like public, plus private repos over one ssh session; runs only if reconcile-all-at is > 24 h old
@@ -71,6 +72,9 @@ keys_filter() { sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -E "$KE
 fetch_keys() {
   local owner
   KEYS_BOTH_OK=0; KEYS_ON=0
+  # an org profile (config MODE=org): OWNER is the organization, which has no account keys; the personal profile
+  # watches the admin's own keys. The missed-webhook check still runs.
+  if [ "${MODE:-}" = org ]; then wd_log "reconcile: org profile; account-key check skipped"; return 0; fi
   owner="$(printf '%s' "${OWNER:-}" | tr '[:upper:]' '[:lower:]')"
   [ -n "$owner" ] || { wd_log "reconcile: OWNER not set; key check skipped"; return 0; }
   if [ ! -f "$STATE/known-keys.txt" ]; then wd_log "reconcile: $STATE/known-keys.txt missing; key check skipped"; return 0; fi

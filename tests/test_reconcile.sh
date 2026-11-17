@@ -591,6 +591,25 @@ rm -f "$T/notify.fail" "$T/alert.status"
 stop_stub
 cp "$T/config.rec" "$GITZILLA_CONFIG_DIR/config"; unset GITZILLA_SIGN_KEY
 
+# --- 11e. org profile (config MODE=org): no account-key check (the org has no keys), the missed-webhook check stays
+cp "$GITZILLA_CONFIG_DIR/config" "$T/config.personal"
+printf 'GITZILLA_URL=http://127.0.0.1:1\nOWNER=acme\nMODE=org\nORG=acme\n' > "$GITZILLA_CONFIG_DIR/config"
+reset_state
+echo "acme/app public" > "$STATE/repos.txt"
+sethead acme/app refs/heads/main $S1
+setremote acme/app $S2 refs/heads/main
+cp "$T/k1.pub" "$STATE/known-keys.txt"; cp "$T/k2.pub" "$T/curl/auth.keys"; echo '[]' > "$T/curl/signing.json"
+runat $T0 public
+runat $((T0 + 700)) public
+assert_eq 0 "$(cat "$T/rc")" "org: exit 0"
+assert_eq 0 "$(nlines "$T/curl.log")" "org: no account-key fetch"
+assert_contains "$(cat "$STATE/log/gitzilla.log")" "org profile; account-key check skipped" "org: logs why"
+case "$(cat "$T/notify.log" 2>/dev/null)" in *"New key"*) _bad "org: no key alert" ;; *) _ok ;; esac
+assert_eq 1 "$(nincs)" "org: missed-webhook incident after two strikes"
+assert_eq "acme/app" "$(jq -r '.[0].repo' "$(lastinc)")" "org: incident for the org's repo"
+assert_contains "$(cat "$T/notify.log")" "possible missed webhook" "org: missed-webhook notification"
+cp "$T/config.personal" "$GITZILLA_CONFIG_DIR/config"
+
 # --- 12. usage
 run bogus
 assert_eq 2 "$(cat "$T/rc")" "usage: exit 2"

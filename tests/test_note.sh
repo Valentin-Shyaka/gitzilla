@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 . "$(dirname "$0")/helpers.sh"
+# bin/note ignores GITZILLA_CONFIG_DIR / GITZILLA_STATE_DIR (personal routing only), so the personal layout under the
+# test HOME points at the helpers' directories
+mkdir -p "$HOME/.config" "$HOME/.local/state"
+ln -s "$GITZILLA_CONFIG_DIR" "$HOME/.config/gitzilla"; ln -s "$GITZILLA_STATE_DIR" "$HOME/.local/state/gitzilla"
 make_test_key
 start_stub
 cat > "$GITZILLA_CONFIG_DIR/config" <<CFG
@@ -203,6 +207,16 @@ echo "refs/heads/main $SHA refs/heads/main $OLD" | ( cd "$R" && HOME="$PH" GITZI
 assert_eq "localhost:$STUB_PORT" "$(host_of 1)" "profile: org repo note routed by the personal ORG_WORKERS"
 assert_eq "" "$(cat "$T/err")" "profile: no warning"
 [ -e "$PH/.local/state/gitzilla/org-acme" ] && _bad "profile: the org profile's state was touched" || _ok
+# exported GITZILLA_CONFIG_DIR / GITZILLA_STATE_DIR (an org profile's, as its launchd job sets them) are ignored too
+OC="$T/orgdirs/config"; OS="$T/orgdirs/state"; mkdir -p "$OC" "$OS"
+printf 'OWNER=alice\nGITZILLA_URL=http://localhost:9\nNOTE_PUBKEY_FILE=%s\n' "$T/key.pub" > "$OC/config"
+: > "$STUB_LOG"
+echo "refs/heads/main $SHA refs/heads/main $OLD" | GITZILLA_CONFIG_DIR="$OC" GITZILLA_STATE_DIR="$OS" GITZILLA_PROFILE=org-acme run_note git@github.com:Alice/Repo.git
+assert_eq 0 "$(cat "$T/rc")" "profile dirs: exit 0"
+assert_eq 1 "$(lines)" "profile dirs: exported org dirs ignored, own repo note sent"
+assert_eq "127.0.0.1:$STUB_PORT" "$(host_of 1)" "profile dirs: note went to the personal Worker, not the org config's"
+assert_eq "" "$(cat "$T/err")" "profile dirs: no warning"
+assert_eq "" "$(ls -A "$OS")" "profile dirs: the exported state dir was not written"
 stop_stub
 
 # not configured

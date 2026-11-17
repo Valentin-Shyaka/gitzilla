@@ -46,9 +46,11 @@ verify() { # pubfile namespace -> 0 if $T/sig verifies over $T/payload
 # --- join: happy path
 write_personal
 health '{"ok":true,"mode":"org","org":"Acme"}'
-echo '{"ok":true,"fingerprint":"x"}' > "$STUB_ORG_DIR/enroll.body"
+OKBODY="{\"ok\":true,\"fingerprint\":\"$FP_M\"}" # the Worker's 202 names the fingerprint it recorded
+echo "$OKBODY" > "$STUB_ORG_DIR/enroll.body"
 join "$STUB_URL/"
 assert_eq 0 "$(rc)" "join: ok"
+case "$(out)" in *MISMATCH*) _bad "join: no fingerprint warning when the Worker's fingerprint matches" ;; *) _ok ;; esac
 assert_eq 1 "$(reqs /enroll)" "join: one /enroll"
 decode_last /enroll
 assert_eq '["login","nonce","pubkey","ts"]' "$(jq -c 'keys' "$T/payload")" "join: payload is exactly {login,pubkey,ts,nonce}"
@@ -73,13 +75,26 @@ assert_eq 2 "$(reqs /enroll)" "rerun: /enroll posted again"
 assert_contains "$(out)" "already a member" "rerun: says 409 = member"
 assert_contains "$(out)" "Tell your gitzilla admin this fingerprint: $FP_M" "rerun: prints the fingerprint"
 assert_eq "" "$(diff "$T/cfg.before" "$GITZILLA_CONFIG_DIR/config")" "rerun: config unchanged"
-rm -f "$STUB_ORG_DIR/enroll.status"; echo '{"ok":true}' > "$STUB_ORG_DIR/enroll.body"
+rm -f "$STUB_ORG_DIR/enroll.status"; echo "$OKBODY" > "$STUB_ORG_DIR/enroll.body"
+
+# --- the 202's fingerprint differs from the local one: loud warning (the enrollment itself still stands)
+echo '{"ok":true,"fingerprint":"SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}' > "$STUB_ORG_DIR/enroll.body"
+join "$STUB_URL"
+assert_eq 0 "$(rc)" "fp mismatch: exit 0"
+assert_contains "$(out)" "WARNING: FINGERPRINT MISMATCH. The acme Worker recorded SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA, but your push-note key is $FP_M." "fp mismatch: says both fingerprints"
+assert_contains "$(out)" "do not ask your admin to approve" "fp mismatch: says not to approve"
+echo '{"ok":true}' > "$STUB_ORG_DIR/enroll.body"
+join "$STUB_URL"
+assert_contains "$(out)" "WARNING: FINGERPRINT MISMATCH. The acme Worker recorded no fingerprint" "fp mismatch: a 202 without a fingerprint warns too"
+echo "$OKBODY" > "$STUB_ORG_DIR/enroll.body"
+assert_eq "" "$(diff "$T/cfg.before" "$GITZILLA_CONFIG_DIR/config")" "fp mismatch: config unchanged (same org and URL)"
 
 # --- a different URL for a joined org: asks, default no
+n0="$(reqs /enroll)"
 join "$LOCAL_URL"
 assert_eq 1 "$(rc)" "new url: refused by default"
 assert_contains "$(out)" "Replace it with $LOCAL_URL?" "new url: asks"
-assert_eq 2 "$(reqs /enroll)" "new url: no /enroll without a yes"
+assert_eq "$n0" "$(reqs /enroll)" "new url: no /enroll without a yes"
 assert_eq "" "$(diff "$T/cfg.before" "$GITZILLA_CONFIG_DIR/config")" "new url: config unchanged"
 join "$LOCAL_URL" 'y\n'
 assert_eq 0 "$(rc)" "new url: yes replaces"
@@ -91,6 +106,29 @@ join "$STUB_URL"
 assert_eq 0 "$(rc)" "second org: ok"
 assert_eq "acme=$LOCAL_URL beta-co=$STUB_URL" "$(cfg_orgs)" "second org: appended"
 assert_eq 1 "$(grep -c '^ORG_WORKERS=' "$GITZILLA_CONFIG_DIR/config" | tr -d ' ')" "second org: one ORG_WORKERS line"
+
+# --- a URL already recorded for another org now names a new org: asks before a second mapping, default no
+cp "$GITZILLA_CONFIG_DIR/config" "$T/cfg.before"; n0="$(reqs /enroll)"
+health '{"ok":true,"mode":"org","org":"delta"}'
+join "$STUB_URL"
+assert_eq 1 "$(rc)" "known url, new org: refused by default"
+assert_contains "$(out)" "already recorded for: beta-co. It now says it watches delta's repos." "known url, new org: names the org it is recorded for"
+assert_contains "$(out)" "This Worker watches delta's repos. Join delta with it as well? [y/N]" "known url, new org: asks"
+assert_eq "$n0" "$(reqs /enroll)" "known url, new org: no /enroll without a yes"
+assert_eq "" "$(diff "$T/cfg.before" "$GITZILLA_CONFIG_DIR/config")" "known url, new org: config unchanged"
+join "$STUB_URL" 'y\n'
+assert_eq 0 "$(rc)" "known url, new org: yes joins"
+assert_eq "acme=$LOCAL_URL beta-co=$STUB_URL delta=$STUB_URL" "$(cfg_orgs)" "known url, new org: second mapping added after the yes"
+cp "$T/cfg.before" "$GITZILLA_CONFIG_DIR/config"
+# a hand-edited entry with a glob character is kept literally (never expanded to file names in the cwd)
+sed -i.bak '/^ORG_WORKERS=/d' "$GITZILLA_CONFIG_DIR/config"
+printf 'ORG_WORKERS=%q\n' "acme=$LOCAL_URL x*" >> "$GITZILLA_CONFIG_DIR/config"
+mkdir -p "$T/globdir"; touch "$T/globdir/x1=y" "$T/globdir/x2=z"
+health '{"ok":true,"mode":"org","org":"beta-co"}'
+( cd "$T/globdir" && bash "$INSTALL" --join-org "$STUB_URL" >"$T/out" 2>&1 </dev/null ); echo $? > "$T/rc"
+assert_eq 0 "$(rc)" "glob entry: join ok"
+assert_eq "acme=$LOCAL_URL x* beta-co=$STUB_URL" "$(cfg_orgs)" "glob entry: kept literally"
+cp "$T/cfg.before" "$GITZILLA_CONFIG_DIR/config"
 
 # --- refusals: nothing posted, config unchanged
 cp "$GITZILLA_CONFIG_DIR/config" "$T/cfg.before"; n0="$(reqs /enroll)"
@@ -110,12 +148,14 @@ join "https://gz.example.com?x=1"; refused "url with a query" "https URL"
 GITZILLA_PROFILE=org-acme join "$STUB_URL"; refused "in a profile" "personal profile only"
 o="$(bash "$INSTALL" --join-org 2>&1)"; assert_eq 2 "$?" "no url: usage exit 2"; assert_contains "$o" "usage: install.sh --join-org" "no url: usage"
 o="$(bash "$INSTALL" --join-org "$STUB_URL" --from-step hook 2>&1 </dev/null)"; assert_eq 2 "$?" "with --from-step: exit 2"
+o="$(bash "$INSTALL" --join-org "$STUB_URL" --org acme 2>&1 </dev/null)"; assert_eq 2 "$?" "with --org: exit 2"
+assert_contains "$o" "--join-org and --org do not combine" "with --org: says why"
 echo 429 > "$STUB_ORG_DIR/enroll.status"; echo '{"error":"rate limited"}' > "$STUB_ORG_DIR/enroll.body"
-health '{"ok":true,"mode":"org","org":"gamma"}'; join "$STUB_URL"
+health '{"ok":true,"mode":"org","org":"gamma"}'; join "$STUB_URL" 'y\n' # the URL is beta-co's: confirm the second mapping
 assert_eq 1 "$(rc)" "enroll refused: exit 1"
 assert_contains "$(out)" "refused the enrollment: rate limited (HTTP 429)" "enroll refused: prints the Worker's error"
 assert_eq "" "$(diff "$T/cfg.before" "$GITZILLA_CONFIG_DIR/config")" "enroll refused: config unchanged"
-rm -f "$STUB_ORG_DIR/enroll.status"; echo '{"ok":true}' > "$STUB_ORG_DIR/enroll.body"
+rm -f "$STUB_ORG_DIR/enroll.status"; echo "$OKBODY" > "$STUB_ORG_DIR/enroll.body"
 n0="$(reqs /enroll)"
 ssh-keygen -q -t ed25519 -N '' -f "$T/ed" >/dev/null
 sed -i.bak "s#^NOTE_PUBKEY_FILE=.*#NOTE_PUBKEY_FILE=$T/ed.pub#" "$GITZILLA_CONFIG_DIR/config"; cp "$GITZILLA_CONFIG_DIR/config" "$T/cfg.before"

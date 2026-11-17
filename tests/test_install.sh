@@ -38,7 +38,10 @@ cat > "$S/npx" <<STUB
 echo "npx \$*" >> "$T/npx.log"
 case "\$2" in
   login) ;;
-  deploy) echo "Uploaded gitzilla"; echo "Deployed gitzilla triggers"; [ -f "$T/deploy.nourl" ] || echo "  https://gitzilla.alice.workers.dev" ;;
+  deploy) echo "Uploaded gitzilla"; echo "Deployed gitzilla triggers"
+          if [ ! -f "$T/deploy.nourl" ]; then
+            case " \$* " in *" --name gitzilla-acme "*) echo "  https://gitzilla-acme.alice.workers.dev" ;; *) echo "  https://gitzilla.alice.workers.dev" ;; esac
+          fi ;;
   secret) cat > "$T/secrets/\$4" ;;
   logout) [ -f "$T/tokens.stay" ] || rm -f "\$HOME/.wrangler/config/default.toml"; [ -f "$T/logout.fail" ] && exit 1 ;;
 esac
@@ -80,7 +83,7 @@ echo "\$url" >> "$T/curl.log"
 case "\$url" in
   https://github.com/alice.keys) f="$T/curl/auth.keys" ;;
   "https://api.github.com/users/alice/ssh_signing_keys?per_page=100") f="$T/curl/signing.json" ;;
-  https://gitzilla.alice.workers.dev/queue*)
+  https://gitzilla.alice.workers.dev/queue*|https://gitzilla-acme.alice.workers.dev/queue*)
     echo "\$auth" >> "$T/queue.auth"; echo "\$url" >> "$T/queue.urls"
     [ -f "$T/curl/queue.json" ] || { printf 404; exit 0; }
     n=\$(( \$(wc -l < "$T/queue.urls") )); a="\${url##*after=}"
@@ -165,6 +168,16 @@ assert_contains "$(out)" "prereqs note-key worker github-app hook repos mirrors 
 assert_eq "" "$(step_file)" "unknown step: no state written"
 run --from-step
 assert_eq 2 "$(rc)" "--from-step without a name: exit 2"
+run --bogus
+assert_eq 2 "$(rc)" "unknown argument: exit 2"
+assert_contains "$(out)" "install.sh --org <org-login> [--from-step <name>]" "usage names --org"
+assert_contains "$(out)" "install.sh --join-org <https-worker-url>" "usage names --join-org"
+run --from-step
+assert_contains "$(out)" "install.sh --org <org-login>" "--from-step usage names --org"
+assert_contains "$(out)" "install.sh --join-org" "--from-step usage names --join-org"
+run --help
+assert_eq 0 "$(rc)" "--help: exit 0"
+assert_contains "$(out)" "install.sh --org <org-login>" "--help names --org"
 
 # --- 2. prereqs
 reset
@@ -303,14 +316,14 @@ assert_eq 3 "$(nmatch 'secret put' "$T/npx.log")" "worker: fresh install puts th
 W1="$(cat "$T/secrets/WEBHOOK_SECRET")"; : > "$T/npx.log"; rm -rf "$T/secrets"; mkdir -p "$T/secrets"
 GITZILLA_INSTALL_STOP_AFTER=worker runin '\n' --from-step worker
 assert_eq 0 "$(rc)" "worker rerun (keep) ok"
-printf 'ORG_WORKERS=%q\n' "acme=https://gz.acme.workers.dev beta=https://gz.beta.workers.dev" >> "$GITZILLA_CONFIG_DIR/config"
-GITZILLA_INSTALL_STOP_AFTER=worker runin '\n' --from-step worker
-assert_eq "acme=https://gz.acme.workers.dev beta=https://gz.beta.workers.dev" "$( . "$GITZILLA_CONFIG_DIR/config"; printf '%s' "$ORG_WORKERS")" "worker rerun keeps the orgs joined with --join-org"
-assert_eq 1 "$(grep -c '^ORG_WORKERS=' "$GITZILLA_CONFIG_DIR/config" | tr -d ' ')" "worker rerun: one ORG_WORKERS line"
 assert_contains "$(out)" "KEEP" "worker rerun asks"
 assert_eq 0 "$(nmatch 'secret' "$T/npx.log")" "worker keep: no secret put"
 assert_contains "$(cat "$T/npx.log")" "deploy --var NOTE_PUBKEY:" "worker keep: still redeploys with NOTE_PUBKEY"
 assert_eq 0 "$([ -e "$STATE/install-secrets-rotated" ] && echo 1 || echo 0)" "worker keep: no rotated marker"
+printf 'ORG_WORKERS=%q\n' "acme=https://gz.acme.workers.dev beta=https://gz.beta.workers.dev" >> "$GITZILLA_CONFIG_DIR/config"
+GITZILLA_INSTALL_STOP_AFTER=worker runin '\n' --from-step worker
+assert_eq "acme=https://gz.acme.workers.dev beta=https://gz.beta.workers.dev" "$( . "$GITZILLA_CONFIG_DIR/config"; printf '%s' "$ORG_WORKERS")" "worker rerun keeps the orgs joined with --join-org"
+assert_eq 1 "$(grep -c '^ORG_WORKERS=' "$GITZILLA_CONFIG_DIR/config" | tr -d ' ')" "worker rerun: one ORG_WORKERS line"
 : > "$T/npx.log"
 GITZILLA_INSTALL_STOP_AFTER=worker runin 'r\n' --from-step worker
 assert_eq 0 "$(nmatch 'secret' "$T/npx.log")" "worker: typing just 'r' keeps"
@@ -1242,5 +1255,175 @@ GITZILLA_INSTALL_STOP_AFTER=repos run
 assert_eq 0 "$(rc)" "resume ok"
 assert_contains "$(out)" "== step: repos" "resume starts after the recorded step"
 case "$(out)" in *"== step: hook"*) _bad "resume must not rerun hook" ;; *) _ok ;; esac
+
+# --- 11. org install (--org): profile org-<login>, Worker gitzilla-<login>, org steps; the personal files untouched.
+# Runs use the real profile layout under the test HOME (no GITZILLA_CONFIG_DIR / GITZILLA_STATE_DIR).
+OC="$HOME/.config/gitzilla/org-acme"; OS="$HOME/.local/state/gitzilla/org-acme"
+PCF="$HOME/.config/gitzilla"; PSD="$HOME/.local/state/gitzilla"
+orun() { env -u GITZILLA_CONFIG_DIR -u GITZILLA_STATE_DIR bash "$INSTALL" "$@" >"$T/out" 2>&1 </dev/null; echo $? > "$T/rc"; }
+oruni() { local in="$1"; shift; printf "$in" | env -u GITZILLA_CONFIG_DIR -u GITZILLA_STATE_DIR bash "$INSTALL" "$@" >"$T/out" 2>&1; echo $? > "$T/rc"; }
+# personal_snap: every personal file (not the org profile's), with contents
+personal_snap() {
+  ( cd "$HOME" && find .config/gitzilla .local/state/gitzilla Library/LaunchAgents -path '*/org-acme' -prune -o -type f -print 2>/dev/null \
+      | grep -v 'io.github.gitzilla.org-acme' | sort | while read -r f; do printf '%s %s\n' "$f" "$(md5 -q "$f")"; done )
+}
+org_reset() {
+  reset
+  mkdir -p "$PCF" "$PSD/log" "$OC" "$HOME/Library/LaunchAgents"
+  printf 'OWNER=Alice\nGITZILLA_URL=https://gitzilla.alice.workers.dev\nNOTE_PUBKEY_FILE=%s\n' "$PCF/push-note.pub" > "$PCF/config"
+  echo personal-pub > "$PCF/push-note.pub"; echo self-test > "$PSD/install-step"; echo 7 > "$PSD/queue-cursor"
+  echo personal > "$HOME/Library/LaunchAgents/io.github.gitzilla.agent.plist"
+  personal_snap > "$T/personal.before"
+}
+personal_same() { personal_snap > "$T/personal.after"; assert_eq "$(cat "$T/personal.before")" "$(cat "$T/personal.after")" "$1: personal config, state and jobs untouched"; }
+TOKEN="tk_$(printf 'a%.0s' $(seq 29))"
+
+# argument checks: nothing is written
+org_reset
+orun --org
+assert_eq 2 "$(rc)" "--org without a login: exit 2"
+assert_contains "$(out)" "install.sh --org <org-login>" "--org without a login: usage"
+orun --org -acme
+assert_eq 2 "$(rc)" "--org with a login starting with a hyphen: exit 2"
+orun --org "acme corp"
+assert_eq 2 "$(rc)" "--org with a space: exit 2"
+orun --org "$(printf 'a%.0s' $(seq 37))"
+assert_eq 2 "$(rc)" "--org with a 37-char login: exit 2 (profile name over 40)"
+assert_contains "$(out)" "may have at most 40 characters" "--org too long: says why"
+GITZILLA_PROFILE=other orun --org acme
+assert_eq 2 "$(rc)" "--org with another GITZILLA_PROFILE: exit 2"
+orun --org Acme --from-step hook
+assert_eq 2 "$(rc)" "--org: hook is not an org step"
+assert_contains "$(out)" "Valid steps: prereqs note-key worker github-app repos mirrors launchd self-test" "--org: the org steps (no hook, known-keys, first-rotation)"
+assert_eq no "$([ -e "$OS" ] || [ -e "$PSD/org-acme" ] && echo yes || echo no)" "--org refusals: no profile state created"
+personal_same "--org refusals"
+
+# worker step: --name gitzilla-acme on every deploy and secret call, MODE/ORG/ADMIN_PUBKEYS vars, org config
+org_reset
+mkkey adminkey ecdsa
+sed 's/ [^ ]*$/ admin key, with a comma/' "$T/keys/adminkey.pub" > "$OC/push-note.pub" # a comment must never reach ADMIN_PUBKEYS
+ADMIN="$(cut -d' ' -f1,2 "$T/keys/adminkey.pub")"
+: > "$T/npx.log"; rm -f "$T/gh.log"
+GITZILLA_INSTALL_STOP_AFTER=worker oruni "$SLACK\n+14155550100,+442071838750\n$TOKEN\n" --org Acme --from-step worker
+assert_eq 0 "$(rc)" "org worker: ok ($(tail -n1 "$T/out"))"
+assert_eq worker "$(cat "$OS/install-step" 2>/dev/null)" "org worker: progress in the org profile's state"
+assert_eq 1 "$(grep -c ' deploy ' "$T/npx.log" | tr -d ' ')" "org worker: one deploy"
+assert_contains "$(grep ' deploy ' "$T/npx.log")" "deploy --name gitzilla-acme --var ALERT_TZ:Europe/Paris --var MODE:org --var ORG:acme --var WEB_FLOW:orange --var ADMIN_PUBKEYS:$ADMIN" "org worker: deploy vars (org lower-cased, web-flow orange by default, admin key without its comment)"
+case "$(grep ' deploy ' "$T/npx.log")" in *"ADMIN_PUBKEYS:$ADMIN "*|*comma*) _bad "org worker: ADMIN_PUBKEYS carries only the key" ;; *) _ok ;; esac
+assert_eq 5 "$(grep -c ' secret put ' "$T/npx.log" | tr -d ' ')" "org worker: five secrets put"
+for s in WEBHOOK_SECRET NTFY_TOPIC SLACK_WEBHOOK_URL NTFY_CALL_NUMBERS NTFY_CALL_TOKEN; do
+  assert_eq 1 "$(grep -c "secret put $s --name gitzilla-acme$" "$T/npx.log" | tr -d ' ')" "org worker: $s put into gitzilla-acme"
+done
+assert_eq "$SLACK" "$(cat "$T/secrets/SLACK_WEBHOOK_URL")" "org worker: Slack URL on stdin"
+assert_eq "+14155550100,+442071838750" "$(cat "$T/secrets/NTFY_CALL_NUMBERS")" "org worker: call numbers on stdin"
+assert_eq "$TOKEN" "$(cat "$T/secrets/NTFY_CALL_TOKEN")" "org worker: call token on stdin"
+OWSEC="$(cat "$T/secrets/WEBHOOK_SECRET")"; ONTFY="$(cat "$T/secrets/NTFY_TOPIC")"
+hit="$(grep -lE "$OWSEC|$ONTFY|SLACKSECRETVALUE|4155550100|$TOKEN" "$T/npx.log" "$T/npm.log" 2>/dev/null)"
+assert_eq "" "$hit" "org worker: no secret in any wrangler argv"
+hit="$(grep -rlE "$OWSEC|$ONTFY|SLACKSECRETVALUE|4155550100|$TOKEN" "$HOME" 2>/dev/null)"
+assert_eq "" "$hit" "org worker: no secret in any file under HOME"
+assert_eq "" "$(grep -E ' (deploy|secret) ' "$T/npx.log" | grep -v -- '--name gitzilla-acme' )" "org worker: no deploy or secret call without --name gitzilla-acme"
+assert_eq 0 "$(nmatch 'api user' "$T/gh.log")" "org worker: OWNER is the org, not the gh login"
+oc="$(cat "$OC/config")"
+for l in "OWNER=acme" "GITZILLA_URL=https://gitzilla-acme.alice.workers.dev" "NOTE_PUBKEY_FILE=$OC/push-note.pub" "APP_NAME=gitzilla-acme" \
+         "MODE=org" "ORG=acme" "WORKER_NAME=gitzilla-acme" "DRILL_REPO=gitzilla-drill" "WEB_FLOW=orange"; do
+  assert_contains "$oc" "$l" "org worker: config $l"
+done
+assert_eq 600 "$(stat -f %Lp "$OC/config")" "org worker: config mode 600"
+assert_contains "$(out)" "./install.sh --join-org https://gitzilla-acme.alice.workers.dev" "org worker: tells members (and the admin) how to join"
+personal_same "org worker"
+# rerun by profile name (config MODE=org): keep -> redeploy with --name; rotate without Slack -> --name hints
+: > "$T/npx.log"
+GITZILLA_PROFILE=org-acme GITZILLA_INSTALL_STOP_AFTER=worker oruni '\n' --from-step worker
+assert_eq 0 "$(rc)" "org worker rerun by profile name: ok"
+assert_contains "$(out)" "KEEP" "org worker rerun: asks keep/rotate"
+assert_eq 0 "$(grep -c ' secret ' "$T/npx.log" | tr -d ' ')" "org worker keep: no secret put"
+assert_contains "$(cat "$T/npx.log")" "deploy --name gitzilla-acme --var ALERT_TZ:Europe/Paris --var MODE:org" "org worker keep: redeploys the org Worker"
+GITZILLA_WEB_FLOW=bogus GITZILLA_PROFILE=org-acme GITZILLA_INSTALL_STOP_AFTER=worker oruni '\n' --from-step worker
+assert_eq 1 "$(rc)" "org worker: an invalid GITZILLA_WEB_FLOW is refused"
+assert_contains "$(out)" "GITZILLA_WEB_FLOW must be orange or silent" "org worker: says the web-flow values"
+: > "$T/npx.log"
+GITZILLA_WEB_FLOW=silent GITZILLA_PROFILE=org-acme GITZILLA_INSTALL_STOP_AFTER=worker oruni '\n' --from-step worker
+assert_contains "$(cat "$T/npx.log")" "--var WEB_FLOW:silent --var ADMIN_PUBKEYS:" "org worker: GITZILLA_WEB_FLOW=silent deployed"
+assert_contains "$(cat "$OC/config")" "WEB_FLOW=silent" "org worker: web-flow setting saved"
+: > "$T/npx.log"
+GITZILLA_PROFILE=org-acme GITZILLA_INSTALL_STOP_AFTER=worker oruni '\n' --from-step worker
+assert_contains "$(cat "$T/npx.log")" "--var WEB_FLOW:silent --var ADMIN_PUBKEYS:" "org worker: a rerun keeps the saved web-flow setting"
+GITZILLA_PROFILE=org-acme GITZILLA_INSTALL_STOP_AFTER=worker oruni 'rotate\n\n\n' --from-step worker
+assert_eq 0 "$(rc)" "org worker rotate: ok"
+assert_contains "$(out)" "npx wrangler secret delete SLACK_WEBHOOK_URL --name gitzilla-acme" "org worker rotate: Slack removal hint names the org Worker"
+assert_contains "$(out)" "secret delete NTFY_CALL_NUMBERS --name gitzilla-acme / NTFY_CALL_TOKEN --name gitzilla-acme" "org worker rotate: call removal hint names the org Worker"
+assert_eq 2 "$(grep -c ' secret put ' "$T/npx.log" | tr -d ' ')" "org worker rotate: webhook secret and topic put"
+assert_eq "" "$(grep -E ' (deploy|secret) ' "$T/npx.log" | grep -v -- '--name gitzilla-acme')" "org worker reruns: every deploy and secret call has --name gitzilla-acme"
+assert_eq 1 "$(grep -c '^MODE=org$' "$OC/config" | tr -d ' ')" "org worker reruns: one MODE line"
+personal_same "org worker reruns"
+# the admin key must be one ecdsa-sha2-nistp256 line: otherwise nothing is deployed (the Worker would trust no admin)
+for bad in ed25519 twolines garbage; do
+  org_reset; : > "$T/npx.log"; rm -f "$T/npm.log"
+  case "$bad" in
+    ed25519) mkkey edkey ed25519; cp "$T/keys/edkey.pub" "$OC/push-note.pub" ;;
+    twolines) mkkey adminkey ecdsa; cat "$T/keys/adminkey.pub" "$T/keys/adminkey.pub" > "$OC/push-note.pub" ;;
+    garbage) printf 'ecdsa-sha2-nistp256 AAAAnotakey=\n' > "$OC/push-note.pub" ;;
+  esac
+  GITZILLA_INSTALL_STOP_AFTER=worker oruni "$SLACK\n" --org acme --from-step worker
+  assert_eq 1 "$(rc)" "org worker, $bad admin key: refused"
+  assert_contains "$(out)" "must be exactly one ecdsa-sha2-nistp256 (Secretive) public key line" "org worker, $bad admin key: says why"
+  assert_eq "" "$(cat "$T/npx.log")" "org worker, $bad admin key: no wrangler call"
+  assert_eq no "$([ -e "$OC/config" ] && echo yes || echo no)" "org worker, $bad admin key: no config"
+  case "$(out)" in *WEBHOOK_SECRET*|*"input hidden"*) _bad "org worker, $bad admin key: refused before any secret is shown" ;; *) _ok ;; esac
+done
+# a plain profile (no --org, no MODE=org config) still refuses at the worker step
+org_reset; mkkey adminkey ecdsa; mkdir -p "$PCF/plain"; cp "$T/keys/adminkey.pub" "$PCF/plain/push-note.pub"; : > "$T/npx.log"
+GITZILLA_PROFILE=plain GITZILLA_INSTALL_STOP_AFTER=worker orun --from-step worker
+assert_eq 1 "$(rc)" "plain profile: worker step refuses"
+assert_contains "$(out)" "the worker step is not available in a profile yet" "plain profile: says why"
+assert_eq "" "$(cat "$T/npx.log")" "plain profile: no wrangler call"
+
+# github-app: the org's app settings, the drill repo in the org only after a yes
+org_reset; mk_sign_key; mkdir -p "$HOME/Downloads"
+printf 'OWNER=acme\nGITZILLA_URL=https://gitzilla-acme.alice.workers.dev\nNOTE_PUBKEY_FILE=%s\nAPP_NAME=gitzilla-acme\nDRILL_REPO=gitzilla-drill\nMODE=org\nORG=acme\nWORKER_NAME=gitzilla-acme\n' "$OC/push-note.pub" > "$OC/config"
+touch "$T/gh.norepo"; rm -f "$T/gh.log" "$T/open.log"
+GITZILLA_INSTALL_STOP_AFTER=github-app oruni '\n\n' --org acme --from-step github-app
+assert_eq 1 "$(rc)" "org github-app: no drill repo and no yes -> stops"
+assert_contains "$(out)" "Create it now as a private repo (gh repo create acme/gitzilla-drill --private --add-readme)? [y/N]" "org github-app: asks before creating the drill repo in the org"
+assert_eq 0 "$(grep -c 'repo create' "$T/gh.log" | tr -d ' ')" "org github-app: no repo created without a yes"
+assert_contains "$(out)" "https://github.com/organizations/acme/settings/apps/new" "org github-app: the org's new-app page"
+assert_contains "$(cat "$T/open.log")" "https://github.com/organizations/acme/settings/apps/new" "org github-app: opens the org's new-app page"
+assert_contains "$(out)" "GitHub App name   : gitzilla-acme" "org github-app: app name gitzilla-<org>"
+assert_contains "$(out)" "Homepage URL      : https://github.com/acme" "org github-app: homepage is the org"
+assert_contains "$(out)" "Webhook URL       : https://gitzilla-acme.alice.workers.dev/webhook" "org github-app: the org Worker's webhook"
+assert_contains "$(out)" "Only on this account (the acme organization)" "org github-app: installable on the org only"
+assert_contains "$(out)" "install the app on the organization acme" "org github-app: install on the organization"
+assert_contains "$(out)" "All repositories" "org github-app: all repos"
+echo '[{"seq":3,"repo":"acme/gitzilla-drill","ref":"refs/heads/main"}]' > "$T/curl/late.json"; echo 1 > "$T/curl/late.after"; echo '[]' > "$T/curl/queue.json"
+rm -f "$T/queue.urls"
+GITZILLA_INSTALL_STOP_AFTER=github-app oruni '\ny\n' --org acme --from-step github-app
+assert_eq 0 "$(rc)" "org github-app: ok after the yes ($(tail -n1 "$T/out"))"
+assert_contains "$(cat "$T/gh.log")" "repo create acme/gitzilla-drill --private --add-readme" "org github-app: drill repo created in the org"
+assert_contains "$(out)" "./install.sh --join-org https://gitzilla-acme.alice.workers.dev" "org github-app: the orange alert is expected until the admin joined"
+assert_eq 3 "$(cat "$OS/queue-cursor" 2>/dev/null)" "org github-app: cursor in the org profile"
+assert_contains "$(cat "$T/queue.urls")" "https://gitzilla-acme.alice.workers.dev/queue?after=" "org github-app: reads the org Worker's queue"
+personal_same "org github-app"
+
+# repos, mirrors, launchd, self-test: the org's repos; no hook, known-keys or first-rotation
+org_reset
+printf 'OWNER=acme\nGITZILLA_URL=https://gitzilla-acme.alice.workers.dev\nNOTE_PUBKEY_FILE=%s\nAPP_NAME=gitzilla-acme\nDRILL_REPO=gitzilla-drill\nMODE=org\nORG=acme\nWORKER_NAME=gitzilla-acme\n' "$OC/push-note.pub" > "$OC/config"
+echo '[{"nameWithOwner":"Acme/App","visibility":"PRIVATE"},{"nameWithOwner":"acme/site","visibility":"PUBLIC"},{"nameWithOwner":"alice/x","visibility":"PUBLIC"}]' > "$T/gh.repos"
+mkbare acme/app; mkbare acme/site
+rm -f "$T/gh.log" "$T/launchctl.log" "$T/rotate.log"
+oruni 'y\ny\nn\n' --org acme --from-step repos
+assert_eq 0 "$(rc)" "org chain from repos: ok ($(tail -n1 "$T/out"))"
+assert_contains "$(cat "$T/gh.log")" "repo list acme --limit 1000 --json nameWithOwner,visibility" "org repos: gh repo list <org>"
+assert_eq "acme/app private
+acme/site public" "$(cat "$OS/repos.txt")" "org repos: the org's repos only, in the profile"
+[ -d "$OS/mirrors/acme__app.git" ] && [ -d "$OS/mirrors/acme__site.git" ] && _ok || _bad "org mirrors: in the profile"
+assert_eq "== step: repos|== step: mirrors|== step: launchd|== step: self-test" "$(grep '^== step:' "$T/out" | paste -sd'|' -)" "org chain: repos mirrors launchd self-test, nothing else"
+assert_eq self-test "$(cat "$OS/install-step")" "org chain: last step recorded in the profile"
+assert_contains "$(out)" "push from a Mac that joined the org with ./install.sh --join-org" "org self-test: pushes come from a joined Mac"
+assert_eq no "$([ -e "$T/rotate.log" ] && echo yes || echo no)" "org chain: no rotation"
+assert_eq "" "$(grep -E '^(bootout|bootstrap)' "$T/launchctl.log" | grep -v 'io\.github\.gitzilla\.org-acme\.' )" "org launchd: only org-acme labels"
+assert_eq 2 "$(grep -c '^bootstrap ' "$T/launchctl.log" | tr -d ' ')" "org launchd: agent and reconcile"
+assert_eq "" "$(git config --global --get core.hooksPath)" "org chain: no hook"
+personal_same "org chain"
 
 finish
