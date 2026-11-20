@@ -26,6 +26,7 @@ case "\$1 \$2" in
   "api user") if [ -f "$T/gh.login" ]; then cat "$T/gh.login"; else echo Alice; fi ;;
   "repo list") cat "$T/gh.repos" ;;
   "repo view") [ -f "$T/gh.norepo" ] && exit 1; exit 0 ;;
+  "api repos/"*) if [ -f "$T/gh.perm" ]; then cat "$T/gh.perm"; else echo true; fi ;;
   "repo create") [ -f "$T/gh.createfail" ] && exit 1; rm -f "$T/gh.norepo"; exit 0 ;;
 esac
 STUB
@@ -1322,7 +1323,7 @@ hit="$(grep -lE "$OWSEC|$ONTFY|SLACKSECRETVALUE|4155550100|$TOKEN" "$T/npx.log" 
 assert_eq "" "$hit" "org worker: no secret in any wrangler argv"
 hit="$(grep -rlE "$OWSEC|$ONTFY|SLACKSECRETVALUE|4155550100|$TOKEN" "$HOME" 2>/dev/null)"
 assert_eq "" "$hit" "org worker: no secret in any file under HOME"
-assert_eq "" "$(grep -E ' (deploy|secret) ' "$T/npx.log" | grep -v -- '--name gitzilla-acme' )" "org worker: no deploy or secret call without --name gitzilla-acme"
+assert_eq "" "$(grep -E ' (deploy|secret) ' "$T/npx.log" | grep -Ev -- '--name gitzilla-acme( |$)' )" "org worker: no deploy or secret call without --name gitzilla-acme"
 assert_eq 0 "$(nmatch 'api user' "$T/gh.log")" "org worker: OWNER is the org, not the gh login"
 oc="$(cat "$OC/config")"
 for l in "OWNER=acme" "GITZILLA_URL=https://gitzilla-acme.alice.workers.dev" "NOTE_PUBKEY_FILE=$OC/push-note.pub" "APP_NAME=gitzilla-acme" \
@@ -1332,6 +1333,20 @@ done
 assert_eq 600 "$(stat -f %Lp "$OC/config")" "org worker: config mode 600"
 assert_contains "$(out)" "./install.sh --join-org https://gitzilla-acme.alice.workers.dev" "org worker: tells members (and the admin) how to join"
 personal_same "org worker"
+assert_contains "$(out)" "No $OC/allowed_signers yet" "org worker: says the org signers file is missing"
+assert_contains "$(out)" '<login> namespaces="git" <key type> <base64 key>' "org worker: says how to populate it"
+# the --name check itself: a lookalike Worker name does not pass it
+printf 'npx wrangler secret put X --name gitzilla-acme-evil\nnpx wrangler deploy --name gitzilla-acmex\n' > "$T/fake-npx.log"
+assert_eq 2 "$(grep -E ' (deploy|secret) ' "$T/fake-npx.log" | grep -Ev -- '--name gitzilla-acme( |$)' | grep -c .)" "the --name check rejects lookalike Worker names"
+# exported GITZILLA_CONFIG_DIR / GITZILLA_STATE_DIR (here: the personal ones) are ignored by --org
+: > "$T/npx.log"
+GITZILLA_CONFIG_DIR="$PCF" GITZILLA_STATE_DIR="$PSD" GITZILLA_INSTALL_STOP_AFTER=worker \
+  bash "$INSTALL" --org acme --from-step worker < /dev/null >"$T/out" 2>&1; echo $? > "$T/rc"
+assert_eq 0 "$(rc)" "org worker with exported personal dirs: ok (keep)"
+assert_contains "$(out)" "--org ignores the exported GITZILLA_CONFIG_DIR / GITZILLA_STATE_DIR" "org worker with exported dirs: says they were ignored"
+assert_contains "$(out)" "KEEP" "org worker with exported dirs: found the org profile's config (keep/rotate)"
+assert_contains "$(cat "$OC/config")" "MODE=org" "org worker with exported dirs: wrote the org profile's config"
+personal_same "org worker with exported personal dirs"
 # rerun by profile name (config MODE=org): keep -> redeploy with --name; rotate without Slack -> --name hints
 : > "$T/npx.log"
 GITZILLA_PROFILE=org-acme GITZILLA_INSTALL_STOP_AFTER=worker oruni '\n' --from-step worker
@@ -1354,7 +1369,7 @@ assert_eq 0 "$(rc)" "org worker rotate: ok"
 assert_contains "$(out)" "npx wrangler secret delete SLACK_WEBHOOK_URL --name gitzilla-acme" "org worker rotate: Slack removal hint names the org Worker"
 assert_contains "$(out)" "secret delete NTFY_CALL_NUMBERS --name gitzilla-acme / NTFY_CALL_TOKEN --name gitzilla-acme" "org worker rotate: call removal hint names the org Worker"
 assert_eq 2 "$(grep -c ' secret put ' "$T/npx.log" | tr -d ' ')" "org worker rotate: webhook secret and topic put"
-assert_eq "" "$(grep -E ' (deploy|secret) ' "$T/npx.log" | grep -v -- '--name gitzilla-acme')" "org worker reruns: every deploy and secret call has --name gitzilla-acme"
+assert_eq "" "$(grep -E ' (deploy|secret) ' "$T/npx.log" | grep -Ev -- '--name gitzilla-acme( |$)')" "org worker reruns: every deploy and secret call has --name gitzilla-acme"
 assert_eq 1 "$(grep -c '^MODE=org$' "$OC/config" | tr -d ' ')" "org worker reruns: one MODE line"
 personal_same "org worker reruns"
 # the admin key must be one ecdsa-sha2-nistp256 line: otherwise nothing is deployed (the Worker would trust no admin)
@@ -1414,6 +1429,8 @@ rm -f "$T/gh.log" "$T/launchctl.log" "$T/rotate.log"
 oruni 'y\ny\nn\n' --org acme --from-step repos
 assert_eq 0 "$(rc)" "org chain from repos: ok ($(tail -n1 "$T/out"))"
 assert_contains "$(cat "$T/gh.log")" "repo list acme --limit 1000 --json nameWithOwner,visibility" "org repos: gh repo list <org>"
+assert_contains "$(cat "$T/gh.log")" "api repos/acme/app --jq .permissions.push // .permissions.admin" "org repos: push access sampled"
+assert_contains "$(out)" "push access checked on a sample of repos: ok" "org repos: sample ok"
 assert_eq "acme/app private
 acme/site public" "$(cat "$OS/repos.txt")" "org repos: the org's repos only, in the profile"
 [ -d "$OS/mirrors/acme__app.git" ] && [ -d "$OS/mirrors/acme__site.git" ] && _ok || _bad "org mirrors: in the profile"
@@ -1425,5 +1442,11 @@ assert_eq "" "$(grep -E '^(bootout|bootstrap)' "$T/launchctl.log" | grep -v 'io\
 assert_eq 2 "$(grep -c '^bootstrap ' "$T/launchctl.log" | tr -d ' ')" "org launchd: agent and reconcile"
 assert_eq "" "$(git config --global --get core.hooksPath)" "org chain: no hook"
 personal_same "org chain"
+echo false > "$T/gh.perm"
+GITZILLA_INSTALL_STOP_AFTER=repos oruni '' --org acme --from-step repos
+assert_eq 0 "$(rc)" "org repos without push: still ok (a warning)"
+assert_contains "$(out)" "WARNING: your account cannot push to: acme/app acme/site" "org repos without push: lists the repos"
+assert_contains "$(out)" '"no push permission"' "org repos without push: says what restore will do"
+rm -f "$T/gh.perm"
 
 finish

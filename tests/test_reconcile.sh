@@ -609,6 +609,11 @@ assert_eq 1 "$(nincs)" "org: missed-webhook incident after two strikes"
 assert_eq "acme/app" "$(jq -r '.[0].repo' "$(lastinc)")" "org: incident for the org's repo"
 assert_contains "$(cat "$T/notify.log")" "possible missed webhook" "org: missed-webhook notification"
 cp "$T/config.personal" "$GITZILLA_CONFIG_DIR/config"
+# MODE=org exported, personal config: the account-key check still runs (lib.sh takes MODE from the config only)
+reset_state
+: > "$STATE/repos.txt"; cp "$T/k1.pub" "$STATE/known-keys.txt"; cp "$T/k1.pub" "$T/curl/auth.keys"; echo '[]' > "$T/curl/signing.json"
+MODE=org ORG=acme run public
+assert_contains "$(cat "$T/curl.log")" "https://github.com/alice.keys" "personal with MODE=org exported: account keys still checked"
 
 # --- 12. usage
 run bogus

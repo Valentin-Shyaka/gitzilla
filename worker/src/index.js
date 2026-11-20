@@ -90,6 +90,7 @@ const REPORT_REASONS = [
   "not flagged critical — review manually", "interleaved with your own pushes", "invalid event",
   "no change", "push failed", "restore target not verified — review manually",
   "no push permission", // org profile: the admin's account may not push to that repo
+  "no org signers file", // org profile: no allowed_signers of its own, so no restore target can be verified
 ];
 
 const REASON_DETAIL = /^[A-Za-z0-9 ._:/-]{0,100}$/;

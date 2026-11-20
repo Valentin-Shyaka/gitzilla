@@ -176,7 +176,7 @@ a profile: `GITZILLA_PROFILE=<name>` in front of `./install.sh` and the `bin/` c
 name is 1 to 40 lower-case letters, digits or hyphens, starting with a letter or digit, and not one of the names
 gitzilla uses for its own files in `~/.config/gitzilla/` or `~/.local/state/gitzilla/` (`config`, `jq-path`, `log`,
 `mirrors`, `incidents`, `install-step`, `install-set-hookspath`, `install-secrets-rotated`, `queue-cursor`,
-`queue-fail-since`, `queue-notified`, `health-notified`, `health-fail-since`, `reconcile-all-at`). A profile keeps
+`queue-fail-since`, `queue-notified`, `health-notified`, `health-fail-since`, `reconcile-all-at`, `allowed_signers`). A profile keeps
 its config in `~/.config/gitzilla/<name>/`, its state, logs and mirrors in `~/.local/state/gitzilla/<name>/`, and its
 launchd jobs as `io.github.gitzilla.<name>.agent|reconcile` (the jobs carry `GITZILLA_PROFILE`). It never reads or
 writes the personal files or jobs. Without `GITZILLA_PROFILE` everything is as described above (the personal
@@ -268,15 +268,18 @@ On the admin's Mac, next to (and after) the admin's personal gitzilla:
 This installs the profile `org-<org-login>` (the login lower-cased; at most 36 characters, so that the profile name
 fits in 40). Its steps are `prereqs note-key worker github-app repos mirrors launchd self-test`: no `hook`,
 `known-keys` or `first-rotation`, which belong to the personal install. It is resumable like the personal install:
-rerun the same command, add `--from-step <step>`, or use `GITZILLA_PROFILE=org-<org-login> ./install.sh` (a profile
-whose config says `MODE=org` stays in org mode). It never reads or writes the personal config, state or jobs.
+rerun the same command, or add `--from-step <step>`. Once the `worker` step has written the profile's config (with
+`MODE=org`), `GITZILLA_PROFILE=org-<org-login> ./install.sh` works too; before that, use `--org` (without it the
+profile is a plain one, and the `worker` step refuses). It never reads or writes the personal config, state or jobs:
+`--org` ignores an exported `GITZILLA_CONFIG_DIR` / `GITZILLA_STATE_DIR` (and says so), and `MODE`/`ORG` come only
+from the profile's config, never from the environment.
 
 | Step | In the org profile |
 |---|---|
 | `note-key` | paste the **same** `push-note` public key as your personal install. It becomes the org Worker's only admin key (`ADMIN_PUBKEYS`). It must be a single `ecdsa-sha2-nistp256` line (Secretive's keys are): the Worker trusts no admin key at all when that value is malformed, so the `worker` step checks it and refuses before it deploys anything |
 | `worker` | deploys a separate Worker named `gitzilla-<org>` with `MODE=org`, `ORG=<org>`, `ADMIN_PUBKEYS=<your push-note key>` and `WEB_FLOW` (below). Every `wrangler deploy` and `wrangler secret` command carries `--name gitzilla-<org>`, so the personal Worker `gitzilla` is never touched. The org Worker gets its own webhook secret, ntfy topic, optional Slack URL and optional call numbers and token, asked and piped exactly as in the personal install. The config (`~/.config/gitzilla/org-<org>/config`) holds `OWNER=<org>`, `MODE=org`, `ORG`, `WORKER_NAME`, `WEB_FLOW` and the Worker URL. To remove an optional secret later: `npx wrangler secret delete <NAME> --name gitzilla-<org>` |
 | `github-app` | create the app `gitzilla-<org>` (cut to 34 characters) in the organization's settings (`https://github.com/organizations/<org>/settings/apps/new`, which needs an org owner), "Only on this account", then install it on the organization with access to **all** repositories. The drill repo is `<org>/gitzilla-drill`; when it does not exist, the installer creates it (private) only after you answer `y` |
-| `repos`, `mirrors` | every repository `gh repo list <org>` returns, mirrored in `~/.local/state/gitzilla/org-<org>/mirrors/` |
+| `repos`, `mirrors` | every repository `gh repo list <org>` returns, mirrored in `~/.local/state/gitzilla/org-<org>/mirrors/`. The `repos` step also asks GitHub whether your account can push to a sample of up to 3 of them and warns about those it cannot (restore would skip them) |
 | `launchd` | the profile's agent and reconcile jobs (no rotate job). The org's reconcile checks for missed webhooks only: an organization has no SSH keys, and your own account keys stay with your personal install |
 | `self-test` | the same rows, pushed from a Mac that joined the org (yours, once you have joined and approved yourself) |
 
@@ -289,8 +292,18 @@ What the admin's GitHub account needs:
 - Push access to every repository restore should put back, and the right to bypass the branch protection rules or
   rulesets of those branches (restore force-pushes with `--force-with-lease`). Before it sends a note or pushes, restore
   in the org profile asks GitHub (`gh api repos/<repo>`, `.permissions.push` or `.permissions.admin`) whether your
-  account may push; when it may not, every ref of that repository is skipped with `no push permission`, and that
-  reason shows in the restore report.
+  account may push; when it may not (or gh fails or takes over 15 s), every ref of that repository is skipped with
+  `no push permission`, and that reason shows in the restore report.
+- The members' commit-signing keys, in the org profile's own signers file `~/.config/gitzilla/org-<org>/allowed_signers`
+  (the `worker` step prints the format): one line per key, `<login> namespaces="git" <key type> <base64 key>`, for
+  example from `https://api.github.com/users/<login>/ssh_signing_keys` after checking each key with its owner. The org
+  profile uses only this file, never your personal or global `allowed_signers`, so your own trust set is not widened.
+  - With the file: the org's deep check marks commits not signed by a listed key `unsigned` (an orange push turns
+    red, with a restore dialog), and restore puts a branch back only to a commit signed by a listed key, as in the
+    personal install.
+  - Without it (missing, or only comments): the deep check skips signatures, so the Worker's alert level stands and
+    no restore dialog comes from signatures (a payload hit still turns red), and restore skips every ref it would
+    rewind with `no org signers file`.
 
 Bots and the web UI:
 

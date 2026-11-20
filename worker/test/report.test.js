@@ -95,6 +95,12 @@ describe("POST /report", () => {
     expect(validReason("no push permission (a\nb)")).toBe(false);
     expect(validReason("push permission")).toBe(false);
   });
+  it("allows the org restore reason 'no org signers file' and nothing near it", () => {
+    expect(validReason("no org signers file")).toBe(true);
+    expect(validReason("no org signers file (x)")).toBe(true);
+    expect(validReason("no org signers")).toBe(false);
+    expect(validReason("no org signers file!")).toBe(false);
+  });
   it("renders the 'no push permission' skip in the report", () => {
     const { body } = formatReport({ restored: [], skipped: [{ repo: "acme/app", ref: "refs/heads/main", reason: "no push permission" }], restored_total: 0, skipped_total: 1 });
     expect(body).toContain("acme/app refs/heads/main: no push permission");

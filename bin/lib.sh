@@ -10,7 +10,7 @@
 # Entries with a dot (repos.txt, rotation.json, ...) cannot collide: a profile name has no dot. Keep this list
 # complete when a new file is added under $GITZILLA_CONFIG_DIR or $STATE.
 WD_RESERVED_NAMES="config jq-path log mirrors incidents install-step install-set-hookspath install-secrets-rotated
-queue-cursor queue-fail-since queue-notified health-notified health-fail-since reconcile-all-at"
+queue-cursor queue-fail-since queue-notified health-notified health-fail-since reconcile-all-at allowed_signers"
 GITZILLA_PROFILE="${GITZILLA_PROFILE:-}"
 if [ -n "$GITZILLA_PROFILE" ]; then
   _wd_ok='^[a-z0-9][a-z0-9-]{0,39}$'
@@ -41,8 +41,41 @@ wd_allowed_signers() {
   printf '%s\n' "${f:-$HOME/.config/git/allowed_signers}"
 }
 
+# The org-profile settings come only from the profile's config (install.sh --org writes them), never from the
+# environment: a stray exported MODE=org must not turn the personal instance into an org one.
+unset MODE ORG WORKER_NAME WEB_FLOW
 # shellcheck disable=SC1090
 [ -f "$GITZILLA_CONFIG_DIR/config" ] && . "$GITZILLA_CONFIG_DIR/config"
+
+# wd_signers_file: the allowed-signers file the signature checks (agent deep check, restore target) use. Personal:
+# ALLOWED_SIGNERS_FILE (tests), else git's (wd_allowed_signers). Org profile (MODE=org): only the profile's own
+# $GITZILLA_CONFIG_DIR/allowed_signers (the members' commit-signing keys), never the admin's personal one; it may be
+# missing or empty, which wd_org_signers_ok reports.
+wd_signers_file() {
+  if [ "${MODE:-}" = org ]; then printf '%s\n' "$GITZILLA_CONFIG_DIR/allowed_signers"
+  else printf '%s\n' "${ALLOWED_SIGNERS_FILE:-$(wd_allowed_signers)}"; fi
+}
+# wd_org_signers_ok: org profile only; 0 when the profile's allowed_signers holds at least one non-comment line.
+wd_org_signers_ok() {
+  [ -s "$GITZILLA_CONFIG_DIR/allowed_signers" ] && grep -qv '^[[:space:]]*\(#\|$\)' "$GITZILLA_CONFIG_DIR/allowed_signers" 2>/dev/null
+}
+
+# wd_timeout <seconds> <cmd...>: run cmd, kill it after <seconds>, then print what it wrote to stdout (stderr passes
+# through). Returns cmd's status (non-zero when it was killed). The output goes through a temp file, not a pipe, so a
+# $(...) caller never waits for a killed command's children (or the watcher) to let go of the pipe.
+wd_timeout() {
+  local s="$1" pid w rc f
+  shift
+  f="$(mktemp)" || return 1
+  "$@" > "$f" </dev/null &
+  pid=$!
+  ( sleep "$s"; kill "$pid" 2>/dev/null ) >/dev/null 2>&1 </dev/null &
+  w=$!
+  wait "$pid"; rc=$?
+  kill "$w" 2>/dev/null; wait "$w" 2>/dev/null
+  cat "$f"; rm -f "$f"
+  return "$rc"
+}
 
 # Hooks run from GUI git clients (GitHub Desktop, Tower, Xcode, ...) get PATH=/usr/bin:/bin:/usr/sbin:/sbin. When no jq
 # is on PATH, use the one install.sh's hook step recorded in $GITZILLA_CONFIG_DIR/jq-path.

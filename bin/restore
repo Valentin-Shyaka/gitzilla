@@ -21,7 +21,10 @@
 # Org profile (config MODE=org, written by install.sh --org): before the note and the push of a ref, the admin's
 # own access to the repo is checked with `gh api repos/<repo> --jq '.permissions.push // .permissions.admin'`;
 # anything but `true` (no access, gh not logged in, network) skips every ref of that repo with "no push permission".
-# The personal profile does no such check.
+# The personal profile does no such check. gh gets GITZILLA_GH_TIMEOUT seconds (default 15); a timeout is a skip.
+# The restore target of an org profile is verified against the profile's own $GITZILLA_CONFIG_DIR/allowed_signers
+# (the members' signing keys), never the admin's personal one; without that file (missing or empty) every ref that
+# needs a verified target is skipped with "no org signers file".
 #
 # Env overrides (tests): GITZILLA_DIALOG_CMD <message> <Restore,Details,Ignore> (prints the button, or
 # TIMEOUT to simulate give-up),
@@ -29,8 +32,13 @@
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$here/lib.sh"
 GH="${GITZILLA_GH_CMD:-gh}"
+GH_TIMEOUT="${GITZILLA_GH_TIMEOUT:-15}"
+case "$GH_TIMEOUT" in ''|*[!0-9]*) GH_TIMEOUT=15 ;; esac
 REMOTE_TPL="${GITZILLA_REMOTE_URL_TEMPLATE:-git@github.com:%s.git}"
-SIGNERS="${ALLOWED_SIGNERS_FILE:-$(wd_allowed_signers)}" # gpg.ssh.allowedSignersFile, else ~/.config/git/allowed_signers
+# personal: gpg.ssh.allowedSignersFile, else ~/.config/git/allowed_signers; org profile: its own allowed_signers only
+SIGNERS="$(wd_signers_file)"
+ORG_NOSIGNERS=0
+if [ "${MODE:-}" = org ] && ! wd_org_signers_ok; then ORG_NOSIGNERS=1; fi
 ZERO=0000000000000000000000000000000000000000
 REVOKE="$WD_REVOKE"
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR
@@ -82,7 +90,9 @@ can_push() {
   local f="$tmp/perm.tsv" v
   v="$(awk -F'\t' -v r="$1" '$1 == r {print $2; exit}' "$f" 2>/dev/null)"
   if [ -z "$v" ]; then
-    v="$("$GH" api "repos/$1" --jq '.permissions.push // .permissions.admin' </dev/null 2>/dev/null | head -n1)"
+    # bounded: a stalled gh must not hold up the other refs of an incident; a timeout or error is "no"
+    v="$(wd_timeout "$GH_TIMEOUT" "$GH" api "repos/$1" --jq '.permissions.push // .permissions.admin' 2>/dev/null)" || v=no
+    v="${v%%$'\n'*}"
     [ "$v" = true ] || v=no
     printf '%s\t%s\n' "$1" "$v" >> "$f"
   fi
@@ -180,6 +190,11 @@ while IFS="$(printf '\t')" read -r repo ref before after ts mx; do
   if [ ! -d "$mirror" ]; then skip "$repo" "$ref" "old commit not available locally"; continue; fi
   if [ "$before" != "$ZERO" ] && ! git -C "$mirror" cat-file -e "$before" </dev/null 2>/dev/null; then
     skip "$repo" "$ref" "old commit not available locally"; continue
+  fi
+  # org profile without its own signers file: a target cannot be verified (the admin's own file is never used)
+  if [ "$before" != "$ZERO" ] && [ "$ORG_NOSIGNERS" = 1 ]; then
+    wd_log "restore: org profile has no allowed_signers ($GITZILLA_CONFIG_DIR/allowed_signers); $repo $ref skipped"
+    skip "$repo" "$ref" "no org signers file"; write_result; continue
   fi
   # the target must be the owner's signed commit: a chain that starts at an attacker commit is not a restore
   if [ "$before" != "$ZERO" ] && \

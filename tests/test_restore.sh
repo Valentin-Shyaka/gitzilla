@@ -605,6 +605,8 @@ STUB
 chmod +x "$T/gh.sh"; export GITZILLA_GH_CMD="$T/gh.sh"
 cp "$GITZILLA_CONFIG_DIR/config" "$T/config.personal"
 printf 'MODE=org\nORG=acme\n' >> "$GITZILLA_CONFIG_DIR/config"
+# the org profile verifies restore targets against its own allowed_signers only (ALLOWED_SIGNERS_FILE is ignored)
+cp "$T/allowed_signers" "$GITZILLA_CONFIG_DIR/allowed_signers"
 # push permission: restored as in personal mode; one gh call for the two refs of the repo
 setup; attack_main
 git -C "$WORK" checkout -q -b dev "$C1"; git -C "$WORK" push -q origin dev
@@ -632,8 +634,47 @@ done
 assert_eq 1 "$(reports)" "org no push: the summary report is sent"
 grep -h '"path":"/report"' "$STUB_LOG" | head -1 | jq -r .body | jq -r .payload | base64 -d > "$T/rp.json"
 assert_eq "no push permission" "$(jq -r '.skipped[0].reason' "$T/rp.json")" "org no push: report reason is the fixed string"
+# a gh call that hangs is cut off (GITZILLA_GH_TIMEOUT): skipped, never pushed, and the run does not wait for it
+printf '#!/bin/sh\necho "$*" >> "%s/gh.log"\nsleep 60\necho done > "%s/gh-slow.done" 2>/dev/null\necho true\n' "$T" "$T" > "$T/gh-slow.sh"; chmod +x "$T/gh-slow.sh"
+setup; attack_main
+ts_event 1 alice/app refs/heads/main "$C1" "$C2" | write_inc
+rm -f "$T/gh-slow.done"
+GITZILLA_GH_CMD="$T/gh-slow.sh" GITZILLA_GH_TIMEOUT=1 run --yes "$INC"
+assert_eq "no push permission" "$(result '.skipped[0].reason')" "org gh timeout: skipped with 'no push permission'"
+assert_eq "$C2" "$(head_of refs/heads/main)" "org gh timeout: origin untouched"
+assert_eq 0 "$(notes)" "org gh timeout: no note sent"
+assert_eq no "$([ -e "$T/gh-slow.done" ] && echo yes || echo no)" "org gh timeout: restore returned without waiting for the stalled gh"
+# no org signers file (missing, or comments only): every ref with a target to verify is skipped, before gh and the note
+for how in missing empty; do
+  if [ "$how" = missing ]; then rm -f "$GITZILLA_CONFIG_DIR/allowed_signers"; else printf '# none yet\n' > "$GITZILLA_CONFIG_DIR/allowed_signers"; fi
+  setup; attack_main
+  echo true > "$T/gh.perm"; rm -f "$T/gh.log"
+  ts_event 1 alice/app refs/heads/main "$C1" "$C2" | write_inc
+  run --yes "$INC"
+  assert_eq "no org signers file" "$(result '.skipped[0].reason')" "org signers $how: skipped with 'no org signers file'"
+  assert_eq "$C2" "$(head_of refs/heads/main)" "org signers $how: origin untouched"
+  assert_eq 0 "$(notes)" "org signers $how: no note sent"
+  assert_eq no "$([ -e "$T/gh.log" ] && echo yes || echo no)" "org signers $how: no gh call"
+  grep -h '"path":"/report"' "$STUB_LOG" | head -1 | jq -r .body | jq -r .payload | base64 -d > "$T/rp.json"
+  assert_eq "no org signers file" "$(jq -r '.skipped[0].reason' "$T/rp.json")" "org signers $how: report reason"
+done
+# present but without the target's signer: not verified, even though the admin's ALLOWED_SIGNERS_FILE would verify it
+ssh-keygen -q -t ed25519 -N '' -C other -f "$T/otherkey" >/dev/null
+echo "bob namespaces=\"git\" $(cut -d' ' -f1,2 "$T/otherkey.pub")" > "$GITZILLA_CONFIG_DIR/allowed_signers"
+setup; attack_main
+ts_event 1 alice/app refs/heads/main "$C1" "$C2" | write_inc
+run --yes "$INC"
+assert_eq "restore target not verified — review manually" "$(result '.skipped[0].reason')" "org signers: only the profile's file verifies targets"
+rm -f "$GITZILLA_CONFIG_DIR/allowed_signers"
 # personal profile: no permission check at all
 cp "$T/config.personal" "$GITZILLA_CONFIG_DIR/config"
+# MODE=org exported with the personal config: still no permission check
+setup; attack_main
+echo false > "$T/gh.perm"; rm -f "$T/gh.log"
+ts_event 1 alice/app refs/heads/main "$C1" "$C2" | write_inc
+MODE=org ORG=acme run --yes "$INC"
+assert_eq 1 "$(result '.restored|length')" "personal with MODE=org exported: restored as before"
+assert_eq no "$([ -e "$T/gh.log" ] && echo yes || echo no)" "personal with MODE=org exported: gh never called"
 setup; attack_main
 echo false > "$T/gh.perm"; rm -f "$T/gh.log"
 ts_event 1 alice/app refs/heads/main "$C1" "$C2" | write_inc

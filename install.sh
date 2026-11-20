@@ -61,6 +61,12 @@ if [ "$org_set" = 1 ]; then
     echo "install: --org $ORG_LOGIN installs the profile org-$ORG_LOGIN, but GITZILLA_PROFILE is '$GITZILLA_PROFILE'; drop GITZILLA_PROFILE" >&2; exit 2
   fi
   GITZILLA_PROFILE="org-$ORG_LOGIN"; export GITZILLA_PROFILE # the steps' child commands (reconcile seed, notify-test) too
+  # the org profile lives in ~/.config/gitzilla/org-<login> and ~/.local/state/gitzilla/org-<login>, always: exported
+  # directories (copied from a launchd job, or the personal ones) would make it read and rewrite another instance
+  if [ -n "${GITZILLA_CONFIG_DIR:-}" ] || [ -n "${GITZILLA_STATE_DIR:-}" ]; then
+    echo "install: --org ignores the exported GITZILLA_CONFIG_DIR / GITZILLA_STATE_DIR (the org profile uses ~/.config/gitzilla/org-$ORG_LOGIN and ~/.local/state/gitzilla/org-$ORG_LOGIN)"
+    unset GITZILLA_CONFIG_DIR GITZILLA_STATE_DIR
+  fi
 fi
 . "$here/bin/lib.sh"
 GITZILLA_HOME="$here"
@@ -430,6 +436,23 @@ step_worker() {
     say "Members join it from their personal gitzilla with:  ./install.sh --join-org $GITZILLA_URL"
     say "Join it yourself the same way (personal install, no GITZILLA_PROFILE), then approve each member with:"
     say "  GITZILLA_PROFILE=$GITZILLA_PROFILE bin/org approve <login> <fingerprint>"
+    org_signers_hint
+  fi
+}
+
+# org_signers_hint: the org profile verifies commit signatures (deep check, restore target) only against its own
+# allowed_signers, never the admin's personal one.
+org_signers_hint() {
+  local f="$GITZILLA_CONFIG_DIR/allowed_signers"
+  say ""
+  if wd_org_signers_ok; then
+    say "Commit signatures in $ORG_LOGIN's repos are checked against $f ($(grep -cv '^[[:space:]]*\(#\|$\)' "$f" | tr -d ' ') key line(s))."
+  else
+    say "No $f yet: until it exists the org's deep check skips signatures (the Worker's alert level stands) and"
+    say "restore skips every ref with \"no org signers file\". Populate it with the members' commit-signing public keys,"
+    say "one line each:"
+    say "  <login> namespaces=\"git\" <key type> <base64 key>"
+    say "(e.g. from https://api.github.com/users/<login>/ssh_signing_keys, after checking each key with its owner)."
   fi
 }
 
@@ -718,6 +741,29 @@ step_repos() {
   mkdir -p "$STATE" || die "cannot create $STATE"
   printf '%s\n' "$list" | atomic_write "$STATE/repos.txt" || die "cannot write repos.txt"
   say "$(printf '%s\n' "$list" | wc -l | tr -d ' ') repositories listed"
+  [ "$ORG_MODE" = 1 ] && push_sample "$list"
+  return 0
+}
+
+# push_sample <repos.txt lines>: org mode. Restore needs push access to put a ref back; ask GitHub for a sample of up to
+# 3 repos and warn about those this account cannot push to (restore skips them with "no push permission").
+push_sample() {
+  local slug _vis v no="" n=0
+  while read -r slug _vis; do
+    [ -n "$slug" ] || continue
+    n=$((n + 1)); [ "$n" -le 3 ] || break
+    v="$(wd_timeout "${GITZILLA_GH_TIMEOUT:-15}" "$GH" api "repos/$slug" --jq '.permissions.push // .permissions.admin' 2>/dev/null)" || v=no
+    v="${v%%$'\n'*}"
+    [ "$v" = true ] || no="${no:+$no }$slug"
+  done <<EOF
+$1
+EOF
+  if [ -n "$no" ]; then
+    say "WARNING: your account cannot push to: $no (sample of $((n > 3 ? 3 : n)) repos). Restore skips such repos with"
+    say "  \"no push permission\": an org owner must give you push access (and the right to bypass branch protection)."
+  else
+    say "push access checked on a sample of repos: ok"
+  fi
 }
 
 step_mirrors() {

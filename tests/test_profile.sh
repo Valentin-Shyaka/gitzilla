@@ -38,7 +38,7 @@ rm -rf "$HOME/.config" "$HOME/.local"
 
 # --- 2. invalid profiles die (names that would land on a personal file or directory are refused too)
 RESERVED="config jq-path log mirrors incidents install-step install-set-hookspath install-secrets-rotated queue-cursor
-queue-fail-since queue-notified health-notified health-fail-since reconcile-all-at"
+queue-fail-since queue-notified health-notified health-fail-since reconcile-all-at allowed_signers"
 for bad in Org -x a_b a.b "a/b" .. "a b" "${P40}1" "org-acme
 x" $RESERVED; do
   o="$(GITZILLA_PROFILE="$bad" bash -c '. "$1"; echo SURVIVED' _ "$LIB" 2>&1)"; rc=$?

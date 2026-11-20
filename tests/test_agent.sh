@@ -297,6 +297,52 @@ ev 1 alice/app refs/heads/main $BASE $SIGNED warning | set_events
 poll
 assert_eq "[]" "$(jq -c '.[0].flags' "$STATE/incidents/1.json")" "clean deep_check: no flags"
 
+# --- 3a2. org profile (config MODE=org): signatures only against the profile's own allowed_signers
+cp "$GITZILLA_CONFIG_DIR/config" "$T/config.personal"
+printf 'MODE=org\nORG=alice\n' >> "$GITZILLA_CONFIG_DIR/config"
+OSIG="$GITZILLA_CONFIG_DIR/allowed_signers"
+# absent (the admin's ALLOWED_SIGNERS_FILE and git's file are valid but must not be used): no signature escalation
+rm -f "$OSIG"
+mkdir -p "$HOME/sig"; cp "$T/allowed_signers" "$HOME/sig/as"; git config --global gpg.ssh.allowedSignersFile "$HOME/sig/as"
+reset_state
+ev 1 alice/app refs/heads/main $SIGNED $UNSIGNED warning | set_events
+poll
+assert_eq warning "$(jq -r '.[0].level' "$STATE/incidents/1.json")" "org, no signers file: unsigned commit stays warning (the Worker's level stands)"
+assert_eq "no" "$(jq -c '.[0].flags' "$STATE/incidents/1.json" | grep -q unsigned && echo yes || echo no)" "org, no signers file: no unsigned flag"
+assert_eq 0 "$(nlines "$T/restore.log")" "org, no signers file: no restore dialog"
+assert_contains "$(cat "$STATE/log/gitzilla.log")" "org profile has no allowed_signers" "org, no signers file: logged"
+# empty (comments only) counts as absent
+printf '# members\n\n' > "$OSIG"
+reset_state
+ev 1 alice/app refs/heads/main $SIGNED $UNSIGNED warning | set_events
+poll
+assert_eq warning "$(jq -r '.[0].level' "$STATE/incidents/1.json")" "org, empty signers file: stays warning"
+# present: used as the personal file is today
+cp "$T/allowed_signers" "$OSIG"
+reset_state
+ev 1 alice/app refs/heads/main $SIGNED $UNSIGNED warning | set_events
+poll
+assert_eq critical "$(jq -r '.[0].level' "$STATE/incidents/1.json")" "org, signers file: unsigned commit escalated"
+assert_eq 1 "$(nlines "$T/restore.log")" "org, signers file: restore called"
+reset_state
+ev 1 alice/app refs/heads/main $BASE $SIGNED warning | set_events
+poll
+assert_eq warning "$(jq -r '.[0].level' "$STATE/incidents/1.json")" "org, signers file: signed range stays warning"
+# present but without the signer's key: the admin's own (valid) files are still never consulted
+ssh-keygen -q -t ed25519 -N '' -C other -f "$T/otherkey" >/dev/null
+echo "bob namespaces=\"git\" $(cut -d' ' -f1,2 "$T/otherkey.pub")" > "$OSIG"
+reset_state
+ev 1 alice/app refs/heads/main $BASE $SIGNED warning | set_events
+poll
+assert_contains "$(jq -c '.[0].flags' "$STATE/incidents/1.json")" unsigned "org: only the profile's file counts (admin's ALLOWED_SIGNERS_FILE / git file ignored)"
+git config --global --unset gpg.ssh.allowedSignersFile
+rm -f "$OSIG"; cp "$T/config.personal" "$GITZILLA_CONFIG_DIR/config"
+# MODE=org in the environment (no profile config) changes nothing for the personal instance
+reset_state
+ev 1 alice/app refs/heads/main $SIGNED $UNSIGNED warning | set_events
+MODE=org ORG=alice poll
+assert_eq critical "$(jq -r '.[0].level' "$STATE/incidents/1.json")" "personal with MODE=org exported: signature check as before"
+
 # --- 3b. mirror fetch failure -> check-failed, level unchanged; notification mentions it
 reset_state
 ev 1 alice/app refs/heads/main $BASE $SIGNED warning | set_events
