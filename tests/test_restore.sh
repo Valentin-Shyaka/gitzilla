@@ -21,6 +21,7 @@ printf '#!/bin/sh\necho "$1|$2" >> "%s/notify.log"\n' "$T" > "$T/notify.sh"
 cat > "$T/dialog.sh" <<STUB
 #!/bin/sh
 echo "\$1|\$2" >> "$T/dialog.log"
+echo "\$3" >> "$T/dialog.title"
 a="\$(head -n1 "$T/dialog.answers" 2>/dev/null)"
 sed -i.bak 1d "$T/dialog.answers" 2>/dev/null
 echo "\${a:-Restore}"
@@ -155,6 +156,7 @@ assert_eq "$C2" "$(head_of refs/heads/main)" "ignore: origin unchanged"
 assert_eq 0 "$(notes)" "ignore: no notes"
 assert_contains "$(cat "$T/dialog.log")" "Restore 1 refs in 1 repos to their state at 08:53?" "ignore: dialog text"
 assert_contains "$(cat "$T/dialog.log")" "Restore,Details,Ignore" "ignore: buttons"
+assert_eq gitzilla "$(tail -n1 "$T/dialog.title")" "personal: the dialog title is plain gitzilla"
 # --- 6b. dialog Restore -> pushes; Details then Restore -> shows details first
 setup; attack_main
 ts_event 1 alice/app refs/heads/main "$C1" "$C2" | write_inc
@@ -172,6 +174,33 @@ run --yes "$INC"
 assert_eq "old commit not available locally" "$(result '.skipped[0].reason')" "missing: reason"
 assert_eq "$C2" "$(head_of refs/heads/main)" "missing: origin unchanged"
 assert_eq 0 "$(notes)" "missing: no note"
+
+# --- 7a. before not in the mirror but still on the remote (an overwritten push the mirror never fetched): fetched
+# once by its id, then restored as usual
+setup
+git -C "$WORK" checkout -q main; G1="$(commit f member)"; git -C "$WORK" push -q origin main   # mirror not fetched
+git -C "$WORK" checkout -q -B atk "$C1"; X="$(commit f evil)"; git -C "$WORK" push -q -f origin atk:main
+git -C "$MIRROR" fetch -q --prune
+assert_eq no "$(git -C "$MIRROR" cat-file -e "$G1" 2>/dev/null && echo yes || echo no)" "fetch by id: setup (G1 not in the mirror)"
+ts_event 1 alice/app refs/heads/main "$G1" "$X" | write_inc
+run --yes "$INC"
+assert_eq 1 "$(result '.restored|length')" "fetch by id: restored"
+assert_eq "$G1" "$(head_of refs/heads/main)" "fetch by id: origin main back at the overwritten commit"
+assert_eq "$G1" "$(mhead refs/heads/main)" "fetch by id: mirror ref updated"
+assert_contains "$(cat "$GITZILLA_STATE_DIR/log/gitzilla.log")" "fetched the old commit $G1 of alice/app by its id" "fetch by id: logged"
+# a fetch that hangs is cut off (GITZILLA_FETCH_TIMEOUT) and the ref skipped with the usual reason
+setup; attack_main
+M="$(printf '%040d' 8)"
+mkdir -p "$T/slowbin"; printf '#!/bin/sh\necho "$*" >> "%s/slowssh.log"\nexec sleep 30\n' "$T" > "$T/slowbin/ssh"; chmod +x "$T/slowbin/ssh"
+ts_event 1 alice/app refs/heads/main "$M" "$C2" | write_inc
+rm -f "$T/slowssh.log"; s0="$(date +%s)"
+PATH="$T/slowbin:$PATH" GITZILLA_REMOTE_URL_TEMPLATE="ssh://git@github.invalid/%s.git" GITZILLA_FETCH_TIMEOUT=2 run --yes "$INC"
+assert_eq "old commit not available locally" "$(result '.skipped[0].reason')" "fetch by id timeout: skipped with the usual reason"
+if [ $(( $(date +%s) - s0 )) -lt 15 ]; then _ok; else _bad "fetch by id timeout: restore did not wait for the stalled fetch"; fi
+i=0; while [ ! -s "$T/slowssh.log" ] && [ "$i" -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
+assert_contains "$(cat "$T/slowssh.log" 2>/dev/null)" "git@github.invalid git-upload-pack '/alice/app.git'" "fetch by id timeout: the fetch was tried"
+assert_eq "$C2" "$(head_of refs/heads/main)" "fetch by id timeout: origin unchanged"
+pkill -f "$T/slowbin" 2>/dev/null; true
 
 # --- 8. invalid slug / ref / sha -> skipped invalid event; non-push ignored
 setup; attack_main
@@ -644,6 +673,36 @@ assert_eq "no push permission" "$(result '.skipped[0].reason')" "org gh timeout:
 assert_eq "$C2" "$(head_of refs/heads/main)" "org gh timeout: origin untouched"
 assert_eq 0 "$(notes)" "org gh timeout: no note sent"
 assert_eq no "$([ -e "$T/gh-slow.done" ] && echo yes || echo no)" "org gh timeout: restore returned without waiting for the stalled gh"
+# the profile's own gh login: GH_CONFIG_DIR=<profile config>/gh, no inherited token; 404/403/401 -> its own reason
+cat > "$T/gh-env.sh" <<STUB
+#!/bin/sh
+echo "GH_CONFIG_DIR=\${GH_CONFIG_DIR:-} GH_TOKEN=\${GH_TOKEN:-} GITHUB_TOKEN=\${GITHUB_TOKEN:-} \$*" >> "$T/gh.log"
+case "\$(cat "$T/gh.status" 2>/dev/null)" in
+  "") echo true ;;
+  *) printf '{"message":"Not Found"}'; echo "gh: Not Found (HTTP \$(cat "$T/gh.status"))" >&2; exit 1 ;;
+esac
+STUB
+chmod +x "$T/gh-env.sh"
+setup; attack_main
+rm -f "$T/gh.log" "$T/gh.status" "$T/notify.log"
+ts_event 1 alice/app refs/heads/main "$C1" "$C2" | write_inc
+GITZILLA_PROFILE=org-acme GH_TOKEN=personal-token GITHUB_TOKEN=personal-token2 GH_CONFIG_DIR="$HOME/.config/gh" GITZILLA_GH_CMD="$T/gh-env.sh" run --prompt "$INC"
+assert_eq 1 "$(result '.restored|length')" "org profile gh: restored with push permission"
+assert_eq "GH_CONFIG_DIR=$GITZILLA_CONFIG_DIR/gh GH_TOKEN= GITHUB_TOKEN= api repos/alice/app --jq .permissions.push // .permissions.admin" "$(cat "$T/gh.log")" "org profile gh: the profile's gh store, no inherited token"
+assert_eq "gitzilla (org-acme)" "$(tail -n1 "$T/dialog.title")" "org profile: the dialog title names the profile"
+assert_contains "$(cat "$T/notify.log")" "gitzilla (org-acme): restore|" "org profile: the summary notification names the profile"
+for st in 404 403 401; do
+  setup; attack_main
+  echo "$st" > "$T/gh.status"; rm -f "$T/gh.log"
+  ts_event 1 alice/app refs/heads/main "$C1" "$C2" | write_inc
+  GITZILLA_PROFILE=org-acme GITZILLA_GH_CMD="$T/gh-env.sh" run --yes "$INC"
+  assert_eq "repo not visible to org token" "$(result '.skipped[0].reason')" "org gh $st: skipped with 'repo not visible to org token'"
+  assert_eq "$C2" "$(head_of refs/heads/main)" "org gh $st: origin untouched"
+  assert_eq 0 "$(notes)" "org gh $st: no note sent"
+done
+grep -h '"path":"/report"' "$STUB_LOG" | head -1 | jq -r .body | jq -r .payload | base64 -d > "$T/rp.json"
+assert_eq "repo not visible to org token" "$(jq -r '.skipped[0].reason' "$T/rp.json")" "org gh 404: report reason is the fixed string"
+rm -f "$T/gh.status"
 # no org signers file (missing, or comments only): every ref with a target to verify is skipped, before gh and the note
 for how in missing empty; do
   if [ "$how" = missing ]; then rm -f "$GITZILLA_CONFIG_DIR/allowed_signers"; else printf '# none yet\n' > "$GITZILLA_CONFIG_DIR/allowed_signers"; fi

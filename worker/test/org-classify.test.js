@@ -319,6 +319,12 @@ describe("org push classification", () => {
     expect(sl.text.endsWith(REVOKE)).toBe(true);
     expect(calls()).toHaveLength(0);
   });
+  it("an EMU login with _ (<user>_<shortcode>) is the pusher, not unknown", async () => {
+    await push({ sender: { login: "Mallory_Acme", type: "User" }, forced: true });
+    expect(await lastEvent()).toMatchObject({ pusher: "mallory_acme", level: "critical", flags: ["unenrolled", "forced"] });
+    const [sl] = slack();
+    expect(sl.text).toContain("Pusher: mallory_acme");
+  });
   it("Bot sender type -> silent bot", async () => {
     await push({ sender: { login: "renovate[bot]", type: "Bot" } });
     expect(await lastEvent()).toMatchObject({ pusher: "renovate[bot]", level: "silent", flags: ["bot"] });

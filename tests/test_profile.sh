@@ -34,11 +34,25 @@ case "$(cat "$PS/log/gitzilla.log")" in *"hello profile"*) _bad "personal log ho
 mkdir -p "$PC/org-acme"; echo 'OWNER=acme' > "$PC/org-acme/config"; echo 'OWNER=alice' > "$PC/config"
 assert_eq acme "$(GITZILLA_PROFILE=org-acme bash -c '. "$1"; echo "$OWNER"' _ "$LIB")" "profile: sources its own config"
 assert_eq alice "$(bash -c '. "$1"; echo "$OWNER"' _ "$LIB")" "personal: sources the personal config"
+# gh: a profile has its own gh store (GH_CONFIG_DIR=<profile config>/gh, exported) and drops inherited gh tokens;
+# personal leaves gh's environment alone
+ghenv() { bash -c '. "$1"; printf "%s|%s|%s|%s\n" "${GH_CONFIG_DIR:-}" "${GH_TOKEN:-}" "${GITHUB_TOKEN:-}" "$(sh -c "echo \${GH_CONFIG_DIR:-}")"' _ "$LIB"; }
+assert_eq "$PC/org-acme/gh|||$PC/org-acme/gh" "$(GITZILLA_PROFILE=org-acme GH_TOKEN=t GITHUB_TOKEN=u GH_CONFIG_DIR=/elsewhere ghenv)" "profile: GH_CONFIG_DIR is the profile's (exported), gh tokens dropped"
+assert_eq "$T/c/gh|||$T/c/gh" "$(GITZILLA_PROFILE=org-acme GITZILLA_CONFIG_DIR=$T/c ghenv)" "profile: GH_CONFIG_DIR follows an explicit config dir"
+assert_eq "/elsewhere|t|u|/elsewhere" "$(GH_TOKEN=t GITHUB_TOKEN=u GH_CONFIG_DIR=/elsewhere ghenv)" "personal: gh environment unchanged"
+assert_eq "||" "$(bash -c '. "$1"; printf "%s|%s|%s\n" "${GH_CONFIG_DIR:-}" "${GH_TOKEN:-}" "${GITHUB_TOKEN:-}"' _ "$LIB")" "personal: no GH_CONFIG_DIR set"
+# notification titles name the profile
+titles() { bash -c '. "$1"; wd_title "gitzilla: CRITICAL"; wd_title gitzilla; wd_title other' _ "$LIB" | paste -sd'|' -; }
+assert_eq "gitzilla (org-acme): CRITICAL|gitzilla (org-acme)|other (org-acme)" "$(GITZILLA_PROFILE=org-acme titles)" "profile: titles name the profile"
+assert_eq "gitzilla: CRITICAL|gitzilla|other" "$(titles)" "personal: titles unchanged"
+printf '#!/bin/sh\necho "$1" >> "%s/ntitle.log"\n' "$T" > "$T/ntitle.sh"; chmod +x "$T/ntitle.sh"
+GITZILLA_PROFILE=org-acme GITZILLA_NOTIFY_CMD="$T/ntitle.sh" bash -c '. "$1"; wd_notify "gitzilla: warning" "x"' _ "$LIB"
+assert_eq "gitzilla (org-acme): warning" "$(cat "$T/ntitle.log")" "profile: wd_notify passes the profile title"
 rm -rf "$HOME/.config" "$HOME/.local"
 
 # --- 2. invalid profiles die (names that would land on a personal file or directory are refused too)
 RESERVED="config jq-path log mirrors incidents install-step install-set-hookspath install-secrets-rotated queue-cursor
-queue-fail-since queue-notified health-notified health-fail-since reconcile-all-at allowed_signers"
+queue-fail-since queue-notified health-notified health-fail-since reconcile-all-at allowed_signers gh"
 for bad in Org -x a_b a.b "a/b" .. "a b" "${P40}1" "org-acme
 x" $RESERVED; do
   o="$(GITZILLA_PROFILE="$bad" bash -c '. "$1"; echo SURVIVED' _ "$LIB" 2>&1)"; rc=$?

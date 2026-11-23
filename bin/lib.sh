@@ -10,7 +10,7 @@
 # Entries with a dot (repos.txt, rotation.json, ...) cannot collide: a profile name has no dot. Keep this list
 # complete when a new file is added under $GITZILLA_CONFIG_DIR or $STATE.
 WD_RESERVED_NAMES="config jq-path log mirrors incidents install-step install-set-hookspath install-secrets-rotated
-queue-cursor queue-fail-since queue-notified health-notified health-fail-since reconcile-all-at allowed_signers"
+queue-cursor queue-fail-since queue-notified health-notified health-fail-since reconcile-all-at allowed_signers gh"
 GITZILLA_PROFILE="${GITZILLA_PROFILE:-}"
 if [ -n "$GITZILLA_PROFILE" ]; then
   _wd_ok='^[a-z0-9][a-z0-9-]{0,39}$'
@@ -27,6 +27,13 @@ if [ -n "$GITZILLA_PROFILE" ]; then
 else
   GITZILLA_CONFIG_DIR="${GITZILLA_CONFIG_DIR:-$HOME/.config/gitzilla}"
   STATE="${GITZILLA_STATE_DIR:-$HOME/.local/state/gitzilla}"
+fi
+# A profile has its own gh login (install.sh's prereqs step: a read-only fine-grained token whose resource owner is the
+# org), kept by gh in <profile config dir>/gh, never the personal login (a user-owned token cannot see an org's private
+# repos). The gh token variables would override that store, so a profile drops them. Personal: gh as it is.
+if [ -n "$GITZILLA_PROFILE" ]; then
+  GH_CONFIG_DIR="$GITZILLA_CONFIG_DIR/gh"; export GH_CONFIG_DIR
+  unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN GH_HOST
 fi
 SECRETIVE_SOCK="$HOME/Library/Containers/com.maxgoedjen.Secretive.SecretAgent/Data/socket.ssh"
 WD_REVOKE="If this wasn't you: revoke tokens at https://github.com/settings/applications"
@@ -109,13 +116,27 @@ wd_log() {
   return 0
 }
 
-# wd_notify <title> <message>: desktop notification (GITZILLA_NOTIFY_CMD overrides, for tests).
+# wd_title <title>: in a profile, "gitzilla: X" -> "gitzilla (<profile>): X" and "gitzilla" -> "gitzilla (<profile>)", so
+# an org's notifications and dialogs are told apart from the personal ones. Personal: unchanged.
+wd_title() {
+  if [ -z "$GITZILLA_PROFILE" ]; then printf '%s\n' "$1"; return 0; fi
+  case "$1" in
+    gitzilla) printf 'gitzilla (%s)\n' "$GITZILLA_PROFILE" ;;
+    gitzilla:*) printf 'gitzilla (%s):%s\n' "$GITZILLA_PROFILE" "${1#gitzilla:}" ;;
+    *) printf '%s (%s)\n' "$1" "$GITZILLA_PROFILE" ;;
+  esac
+}
+
+# wd_notify <title> <message>: desktop notification (GITZILLA_NOTIFY_CMD overrides, for tests). The title names the
+# profile (wd_title).
 wd_notify() {
+  local t
+  t="$(wd_title "$1")"
   if [ -n "${GITZILLA_NOTIFY_CMD:-}" ]; then
-    "$GITZILLA_NOTIFY_CMD" "$1" "$2" </dev/null >/dev/null 2>&1 || { wd_log "notify command failed"; return 1; }
+    "$GITZILLA_NOTIFY_CMD" "$t" "$2" </dev/null >/dev/null 2>&1 || { wd_log "notify command failed"; return 1; }
   else
     osascript -e 'on run argv' -e 'display notification (item 2 of argv) with title (item 1 of argv)' \
-      -e 'end run' -- "$1" "$2" </dev/null >/dev/null 2>&1 || { wd_log "osascript notify failed"; return 1; }
+      -e 'end run' -- "$t" "$2" </dev/null >/dev/null 2>&1 || { wd_log "osascript notify failed"; return 1; }
   fi
   return 0
 }
@@ -167,8 +188,9 @@ wd_sign() {
 
 # ---- organizations. The personal config's ORG_WORKERS holds space-separated "<org-login>=<worker-url>" pairs
 # (install.sh --join-org writes it): pushes to that org's repos send their note to that org's Worker.
-WD_LOGIN_RE='^[a-z0-9][a-z0-9-]{0,38}$'        # GitHub login, lower-cased (the Worker's LOGIN_RE)
-WD_BOT_RE='^[a-z0-9][a-z0-9-]{0,38}(\[bot\])?$' # an allow-listed bot login (the Worker's BOT_RE)
+# GitHub login, lower-cased (the Worker's LOGIN_RE); "_" for Enterprise Managed Users (<user>_<shortcode>)
+WD_LOGIN_RE='^[a-z0-9][a-z0-9_-]{0,38}$'
+WD_BOT_RE='^[a-z0-9][a-z0-9_-]{0,38}(\[bot\])?$' # an allow-listed bot login (the Worker's BOT_RE)
 WD_FP_RE='^SHA256:[A-Za-z0-9+/]{43}$'
 
 # wd_lc <s> -> lower-cased s

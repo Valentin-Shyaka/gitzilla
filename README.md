@@ -169,6 +169,22 @@ Calls work the same way: pressing Enter at the phone-number prompt only skips se
 Files: config in `~/.config/gitzilla/`, state and logs in `~/.local/state/gitzilla/`
 (`log/agent.out`, `log/reconcile.out`, `log/rotate.out`, `log/gitzilla.log`).
 
+### Upgrading
+
+After `git pull` in the clone, redeploy the Worker before relying on anything new, and in particular before
+`bin/notify-test`: a Worker deployed by an older version rejects the test alert, and `notify-test` then prints
+`test alert not sent: worker returned 400`.
+
+- Redeploy only (keeps every secret, the GitHub App and the phone subscription as they are):
+  `GITZILLA_INSTALL_STOP_AFTER=worker ./install.sh --from-step worker`, and press Enter at the keep/rotate question.
+  Without `GITZILLA_INSTALL_STOP_AFTER=worker`, `--from-step worker` also reruns every later step.
+- Adding red-alert calls to an existing install: the call questions are asked only on the rotate path. Run
+  `./install.sh --from-step worker` and type `rotate`. This regenerates the webhook secret and the ntfy topic as well
+  as asking for the Slack URL, the numbers and the token. Then, in the `github-app` step that follows, paste the new
+  webhook secret into the existing app (`https://github.com/settings/apps/<app-name>/advanced`; the step asks for it),
+  and subscribe the ntfy app on your phone to the new topic (unsubscribe from the old one). The later steps rerun as
+  well; each keeps what is already in place.
+
 ### Profiles
 
 One Mac can run more than one gitzilla (for example your personal one and an organization's). Each extra instance is
@@ -176,7 +192,7 @@ a profile: `GITZILLA_PROFILE=<name>` in front of `./install.sh` and the `bin/` c
 name is 1 to 40 lower-case letters, digits or hyphens, starting with a letter or digit, and not one of the names
 gitzilla uses for its own files in `~/.config/gitzilla/` or `~/.local/state/gitzilla/` (`config`, `jq-path`, `log`,
 `mirrors`, `incidents`, `install-step`, `install-set-hookspath`, `install-secrets-rotated`, `queue-cursor`,
-`queue-fail-since`, `queue-notified`, `health-notified`, `health-fail-since`, `reconcile-all-at`, `allowed_signers`). A profile keeps
+`queue-fail-since`, `queue-notified`, `health-notified`, `health-fail-since`, `reconcile-all-at`, `allowed_signers`, `gh`). A profile keeps
 its config in `~/.config/gitzilla/<name>/`, its state, logs and mirrors in `~/.local/state/gitzilla/<name>/`, and its
 launchd jobs as `io.github.gitzilla.<name>.agent|reconcile` (the jobs carry `GITZILLA_PROFILE`). It never reads or
 writes the personal files or jobs. Without `GITZILLA_PROFILE` everything is as described above (the personal
@@ -189,8 +205,13 @@ What a profile does not do:
   A Worker of its own comes only with an org profile, made by `./install.sh --org <org-login>` (Organizations, below),
   which deploys the separately named Worker `gitzilla-<org>`. A plain `GITZILLA_PROFILE=<name> ./install.sh` stops at
   the `worker` step and changes nothing remote.
-- **No rotation.** The gh login and `~/.ssh/github-auth.pub` are shared by the whole Mac, so only the personal
-  instance rotates them: a profile gets no rotate job, `first-rotation` is skipped, and `bin/rotate` refuses.
+- **No rotation.** `~/.ssh/github-auth.pub` and the personal gh login belong to the personal instance, so only it
+  rotates them: a profile gets no rotate job, `first-rotation` is skipped, and `bin/rotate` refuses.
+- **Its own gh login.** In a profile, gitzilla runs `gh` with `GH_CONFIG_DIR=~/.config/gitzilla/<name>/gh` (and
+  without any `GH_TOKEN` / `GITHUB_TOKEN` from the environment), never with the personal login. The `prereqs` step of
+  a profile asks for that login's token (see "Set up an org Worker"); renew it the same way when it expires.
+- **Notifications name the profile.** Mac notifications and the restore dialog of a profile are titled
+  `gitzilla (<name>)` (for example `gitzilla (org-acme): CRITICAL`), so they are told apart from the personal ones.
 - **No hook.** The global pre-push hook belongs to the personal instance: the `hook` step is skipped in a profile. Its
   push note always uses the personal config (and its `ORG_WORKERS`, below), even if `GITZILLA_PROFILE`,
   `GITZILLA_CONFIG_DIR` or `GITZILLA_STATE_DIR` is exported in the shell you push from.
@@ -209,7 +230,8 @@ In short:
 2. Each member (the admin too) runs `./install.sh --join-org <url>` from their personal install and tells the admin
    the fingerprint it prints, in person or over a channel the admin trusts.
 3. The admin approves each one: `GITZILLA_PROFILE=org-acme bin/org approve <login> <fingerprint>`.
-4. Bots that push to the org's repos are allowed with `bin/org allow-bot`; web-UI commits follow the web-flow setting.
+4. GitHub App bots (`dependabot[bot]`, ...) are always silent unless they force-push; machine-user accounts are
+   allowed with `bin/org allow-bot`; web-UI commits follow the web-flow setting.
 
 ### Join an org (members)
 
@@ -244,7 +266,7 @@ one of the Worker's admin keys:
 GITZILLA_PROFILE=<org-profile> bin/org list
 GITZILLA_PROFILE=<org-profile> bin/org approve <login> <fingerprint>
 GITZILLA_PROFILE=<org-profile> bin/org revoke <login> [<fingerprint>]
-GITZILLA_PROFILE=<org-profile> bin/org allow-bot <login>       # e.g. dependabot[bot]
+GITZILLA_PROFILE=<org-profile> bin/org allow-bot <login>       # a machine-user account, e.g. acme-ci
 GITZILLA_PROFILE=<org-profile> bin/org disallow-bot <login>
 ```
 
@@ -254,7 +276,15 @@ GITZILLA_PROFILE=<org-profile> bin/org disallow-bot <login>
   entry proves nothing about who sent it: approve only a fingerprint the member gave you directly (the one
   `--join-org` printed for them), and only if it matches the pending entry for that login exactly.
 - `revoke <login>` removes every key of that login and clears its pending requests; with a fingerprint, only that key
-  (or that pending request). Use it for a departing member, a lost Mac, or a request you did not expect.
+  (or that pending request). Use it for a departing member, a lost Mac, or a request you did not expect. A note the
+  member's key sent before the revoke stays valid for its 10 minutes: a push of that exact commit to that ref by that
+  login within those 10 minutes is still silent. After a revoke for a suspected compromise, check the alerts and the
+  org's repos for pushes by that login in the following 10 minutes.
+- `allow-bot <login>` / `disallow-bot <login>` add or remove a machine-user account (a normal GitHub user account
+  that a CI system pushes with) whose non-forced pushes are silent. They have no effect on GitHub App bots (see "Bots
+  and the web UI").
+- Logins are GitHub logins, lower-cased; `_` is accepted for Enterprise Managed Users (`<user>_<shortcode>`), up to
+  39 characters.
 - On an error the command prints the Worker's message (for example `no such pending enrollment`) and exits non-zero.
 
 ### Set up an org Worker (admins)
@@ -276,15 +306,42 @@ from the profile's config, never from the environment.
 
 | Step | In the org profile |
 |---|---|
+| `prereqs` | as in the personal install, plus the profile's own gh login (see "The profile's gh token" below): it shows the token settings, opens GitHub's new-token page and reads the token hidden. A login already in the profile is kept unless you type `replace` |
 | `note-key` | paste the **same** `push-note` public key as your personal install. It becomes the org Worker's only admin key (`ADMIN_PUBKEYS`). It must be a single `ecdsa-sha2-nistp256` line (Secretive's keys are): the Worker trusts no admin key at all when that value is malformed, so the `worker` step checks it and refuses before it deploys anything |
 | `worker` | deploys a separate Worker named `gitzilla-<org>` with `MODE=org`, `ORG=<org>`, `ADMIN_PUBKEYS=<your push-note key>` and `WEB_FLOW` (below). Every `wrangler deploy` and `wrangler secret` command carries `--name gitzilla-<org>`, so the personal Worker `gitzilla` is never touched. The org Worker gets its own webhook secret, ntfy topic, optional Slack URL and optional call numbers and token, asked and piped exactly as in the personal install. The config (`~/.config/gitzilla/org-<org>/config`) holds `OWNER=<org>`, `MODE=org`, `ORG`, `WORKER_NAME`, `WEB_FLOW` and the Worker URL. To remove an optional secret later: `npx wrangler secret delete <NAME> --name gitzilla-<org>` |
-| `github-app` | create the app `gitzilla-<org>` (cut to 34 characters) in the organization's settings (`https://github.com/organizations/<org>/settings/apps/new`, which needs an org owner), "Only on this account", then install it on the organization with access to **all** repositories. The drill repo is `<org>/gitzilla-drill`; when it does not exist, the installer creates it (private) only after you answer `y` |
-| `repos`, `mirrors` | every repository `gh repo list <org>` returns, mirrored in `~/.local/state/gitzilla/org-<org>/mirrors/`. The `repos` step also asks GitHub whether your account can push to a sample of up to 3 of them and warns about those it cannot (restore would skip them) |
+| `github-app` | create the app `gitzilla-<org>` (cut to 34 characters) in the organization's settings (`https://github.com/organizations/<org>/settings/apps/new`, which needs an org owner), "Only on this account", then install it on the organization with access to **all** repositories. The drill repo is `<org>/gitzilla-drill`; when it does not exist, the installer opens the org's new-repository page and you create it there (private, with a README): the profile's gh token is read-only and cannot create it |
+| `repos`, `mirrors` | every repository `gh repo list <org>` returns (with the profile's token), mirrored in `~/.local/state/gitzilla/org-<org>/mirrors/`. The `repos` step also asks GitHub whether your account can push to a sample of up to 3 of them and warns about those it cannot (restore would skip them with `no push permission`) and about those the token cannot see (`repo not visible to org token`) |
 | `launchd` | the profile's agent and reconcile jobs (no rotate job). The org's reconcile checks for missed webhooks only: an organization has no SSH keys, and your own account keys stay with your personal install |
 | `self-test` | the same rows, pushed from a Mac that joined the org (yours, once you have joined and approved yourself) |
 
-Then join your own org from your personal install (`./install.sh --join-org <url>`) and approve yourself with
-`bin/org approve`, like any member: the admin key signs admin commands, a member key signs push notes.
+Then join your own org from your personal install (`./install.sh --join-org <url>`) and approve your own key with
+`GITZILLA_PROFILE=org-<org> bin/org approve <your-login> <fingerprint>`, like any member: the admin key signs admin
+commands, a member key signs push notes. **Restore needs this**: its note goes to the org Worker's `/note`, which
+accepts member keys only, so until you have joined and approved yourself every ref is skipped with
+`could not send note (worker returned 401)`. `./install.sh --org` ends by saying so.
+
+One admin for now: the installer deploys `ADMIN_PUBKEYS` with exactly one key, the `push-note` key of the Mac that runs
+`./install.sh --org`, and every rerun of its `worker` step deploys it again with that one key, replacing whatever was
+there. The Worker itself accepts up to 3 admin keys, but the installer has no way to set more than one yet: if a
+second person runs `--org` (or redeploys) for the same Worker, their key replaces yours and you are locked out of
+`bin/org` until you rerun the `worker` step from your Mac.
+
+The profile's gh token: the org profile never uses your personal gh login (its fine-grained token belongs to your
+user and cannot see the org's private repos). The `prereqs` step asks for a separate fine-grained personal access
+token, stored by gh in `~/.config/gitzilla/org-<org>/gh` only (`gh auth login --with-token` on stdin,
+`--insecure-storage`, so it is gh's `hosts.yml` in that directory, mode 700, and never the macOS keychain entry of your
+personal login):
+
+- Resource owner: the organization (not your user). If the org requires approval of fine-grained tokens, an owner
+  approves it.
+- Repository access: All repositories.
+- Permissions: Repository > Contents: **Read-only** and Repository > Metadata: **Read-only**, nothing else. Grant no
+  write permission of any kind: no stored credential may be able to push. Restore does not use this token to push; it
+  pushes over SSH with your `github-auth` key (Touch ID), as in the personal install.
+- Expiry: your choice. When it expires, `gh` calls in the profile fail (the `repos` step finds nothing, and restore
+  skips refs with `repo not visible to org token`); renew with
+  `GITZILLA_PROFILE=org-<org> GITZILLA_INSTALL_STOP_AFTER=prereqs ./install.sh --from-step prereqs` (type `replace`
+  if it asks).
 
 What the admin's GitHub account needs:
 
@@ -292,8 +349,11 @@ What the admin's GitHub account needs:
 - Push access to every repository restore should put back, and the right to bypass the branch protection rules or
   rulesets of those branches (restore force-pushes with `--force-with-lease`). Before it sends a note or pushes, restore
   in the org profile asks GitHub (`gh api repos/<repo>`, `.permissions.push` or `.permissions.admin`) whether your
-  account may push; when it may not (or gh fails or takes over 15 s), every ref of that repository is skipped with
-  `no push permission`, and that reason shows in the restore report.
+  account may push, with the profile's gh token. When GitHub answers 404, 403 or 401 (the token does not see the
+  repository, or has expired), every ref of that repository is skipped with `repo not visible to org token`; when
+  your account may not push (or gh fails or takes over 15 s), with `no push permission`. The reason shows in the
+  restore report.
+- Your own member key approved in the org (above): restore's note is signed by it.
 - The members' commit-signing keys, in the org profile's own signers file `~/.config/gitzilla/org-<org>/allowed_signers`
   (the `worker` step prints the format): one line per key, `<login> namespaces="git" <key type> <base64 key>`, for
   example from `https://api.github.com/users/<login>/ssh_signing_keys` after checking each key with its owner. The org
@@ -304,11 +364,27 @@ What the admin's GitHub account needs:
   - Without it (missing, or only comments): the deep check skips signatures, so the Worker's alert level stands and
     no restore dialog comes from signatures (a payload hit still turns red), and restore skips every ref it would
     rewind with `no org signers file`.
+  - Web-UI merges: with `WEB_FLOW=orange` (the default) a push made in GitHub's web UI is deep-checked, and its
+    commits are committed and signed by GitHub's `web-flow` key, which is not in this file. So every pull request
+    merged in the web UI is `unsigned`, turns red and opens a restore dialog on your Mac (answer **Ignore** when it was
+    a legitimate merge). Adding GitHub's web-flow signing key to this file does not help: GitHub signs web commits
+    with a GPG key (`https://github.com/web-flow.gpg`), and this file lists SSH keys only. To stop these dialogs, set
+    `WEB_FLOW=silent` (below; a forced push is still red), or keep the default and answer **Ignore** for your own
+    merges.
+- Restoring a member's push: a member's commits reach your Mac only through the org mirrors (no pre-push hook of
+  yours copies them in). The org profile's agent therefore also fetches the mirrors of repos that had only silent
+  pushes in each poll, so the commit a branch should go back to is normally local. If it is not (an attacker
+  overwrote it before the next poll), restore fetches that one commit from GitHub by its id before giving up with
+  `old commit not available locally`.
 
 Bots and the web UI:
 
-- Bot pushes (`dependabot[bot]`, `github-actions[bot]`, ...) carry no note. `bin/org allow-bot <login>` silences the
-  non-forced pushes of that bot; a forced push is never silenced, by any rule.
+- GitHub App senders (GitHub reports the pusher with `sender.type` `Bot`: `dependabot[bot]`, `github-actions[bot]`,
+  `renovate[bot]`, any installed App) carry no note and are **always silent unless the push is forced**; a forced push
+  is never silenced, by any rule, and is red. `bin/org allow-bot` / `disallow-bot` only affect machine-user accounts
+  (ordinary user accounts used by CI): `allow-bot <login>` silences their non-forced pushes, `disallow-bot` makes
+  them alert again. Neither command changes anything for an App. To stop a compromised App, uninstall it or revoke
+  its repository access in the organization's settings (`https://github.com/organizations/<org>/settings/installations`).
 - Commits made in GitHub's web UI (merges, edits) carry no note either. `WEB_FLOW` decides what a push whose every
   commit is by GitHub's `web-flow` gets: `orange` (the default) or `silent` (never for a forced push). Set it with
   `GITZILLA_WEB_FLOW=silent ./install.sh --org <org> --from-step worker` (press Enter to keep the secrets); the value is
@@ -328,7 +404,8 @@ Bots and the web UI:
   per hour per number. ntfy Pro plans also cap calls per day (see their pricing page); calls beyond the quota fail
   quietly, and push and Slack still arrive. A failing call never blocks the push or Slack alert.
 - `bin/notify-test` sends a signed test alert (`🔴 gitzilla: test alert`) to every channel and prints
-  `test alert sent` or why it failed. Run it after changing a channel.
+  `test alert sent` or why it failed. Run it after changing a channel. For an org Worker:
+  `GITZILLA_PROFILE=org-<org> bin/notify-test`. After an upgrade, redeploy first (Upgrading, above).
 - Push alerts list, per event, `Repo`, `Ref` (with `(forced)`), `Commits` (short SHAs), `Time` and `Flags`. An org
   Worker adds `Pusher: <login>` (the GitHub account that pushed, as GitHub reports it; `Pusher: unknown` when GitHub
   sent none). Org flags include `unenrolled` (the pusher is not a member), `no-note` (a member pushed without a note),
@@ -351,6 +428,7 @@ rotation and restore dialogs. Each row says what must happen.
 | Red alert + restore dialog for a GitHub web-UI merge or a bot commit | gitzilla only trusts commits signed by keys in your `allowed_signers`; GitHub's web-flow signature is not trusted, so these commits count as unsigned | If it was your own merge or your bot, choose **Ignore** |
 | "Restore N branches?" dialog | The agent found rewritten branches | **Restore** pushes the old tips back from the mirrors (`--force-with-lease`; branches that moved on are skipped and listed). **Details** shows them. **Ignore** does nothing. A typical incident costs up to 2 Touch IDs: one for the agent's deep check, and one for the restore push if you answer the dialog more than 2 minutes later |
 | Restore skipped "no push permission" (org profile) | Your account cannot push to that org repository, so restore sent no note and pushed nothing | Ask an org owner to restore it, or get push (and bypass) access and run `GITZILLA_PROFILE=org-<org> bin/restore --prompt <incident-file>` again |
+| Restore skipped "repo not visible to org token" (org profile) | The org profile's gh token got 404/403/401 for that repository: it does not cover the repo, the org has not approved it, or it expired. Restore sent no note and pushed nothing | Renew or widen the token (`GITZILLA_PROFILE=org-<org> GITZILLA_INSTALL_STOP_AFTER=prereqs ./install.sh --from-step prereqs`, type `replace`), then run `GITZILLA_PROFILE=org-<org> bin/restore --prompt <incident-file>` again |
 | Restore skipped "restore target not verified — review manually" | The commit a branch would go back to is not signed by your key (for example the attacker's first push was never deep-checked) | Find the last good commit yourself and use the manual restore below |
 | "N event(s) were lost while this Mac was offline" | The Mac was offline longer than the Worker keeps events (7 days) | Check the phone (and Slack) alerts for that period and run `bin/reconcile all` |
 | "Worker unreachable" notification | Health check failing for over an hour | Check the Cloudflare dashboard; `curl $GITZILLA_URL/health` |
@@ -408,6 +486,7 @@ stolen token short-lived, so there is no longer snooze).
 | GitHub App private key | **Not kept.** GitHub requires one to install the app and stores only the public half; the downloaded `.pem` is deleted right after install | nothing |
 | Cloudflare login | **Not kept.** `wrangler logout` after each deploy, checked on disk | nothing |
 | `gh` token | `gh`'s own credential store; fine-grained PAT, 7-day expiry, rotated every 5 days; Contents and Metadata read-only (plus pull requests and issues) | Usable for at most 7 days; it cannot push, and any push it could cause would raise an alert anyway |
+| Org profile `gh` token | gh's own store in the profile, `~/.config/gitzilla/org-<org>/gh/hosts.yml` (mode 700 directory); fine-grained PAT owned by the org, Contents and Metadata read-only, expiry chosen by the admin, not rotated | Read the org's code until it expires or is revoked (at https://github.com/settings/personal-access-tokens); it cannot push or change anything |
 
 What is stored where: `~/.config/gitzilla/config` (mode 600) holds only non-secret settings (login, joined org Workers,
 Worker URL, app name, drill repo, paths) and `push-note.pub`. `~/.local/state/gitzilla/` holds the queue

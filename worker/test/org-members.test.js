@@ -108,7 +108,13 @@ describe("members.js", () => {
     expect(cleanLogin("-a")).toBeNull();
     expect(cleanLogin("a".repeat(40))).toBeNull();
     expect(cleanLogin("a".repeat(39))).toBe("a".repeat(39));
-    expect(cleanLogin("a_b")).toBeNull();
+    // Enterprise Managed Users: <user>_<shortcode>
+    expect(cleanLogin("Octo_Acme")).toBe("octo_acme");
+    expect(cleanLogin("_a")).toBeNull();
+    expect(cleanLogin("a".repeat(37) + "_b")).toBe("a".repeat(37) + "_b");
+    expect(cleanLogin("a".repeat(38) + "_b")).toBeNull();
+    expect(cleanLogin("a_b!")).toBeNull();
+    expect(cleanBotLogin("Octo_Acme")).toBe("octo_acme");
     expect(cleanLogin("dependabot[bot]")).toBeNull();
     expect(cleanBotLogin("Dependabot[bot]")).toBe("dependabot[bot]");
   });

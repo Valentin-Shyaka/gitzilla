@@ -10,9 +10,10 @@ export const PENDING_TTL_MS = 7 * 86_400_000;
 export const ENROLL_PER_HOUR = 10;
 export const ENROLL_GLOBAL_PER_HOUR = 100;
 
-const LOGIN_RE = /^[a-z0-9](?:[a-z0-9-]{0,38})$/;
+// "_" appears in Enterprise Managed Users' logins (<user>_<shortcode>)
+const LOGIN_RE = /^[a-z0-9](?:[a-z0-9_-]{0,38})$/;
 // GitHub App bots push as "<name>[bot]"
-const BOT_RE = /^[a-z0-9](?:[a-z0-9-]{0,38})(?:\[bot\])?$/;
+const BOT_RE = /^[a-z0-9](?:[a-z0-9_-]{0,38})(?:\[bot\])?$/;
 const FP_RE = /^SHA256:[A-Za-z0-9+/]{43}$/;
 const NONCE_RE = /^[0-9a-f]{32}$/;
 

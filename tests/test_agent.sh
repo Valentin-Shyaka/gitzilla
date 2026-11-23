@@ -336,7 +336,44 @@ ev 1 alice/app refs/heads/main $BASE $SIGNED warning | set_events
 poll
 assert_contains "$(jq -c '.[0].flags' "$STATE/incidents/1.json")" unsigned "org: only the profile's file counts (admin's ALLOWED_SIGNERS_FILE / git file ignored)"
 git config --global --unset gpg.ssh.allowedSignersFile
+# org: a member's silent push is synced into the mirror (its tip is local for a later restore), with no incident
+WBR="$(git -C "$W" rev-parse --abbrev-ref HEAD)"
+git -C "$W" checkout -q -b member-silent "$BASE"
+echo m > "$W/m.txt"; git -C "$W" add m.txt; GC -C "$W" commit -q -m member-silent
+MSIL="$(git -C "$W" rev-parse HEAD)"
+reset_state
+git clone -q --mirror "$T/remotes/alice/app.git" "$STATE/mirrors/alice__app.git"
+git -C "$W" push -q "$T/remotes/alice/app.git" member-silent
+ev 1 alice/app refs/heads/member-silent $Z $MSIL silent | set_events
+poll
+assert_eq 0 "$(cat "$T/rc")" "org silent push: exit 0"
+assert_eq "$MSIL" "$(git -C "$STATE/mirrors/alice__app.git" rev-parse -q --verify "$MSIL^{commit}" 2>/dev/null)" "org silent push: the member's commit is in the mirror"
+assert_eq "no" "$(ls "$STATE/incidents" 2>/dev/null | grep -q . && echo yes || echo no)" "org silent push: no incident"
+assert_eq 0 "$(nlines "$T/notify.log")" "org silent push: no notification"
+# a repo with no mirror yet is cloned; a failed sync is only logged
+reset_state
+ev 1 alice/app refs/heads/member-silent $Z $MSIL silent | set_events
+poll
+[ -d "$STATE/mirrors/alice__app.git" ] && _ok || _bad "org silent push: mirror cloned"
+reset_state
+ev 1 alice/nope refs/heads/main $Z $MSIL silent | set_events
+poll
+assert_eq 0 "$(cat "$T/rc")" "org silent push, sync fails: exit 0"
+assert_eq 1 "$(cat "$STATE/queue-cursor")" "org silent push, sync fails: cursor moves"
+assert_contains "$(cat "$STATE/log/gitzilla.log")" "mirror sync failed for alice/nope (silent pushes)" "org silent push, sync fails: logged"
 rm -f "$OSIG"; cp "$T/config.personal" "$GITZILLA_CONFIG_DIR/config"
+# personal: a silent push does not touch the mirror (the pre-push hook copies the owner's commits in)
+reset_state
+git clone -q --mirror "$T/remotes/alice/app.git" "$STATE/mirrors/alice__app.git"
+git -C "$W" checkout -q -b personal-silent "$BASE"
+echo p > "$W/p.txt"; git -C "$W" add p.txt; GC -C "$W" commit -q -m personal-silent
+PSIL="$(git -C "$W" rev-parse HEAD)"
+git -C "$W" push -q "$T/remotes/alice/app.git" personal-silent
+ev 1 alice/app refs/heads/personal-silent $Z $PSIL silent | set_events
+poll
+assert_eq no "$(git -C "$STATE/mirrors/alice__app.git" cat-file -e "$PSIL^{commit}" 2>/dev/null && echo yes || echo no)" "personal silent push: mirror not synced (unchanged)"
+git -C "$W" push -q "$T/remotes/alice/app.git" :member-silent :personal-silent
+git -C "$W" checkout -q "$WBR"
 # MODE=org in the environment (no profile config) changes nothing for the personal instance
 reset_state
 ev 1 alice/app refs/heads/main $SIGNED $UNSIGNED warning | set_events

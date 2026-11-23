@@ -10,7 +10,9 @@
 #
 # --org <org-login>: the profile org-<login> (lower-cased) in org mode. Its steps are
 #   prereqs note-key worker github-app repos mirrors launchd self-test
-# (no hook, known-keys or first-rotation). The worker step deploys the Worker named gitzilla-<login> (every wrangler
+# (no hook, known-keys or first-rotation). In any profile the prereqs step sets up the profile's own gh login
+# (profile_gh_login: a read-only fine-grained token owned by the org, in GH_CONFIG_DIR=<profile config>/gh); the
+# github-app step has the admin create a missing drill repo on GitHub (that token cannot). The worker step deploys the Worker named gitzilla-<login> (every wrangler
 # deploy and secret call carries --name gitzilla-<login>, never touching the personal Worker "gitzilla") with
 # --var MODE:org --var ORG:<login> --var ADMIN_PUBKEYS:<the push-note key> and writes OWNER=<login>, MODE=org,
 # ORG=<login>, WORKER_NAME and WEB_FLOW into the profile's config. GITZILLA_WEB_FLOW=orange|silent (default: the
@@ -49,7 +51,9 @@ done
 unset _args _i
 if [ "$org_set" = 1 ]; then
   ORG_LOGIN="$(printf '%s' "$ORG_LOGIN" | tr '[:upper:]' '[:lower:]')"
-  _re='^[a-z0-9][a-z0-9-]{0,38}$' # the Worker's LOGIN_RE (WD_LOGIN_RE)
+  # an organization login: letters, digits, hyphens (GitHub allows no "_" in org names, unlike WD_LOGIN_RE for users),
+  # and it must fit the profile name org-<login>
+  _re='^[a-z0-9][a-z0-9-]{0,38}$'
   [[ $ORG_LOGIN =~ $_re ]] || { printf 'install: --org needs the organization'"'"'s GitHub login (1-39 letters, digits or hyphens, not starting with a hyphen)\n%s\n' "$USAGE" >&2; exit 2; }
   unset _re
   # the profile name org-<login> must be a valid profile name (at most 40 characters), the Worker name at most 63
@@ -145,13 +149,60 @@ app_name_for() {
 }
 
 # ---------------------------------------------------------------------------------------------------------------
+# profile_gh_login: a profile's own gh login (bin/lib.sh exports GH_CONFIG_DIR=<profile config>/gh in a profile), so
+# its gh calls (repo list, the restore push-permission check) never use the personal login: a fine-grained token has
+# one resource owner, and the personal one (the user) cannot see an org's private repos. The admin creates a READ-ONLY
+# fine-grained token owned by the org; it is read hidden and given to `gh auth login --with-token` on stdin, stored by
+# gh in GH_CONFIG_DIR only (--insecure-storage: hosts.yml there, mode 600, never the macOS keychain entry the personal
+# login uses for the same account). Never in argv, the log or any other file. A login already there is kept unless the
+# admin types replace (an expired token: gh auth status fails, so it is asked for again).
+GH_TOKEN_RE='^github_pat_[A-Za-z0-9_]{20,255}$'
+profile_gh_login() {
+  local ans tok owner="${ORG_LOGIN:-the account this profile watches}"
+  { mkdir -p "$GH_CONFIG_DIR" && chmod 700 "$GH_CONFIG_DIR"; } || die "cannot create $GH_CONFIG_DIR"
+  if "$GH" auth status >/dev/null 2>&1 </dev/null; then
+    say "gh: profile $GITZILLA_PROFILE has its own login ($GH_CONFIG_DIR)."
+    printf 'Press Enter to keep it, or type replace to give it a new token: '
+    read -r ans || ans=""
+    [ "$ans" = replace ] || return 0
+  fi
+  say "Profile $GITZILLA_PROFILE needs its own READ-ONLY GitHub token (your personal gh login cannot see the private"
+  say "repos of $owner). Create a fine-grained personal access token:"
+  say "  Token name        : gitzilla $GITZILLA_PROFILE (read-only)"
+  say "  Resource owner    : $owner   (the organization, NOT your user)"
+  say "  Expiration        : your choice; when it expires, rerun:"
+  say "                        GITZILLA_PROFILE=$GITZILLA_PROFILE GITZILLA_INSTALL_STOP_AFTER=prereqs ./install.sh --from-step prereqs"
+  say "  Repository access : All repositories"
+  say "  Permissions       : Repository > Contents: Read-only"
+  say "                      Repository > Metadata: Read-only"
+  say "                      NOTHING else. Grant no write permission of any kind (no Contents: Read and write, no"
+  say "                      Administration, no Workflows): no credential gitzilla stores may be able to push."
+  say "If the organization requires approval of fine-grained tokens, an owner must approve it before it works."
+  "$OPEN" "https://github.com/settings/personal-access-tokens/new" >/dev/null 2>&1 || true
+  printf 'Paste the token (github_pat_..., input hidden): '
+  if read -rs tok; then echo; else echo; tok=""; fi
+  if ! [[ $tok =~ $GH_TOKEN_RE ]]; then
+    tok=""; die "that is not a fine-grained token (github_pat_...); rerun --from-step prereqs"
+  fi
+  if ! printf '%s' "$tok" | "$GH" auth login --hostname github.com --with-token --insecure-storage >/dev/null 2>&1; then
+    tok=""; die "gh auth login with that token failed (expired, not approved by the org, or mistyped); rerun --from-step prereqs"
+  fi
+  tok=""
+  "$GH" auth status >/dev/null 2>&1 </dev/null || die "gh in profile $GITZILLA_PROFILE is still not logged in; rerun --from-step prereqs"
+  say "gh: profile $GITZILLA_PROFILE logged in with its own read-only token (stored by gh in $GH_CONFIG_DIR)"
+}
+
 step_prereqs() {
   local c
   for c in git jq curl openssl ssh-keygen node plutil awk sed; do need "$c"; done
   for c in "$GH" "$NPM" "$NPX" "$OPEN" "$LAUNCHCTL"; do need "$c"; done
   [ -d "$SECRETIVE_APP" ] || die "Secretive is not installed ($SECRETIVE_APP)"
   [ -f "$here/worker/package.json" ] || die "worker/ not found next to install.sh"
-  "$GH" auth status >/dev/null 2>&1 || die "gh is not logged in: run 'gh auth login' first"
+  if [ -n "$GITZILLA_PROFILE" ]; then
+    profile_gh_login
+  else
+    "$GH" auth status >/dev/null 2>&1 || die "gh is not logged in: run 'gh auth login' first"
+  fi
   local ghauth="$HOME/.ssh/github-auth.pub"
   if [ ! -s "$ghauth" ] || ! head -n1 "$ghauth" | grep -Eq "$KEY_RE"; then
     cat >&2 <<'EOF'
@@ -556,6 +607,16 @@ EOF
   done
 
   say ""
+  if [ "$ORG_MODE" = 1 ] && ! "$GH" repo view "$OWNER/$DRILL_REPO" >/dev/null 2>&1 </dev/null; then
+    # the profile's gh token is read-only: the admin creates the drill repo in the org on GitHub
+    say "The drill repo $OWNER/$DRILL_REPO does not exist. The installer and the drill push to it (never to a real repo)."
+    say "Create it on GitHub (the profile's gh token is read-only and cannot): owner $OWNER, name $DRILL_REPO, Private,"
+    say "  \"Add a README file\" ticked:  https://github.com/organizations/$OWNER/repositories/new"
+    "$OPEN" "https://github.com/organizations/$OWNER/repositories/new" >/dev/null 2>&1 || true
+    wait_enter "Press Enter once $OWNER/$DRILL_REPO exists."
+    "$GH" repo view "$OWNER/$DRILL_REPO" >/dev/null 2>&1 </dev/null \
+      || die "$OWNER/$DRILL_REPO is not visible to the profile's gh token: create it (the token's \"All repositories\" access then covers it), then rerun --from-step github-app"
+  fi
   if ! "$GH" repo view "$OWNER/$DRILL_REPO" >/dev/null 2>&1 </dev/null; then
     say "The drill repo $OWNER/$DRILL_REPO does not exist. The installer and the drill push to it (never to a real repo)."
     ask_yes "Create it now as a private repo (gh repo create $OWNER/$DRILL_REPO --private --add-readme)?" \
@@ -748,20 +809,31 @@ step_repos() {
 # push_sample <repos.txt lines>: org mode. Restore needs push access to put a ref back; ask GitHub for a sample of up to
 # 3 repos and warn about those this account cannot push to (restore skips them with "no push permission").
 push_sample() {
-  local slug _vis v no="" n=0
+  local slug _vis v no="" hidden="" n=0 err
+  err="$(mktemp)" || die "mktemp failed"
   while read -r slug _vis; do
     [ -n "$slug" ] || continue
     n=$((n + 1)); [ "$n" -le 3 ] || break
-    v="$(wd_timeout "${GITZILLA_GH_TIMEOUT:-15}" "$GH" api "repos/$slug" --jq '.permissions.push // .permissions.admin' 2>/dev/null)" || v=no
+    v="$(wd_timeout "${GITZILLA_GH_TIMEOUT:-15}" "$GH" api "repos/$slug" --jq '.permissions.push // .permissions.admin' 2>"$err")" || v=no
     v="${v%%$'\n'*}"
-    [ "$v" = true ] || no="${no:+$no }$slug"
+    if [ "$v" != true ]; then
+      case "$(cat "$err")" in
+        *"(HTTP 404)"*|*"(HTTP 403)"*|*"(HTTP 401)"*) hidden="${hidden:+$hidden }$slug" ;;
+        *) no="${no:+$no }$slug" ;;
+      esac
+    fi
   done <<EOF
 $1
 EOF
+  rm -f "$err"
+  if [ -n "$hidden" ]; then
+    say "WARNING: the profile's gh token cannot see: $hidden. Restore skips such repos with \"repo not visible to org"
+    say "  token\": give the token access to all of the organization's repositories (rerun --from-step prereqs, type replace)."
+  fi
   if [ -n "$no" ]; then
     say "WARNING: your account cannot push to: $no (sample of $((n > 3 ? 3 : n)) repos). Restore skips such repos with"
     say "  \"no push permission\": an org owner must give you push access (and the right to bypass branch protection)."
-  else
+  elif [ -z "$hidden" ]; then
     say "push access checked on a sample of repos: ok"
   fi
 }
@@ -1089,3 +1161,11 @@ for s in $STEPS; do
   [ "$s" = "${GITZILLA_INSTALL_STOP_AFTER:-}" ] && break
 done
 say "install finished."
+if [ "$ORG_MODE" = 1 ]; then
+  # restore sends its note to the org Worker's /note, which accepts member keys only (not the admin key as such)
+  say ""
+  say "IMPORTANT: join your own organization and approve your own key, or restore cannot send its note and skips every"
+  say "ref with \"could not send note (worker returned 401)\":"
+  say "  ./install.sh --join-org ${GITZILLA_URL:-<org-worker-url>}      (personal gitzilla, no GITZILLA_PROFILE)"
+  say "  GITZILLA_PROFILE=$GITZILLA_PROFILE bin/org approve <your-login> <the fingerprint --join-org printed>"
+fi

@@ -21,12 +21,20 @@ export GITZILLA_NODE_PATH_FILE="$T/node-path" # never write scanner/node-path in
 cat > "$S/gh" <<STUB
 #!/bin/sh
 echo "\$*" >> "$T/gh.log"
+echo "GH_CONFIG_DIR=\${GH_CONFIG_DIR:-} GH_TOKEN=\${GH_TOKEN:-} | \$*" >> "$T/gh.env"
 case "\$1 \$2" in
-  "auth status") [ -f "$T/gh.noauth" ] && exit 1; exit 0 ;;
+  "auth status") [ -f "$T/gh.noauth" ] && exit 1
+                 # a profile's own store (GH_CONFIG_DIR): logged in once "auth login" wrote it
+                 case "\${GH_CONFIG_DIR:-}" in *gitzilla*) [ -f "\$GH_CONFIG_DIR/hosts.yml" ] || exit 1 ;; esac
+                 exit 0 ;;
+  "auth login") tok="\$(cat)"; printf '%s' "\$tok" > "$T/gh.stdin"
+                [ -f "$T/gh.loginfail" ] && exit 1
+                mkdir -p "\$GH_CONFIG_DIR"; echo "oauth_token: (stub)" > "\$GH_CONFIG_DIR/hosts.yml"; exit 0 ;;
   "api user") if [ -f "$T/gh.login" ]; then cat "$T/gh.login"; else echo Alice; fi ;;
   "repo list") cat "$T/gh.repos" ;;
   "repo view") [ -f "$T/gh.norepo" ] && exit 1; exit 0 ;;
-  "api repos/"*) if [ -f "$T/gh.perm" ]; then cat "$T/gh.perm"; else echo true; fi ;;
+  "api repos/"*) if [ -f "$T/gh.404" ] && grep -qx "\$2" "$T/gh.404"; then echo "gh: Not Found (HTTP 404)" >&2; exit 1; fi
+                if [ -f "$T/gh.perm" ]; then cat "$T/gh.perm"; else echo true; fi ;;
   "repo create") [ -f "$T/gh.createfail" ] && exit 1; rm -f "$T/gh.norepo"; exit 0 ;;
 esac
 STUB
@@ -1270,6 +1278,7 @@ personal_snap() {
 }
 org_reset() {
   reset
+  rm -f "$T/gh.env"
   mkdir -p "$PCF" "$PSD/log" "$OC" "$HOME/Library/LaunchAgents"
   printf 'OWNER=Alice\nGITZILLA_URL=https://gitzilla.alice.workers.dev\nNOTE_PUBKEY_FILE=%s\n' "$PCF/push-note.pub" > "$PCF/config"
   echo personal-pub > "$PCF/push-note.pub"; echo self-test > "$PSD/install-step"; echo 7 > "$PSD/queue-cursor"
@@ -1399,9 +1408,11 @@ org_reset; mk_sign_key; mkdir -p "$HOME/Downloads"
 printf 'OWNER=acme\nGITZILLA_URL=https://gitzilla-acme.alice.workers.dev\nNOTE_PUBKEY_FILE=%s\nAPP_NAME=gitzilla-acme\nDRILL_REPO=gitzilla-drill\nMODE=org\nORG=acme\nWORKER_NAME=gitzilla-acme\n' "$OC/push-note.pub" > "$OC/config"
 touch "$T/gh.norepo"; rm -f "$T/gh.log" "$T/open.log"
 GITZILLA_INSTALL_STOP_AFTER=github-app oruni '\n\n' --org acme --from-step github-app
-assert_eq 1 "$(rc)" "org github-app: no drill repo and no yes -> stops"
-assert_contains "$(out)" "Create it now as a private repo (gh repo create acme/gitzilla-drill --private --add-readme)? [y/N]" "org github-app: asks before creating the drill repo in the org"
-assert_eq 0 "$(grep -c 'repo create' "$T/gh.log" | tr -d ' ')" "org github-app: no repo created without a yes"
+assert_eq 1 "$(rc)" "org github-app: no drill repo -> stops"
+assert_contains "$(out)" "Create it on GitHub (the profile's gh token is read-only and cannot): owner acme, name gitzilla-drill, Private," "org github-app: the admin creates the drill repo on GitHub"
+assert_contains "$(cat "$T/open.log")" "https://github.com/organizations/acme/repositories/new" "org github-app: opens the org's new-repo page"
+assert_contains "$(out)" "is not visible to the profile's gh token" "org github-app: still missing -> says why"
+assert_eq 0 "$(grep -c 'repo create' "$T/gh.log" | tr -d ' ')" "org github-app: gh never creates a repo (read-only token)"
 assert_contains "$(out)" "https://github.com/organizations/acme/settings/apps/new" "org github-app: the org's new-app page"
 assert_contains "$(cat "$T/open.log")" "https://github.com/organizations/acme/settings/apps/new" "org github-app: opens the org's new-app page"
 assert_contains "$(out)" "GitHub App name   : gitzilla-acme" "org github-app: app name gitzilla-<org>"
@@ -1412,9 +1423,10 @@ assert_contains "$(out)" "install the app on the organization acme" "org github-
 assert_contains "$(out)" "All repositories" "org github-app: all repos"
 echo '[{"seq":3,"repo":"acme/gitzilla-drill","ref":"refs/heads/main"}]' > "$T/curl/late.json"; echo 1 > "$T/curl/late.after"; echo '[]' > "$T/curl/queue.json"
 rm -f "$T/queue.urls"
-GITZILLA_INSTALL_STOP_AFTER=github-app oruni '\ny\n' --org acme --from-step github-app
-assert_eq 0 "$(rc)" "org github-app: ok after the yes ($(tail -n1 "$T/out"))"
-assert_contains "$(cat "$T/gh.log")" "repo create acme/gitzilla-drill --private --add-readme" "org github-app: drill repo created in the org"
+rm -f "$T/gh.norepo" "$T/gh.log"
+GITZILLA_INSTALL_STOP_AFTER=github-app oruni '\n' --org acme --from-step github-app
+assert_eq 0 "$(rc)" "org github-app: ok once the drill repo exists ($(tail -n1 "$T/out"))"
+assert_eq 0 "$(grep -c 'repo create' "$T/gh.log" | tr -d ' ')" "org github-app: no gh repo create"
 assert_contains "$(out)" "./install.sh --join-org https://gitzilla-acme.alice.workers.dev" "org github-app: the orange alert is expected until the admin joined"
 assert_eq 3 "$(cat "$OS/queue-cursor" 2>/dev/null)" "org github-app: cursor in the org profile"
 assert_contains "$(cat "$T/queue.urls")" "https://gitzilla-acme.alice.workers.dev/queue?after=" "org github-app: reads the org Worker's queue"
@@ -1448,5 +1460,69 @@ assert_eq 0 "$(rc)" "org repos without push: still ok (a warning)"
 assert_contains "$(out)" "WARNING: your account cannot push to: acme/app acme/site" "org repos without push: lists the repos"
 assert_contains "$(out)" '"no push permission"' "org repos without push: says what restore will do"
 rm -f "$T/gh.perm"
+# a repo the profile's token cannot see (404): its own warning and restore reason, not "cannot push"
+echo "repos/acme/site" > "$T/gh.404"
+GITZILLA_INSTALL_STOP_AFTER=repos oruni '' --org acme --from-step repos
+assert_eq 0 "$(rc)" "org repos, a repo hidden from the token: still ok (a warning)"
+assert_contains "$(out)" "WARNING: the profile's gh token cannot see: acme/site" "org repos 404: names the repo"
+assert_contains "$(out)" '"repo not visible to org' "org repos 404: says what restore will do"
+case "$(out)" in *"cannot push to"*|*"sample of repos: ok"*) _bad "org repos 404: not reported as push access" ;; *) _ok ;; esac
+rm -f "$T/gh.404"
+# every gh call of the org install runs with the profile's own gh store
+assert_eq "" "$(grep -v "^GH_CONFIG_DIR=$OC/gh GH_TOKEN= |" "$T/gh.env")" "org: every gh call uses GH_CONFIG_DIR=<profile config>/gh"
+
+# prereqs in the org profile: its own read-only gh login; the token goes to gh on stdin only
+org_reset; mk_ghauth; mkdir -p "$HOME/.config/git"; : > "$HOME/.config/git/allowed_signers"
+PAT="github_pat_$(printf 'Z%.0s' $(seq 60))"
+rm -f "$T/gh.log" "$T/gh.env" "$T/gh.stdin" "$T/open.log"
+GH_TOKEN=personal-env-token GITZILLA_INSTALL_STOP_AFTER=prereqs oruni "$PAT\n" --org acme --from-step prereqs
+assert_eq 0 "$(rc)" "org prereqs: ok ($(tail -n1 "$T/out"))"
+assert_contains "$(out)" "Resource owner    : acme   (the organization, NOT your user)" "org prereqs: the token is owned by the org"
+assert_contains "$(out)" "Repository > Contents: Read-only" "org prereqs: Contents read-only"
+assert_contains "$(out)" "Repository > Metadata: Read-only" "org prereqs: Metadata read-only"
+assert_contains "$(out)" "Grant no write permission of any kind" "org prereqs: no write permission"
+assert_contains "$(out)" "input hidden" "org prereqs: hidden input"
+assert_contains "$(cat "$T/open.log")" "https://github.com/settings/personal-access-tokens/new" "org prereqs: opens the token page"
+assert_eq "$PAT" "$(cat "$T/gh.stdin")" "org prereqs: the token reaches gh on stdin"
+assert_contains "$(cat "$T/gh.env")" "GH_CONFIG_DIR=$OC/gh GH_TOKEN= | auth login --hostname github.com --with-token --insecure-storage" "org prereqs: gh auth login into the profile's store, no inherited token"
+assert_eq "" "$(grep -v "^GH_CONFIG_DIR=$OC/gh GH_TOKEN= |" "$T/gh.env")" "org prereqs: every gh call uses the profile's store"
+assert_eq "" "$(grep -l "$PAT" "$T/gh.log" "$T/gh.env" "$T/out" "$T/open.log" 2>/dev/null)" "org prereqs: the token is in no argv and no output"
+assert_eq "" "$(grep -rl "$PAT" "$HOME" 2>/dev/null)" "org prereqs: the token is in no file under HOME (the stub's gh store holds none)"
+assert_eq 700 "$(stat -f %Lp "$OC/gh")" "org prereqs: the profile's gh dir is mode 700"
+personal_same "org prereqs"
+# rerun: the login is kept (no token asked) unless replace is typed
+rm -f "$T/gh.stdin"
+GITZILLA_INSTALL_STOP_AFTER=prereqs oruni "\n" --org acme --from-step prereqs
+assert_eq 0 "$(rc)" "org prereqs rerun: ok"
+assert_contains "$(out)" "has its own login" "org prereqs rerun: keeps the login"
+assert_eq no "$([ -e "$T/gh.stdin" ] && echo yes || echo no)" "org prereqs rerun: no new login"
+GITZILLA_INSTALL_STOP_AFTER=prereqs oruni "replace\n$PAT\n" --org acme --from-step prereqs
+assert_eq "$PAT" "$(cat "$T/gh.stdin" 2>/dev/null)" "org prereqs replace: new token on stdin"
+# refusals: not a fine-grained token, or gh refuses it
+rm -rf "$OC/gh"; rm -f "$T/gh.stdin"
+GITZILLA_INSTALL_STOP_AFTER=prereqs oruni "ghp_classictoken123456789012345678901234\n" --org acme --from-step prereqs
+assert_eq 1 "$(rc)" "org prereqs: a classic token is refused"
+assert_contains "$(out)" "not a fine-grained token" "org prereqs: says why"
+assert_eq no "$([ -e "$T/gh.stdin" ] && echo yes || echo no)" "org prereqs: a refused token never reaches gh"
+case "$(out)" in *ghp_classictoken*) _bad "org prereqs: the refused token is not echoed" ;; *) _ok ;; esac
+touch "$T/gh.loginfail"
+GITZILLA_INSTALL_STOP_AFTER=prereqs oruni "$PAT\n" --org acme --from-step prereqs
+assert_eq 1 "$(rc)" "org prereqs: gh login failure stops"
+assert_contains "$(out)" "gh auth login with that token failed" "org prereqs: gh login failure says why"
+rm -f "$T/gh.loginfail"
+# personal prereqs: gh's own login, no GH_CONFIG_DIR of ours
+rm -f "$T/gh.env"
+GITZILLA_INSTALL_STOP_AFTER=prereqs run --from-step prereqs
+assert_eq 0 "$(rc)" "personal prereqs: ok"
+assert_eq "GH_CONFIG_DIR= GH_TOKEN= | auth status" "$(cat "$T/gh.env")" "personal prereqs: gh auth status only, no profile store"
+
+# the org install's last words: the admin must join and approve themselves
+org_reset
+printf 'OWNER=acme\nGITZILLA_URL=https://gitzilla-acme.alice.workers.dev\nNOTE_PUBKEY_FILE=%s\nAPP_NAME=gitzilla-acme\nDRILL_REPO=gitzilla-drill\nMODE=org\nORG=acme\nWORKER_NAME=gitzilla-acme\n' "$OC/push-note.pub" > "$OC/config"
+oruni 'n\nn\nn\n' --org acme --from-step self-test
+assert_eq 0 "$(rc)" "org self-test: ok"
+assert_contains "$(out)" "join your own organization and approve your own key" "org final output: join and approve yourself"
+assert_contains "$(out)" "./install.sh --join-org https://gitzilla-acme.alice.workers.dev" "org final output: the join command"
+assert_contains "$(out)" "GITZILLA_PROFILE=org-acme bin/org approve <your-login>" "org final output: the approve command"
 
 finish

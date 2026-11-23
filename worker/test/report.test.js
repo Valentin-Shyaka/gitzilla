@@ -101,6 +101,16 @@ describe("POST /report", () => {
     expect(validReason("no org signers")).toBe(false);
     expect(validReason("no org signers file!")).toBe(false);
   });
+  it("allows the org restore reason 'repo not visible to org token' and nothing near it", () => {
+    expect(validReason("repo not visible to org token")).toBe(true);
+    expect(validReason("repo not visible to org token (gh: HTTP 404)")).toBe(true);
+    expect(validReason("repo not visible to org token!")).toBe(false);
+    expect(validReason("repo not visible")).toBe(false);
+    expect(validReason("Repo not visible to org token")).toBe(false);
+    const { body } = formatReport({ restored: [], skipped: [{ repo: "acme/app", ref: "refs/heads/main", reason: "repo not visible to org token" }], restored_total: 0, skipped_total: 1 });
+    expect(body).toContain("acme/app refs/heads/main: repo not visible to org token");
+    expect(body.endsWith(REVOKE)).toBe(true);
+  });
   it("renders the 'no push permission' skip in the report", () => {
     const { body } = formatReport({ restored: [], skipped: [{ repo: "acme/app", ref: "refs/heads/main", reason: "no push permission" }], restored_total: 0, skipped_total: 1 });
     expect(body).toContain("acme/app refs/heads/main: no push permission");

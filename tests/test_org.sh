@@ -166,6 +166,15 @@ cp "$T/cfg.keep" "$GITZILLA_CONFIG_DIR/config"
 hit="$(grep -rl "$FP_M" "$HOME" "$GITZILLA_STATE_DIR" 2>/dev/null | grep -v '/log/')"
 assert_eq "" "$hit" "join: nothing but the log mentions the fingerprint"
 
+# --- an Enterprise Managed User (OWNER with _) can join; the login keeps its _
+cp "$GITZILLA_CONFIG_DIR/config" "$T/cfg.emu"
+write_personal; sed -i.bak 's/^OWNER=.*/OWNER=Octo_Acme/' "$GITZILLA_CONFIG_DIR/config"
+join "$STUB_URL"
+assert_eq 0 "$(rc)" "join as an EMU login: ok ($(tail -n1 "$T/out"))"
+decode_last /enroll
+assert_eq octo_acme "$(jq -r .login "$T/payload")" "join as an EMU login: login lower-cased, _ kept"
+cp "$T/cfg.emu" "$GITZILLA_CONFIG_DIR/config"
+
 # --- bin/org
 : > "$STUB_LOG"
 o="$(bash "$ORG" list 2>&1)"; rc_=$?
@@ -199,10 +208,18 @@ assert_eq 2 "$(rc)" "approve without fingerprint: exit 2"
 assert_contains "$(out)" "needs the key's fingerprint" "approve without fingerprint: says why"
 org approve alice SHA256:short; assert_eq 2 "$(rc)" "approve with a bad fingerprint: exit 2"
 org approve -bad "$FP_M"; assert_eq 2 "$(rc)" "approve with a bad login: exit 2"
+org approve _bad "$FP_M"; assert_eq 2 "$(rc)" "approve with a login starting with _: exit 2"
+org approve "a$(printf 'b%.0s' $(seq 37))_c" "$FP_M"; assert_eq 2 "$(rc)" "approve with a 40-char login: exit 2"
 org frobnicate; assert_eq 2 "$(rc)" "unknown command: exit 2"
 org list extra; assert_eq 2 "$(rc)" "list with args: exit 2"
 assert_eq 1 "$(reqs /admin)" "bad usage: nothing sent"
 
+# Enterprise Managed Users: <user>_<shortcode>
+org approve Octo_Acme "$FP_M"
+assert_eq 0 "$(rc)" "approve an EMU login with _: ok"
+assert_eq "{\"cmd\":\"approve\",\"args\":{\"login\":\"octo_acme\",\"fingerprint\":\"$FP_M\"}}" "$(admin_payload)" "approve EMU login: payload lower-cased, _ kept"
+org allow-bot 'ci_bot'
+assert_eq '{"cmd":"allow-bot","args":{"login":"ci_bot"}}' "$(admin_payload)" "allow-bot: a machine user with _"
 org revoke Alice
 assert_eq 0 "$(rc)" "revoke login: ok"
 assert_eq '{"cmd":"revoke","args":{"login":"alice"}}' "$(admin_payload)" "revoke login: payload"
