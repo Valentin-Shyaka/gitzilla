@@ -24,11 +24,14 @@ echo "\$*" >> "$T/gh.log"
 echo "GH_CONFIG_DIR=\${GH_CONFIG_DIR:-} GH_TOKEN=\${GH_TOKEN:-} | \$*" >> "$T/gh.env"
 case "\$1 \$2" in
   "auth status") [ -f "$T/gh.noauth" ] && exit 1
+                 # the personal login (gh's default store), broken by a login that clobbered it
+                 [ -z "\${GH_CONFIG_DIR:-}" ] && [ -f "$T/gh.personal.broken" ] && exit 1
                  # a profile's own store (GH_CONFIG_DIR): logged in once "auth login" wrote it
                  case "\${GH_CONFIG_DIR:-}" in *gitzilla*) [ -f "\$GH_CONFIG_DIR/hosts.yml" ] || exit 1 ;; esac
                  exit 0 ;;
   "auth login") tok="\$(cat)"; printf '%s' "\$tok" > "$T/gh.stdin"
                 [ -f "$T/gh.loginfail" ] && exit 1
+                [ -f "$T/gh.clobber" ] && touch "$T/gh.personal.broken"
                 mkdir -p "\$GH_CONFIG_DIR"; echo "oauth_token: (stub)" > "\$GH_CONFIG_DIR/hosts.yml"; exit 0 ;;
   "api user") if [ -f "$T/gh.login" ]; then cat "$T/gh.login"; else echo Alice; fi ;;
   "repo list") cat "$T/gh.repos" ;;
@@ -1485,7 +1488,9 @@ assert_contains "$(out)" "input hidden" "org prereqs: hidden input"
 assert_contains "$(cat "$T/open.log")" "https://github.com/settings/personal-access-tokens/new" "org prereqs: opens the token page"
 assert_eq "$PAT" "$(cat "$T/gh.stdin")" "org prereqs: the token reaches gh on stdin"
 assert_contains "$(cat "$T/gh.env")" "GH_CONFIG_DIR=$OC/gh GH_TOKEN= | auth login --hostname github.com --with-token --insecure-storage" "org prereqs: gh auth login into the profile's store, no inherited token"
-assert_eq "" "$(grep -v "^GH_CONFIG_DIR=$OC/gh GH_TOKEN= |" "$T/gh.env")" "org prereqs: every gh call uses the profile's store"
+assert_eq "" "$(grep -v "^GH_CONFIG_DIR=$OC/gh GH_TOKEN= |" "$T/gh.env" | grep -vx 'GH_CONFIG_DIR= GH_TOKEN= | auth status')" "org prereqs: every gh call but the personal status checks uses the profile's store"
+assert_eq "auth status|auth login|auth status" "$(sed -n 's/^GH_CONFIG_DIR= GH_TOKEN= | \(auth status\)$/\1/p; s/^GH_CONFIG_DIR=[^ ]*gh GH_TOKEN= | \(auth login\).*/\1/p' "$T/gh.env" | paste -sd'|' -)" "org prereqs: personal gh auth status checked before and after the profile login"
+case "$(out)" in *"PERSONAL gh login"*) _bad "org prereqs: no personal-login warning when it still works" ;; *) _ok ;; esac
 assert_eq "" "$(grep -l "$PAT" "$T/gh.log" "$T/gh.env" "$T/out" "$T/open.log" 2>/dev/null)" "org prereqs: the token is in no argv and no output"
 assert_eq "" "$(grep -rl "$PAT" "$HOME" 2>/dev/null)" "org prereqs: the token is in no file under HOME (the stub's gh store holds none)"
 assert_eq 700 "$(stat -f %Lp "$OC/gh")" "org prereqs: the profile's gh dir is mode 700"
@@ -1510,6 +1515,17 @@ GITZILLA_INSTALL_STOP_AFTER=prereqs oruni "$PAT\n" --org acme --from-step prereq
 assert_eq 1 "$(rc)" "org prereqs: gh login failure stops"
 assert_contains "$(out)" "gh auth login with that token failed" "org prereqs: gh login failure says why"
 rm -f "$T/gh.loginfail"
+# the profile login breaks the personal one (a keychain clash): loud warning with the way back
+rm -rf "$OC/gh"; touch "$T/gh.clobber"; rm -f "$T/gh.personal.broken"
+GITZILLA_INSTALL_STOP_AFTER=prereqs oruni "$PAT\n" --org acme --from-step prereqs
+assert_eq 0 "$(rc)" "org prereqs, personal login broken: the step itself completes"
+assert_contains "$(out)" "WARNING: your PERSONAL gh login worked before this step and fails now" "org prereqs, personal login broken: loud warning"
+assert_contains "$(out)" "bin/rotate gh        (or: gh auth login)" "org prereqs, personal login broken: says how to restore it"
+# personal login already failing before: no warning (nothing changed by this step)
+rm -rf "$OC/gh"
+GITZILLA_INSTALL_STOP_AFTER=prereqs oruni "$PAT\n" --org acme --from-step prereqs
+case "$(out)" in *"PERSONAL gh login"*) _bad "org prereqs: no warning when the personal login was already failing" ;; *) _ok ;; esac
+rm -f "$T/gh.clobber" "$T/gh.personal.broken"
 # personal prereqs: gh's own login, no GH_CONFIG_DIR of ours
 rm -f "$T/gh.env"
 GITZILLA_INSTALL_STOP_AFTER=prereqs run --from-step prereqs

@@ -192,7 +192,7 @@ a profile: `GITZILLA_PROFILE=<name>` in front of `./install.sh` and the `bin/` c
 name is 1 to 40 lower-case letters, digits or hyphens, starting with a letter or digit, and not one of the names
 gitzilla uses for its own files in `~/.config/gitzilla/` or `~/.local/state/gitzilla/` (`config`, `jq-path`, `log`,
 `mirrors`, `incidents`, `install-step`, `install-set-hookspath`, `install-secrets-rotated`, `queue-cursor`,
-`queue-fail-since`, `queue-notified`, `health-notified`, `health-fail-since`, `reconcile-all-at`, `allowed_signers`, `gh`). A profile keeps
+`queue-fail-since`, `queue-notified`, `health-notified`, `health-fail-since`, `reconcile-all-at`, `allowed_signers`, `gh`, `gh-token-checked-at`, `gh-token-notified`). A profile keeps
 its config in `~/.config/gitzilla/<name>/`, its state, logs and mirrors in `~/.local/state/gitzilla/<name>/`, and its
 launchd jobs as `io.github.gitzilla.<name>.agent|reconcile` (the jobs carry `GITZILLA_PROFILE`). It never reads or
 writes the personal files or jobs. Without `GITZILLA_PROFILE` everything is as described above (the personal
@@ -209,7 +209,12 @@ What a profile does not do:
   rotates them: a profile gets no rotate job, `first-rotation` is skipped, and `bin/rotate` refuses.
 - **Its own gh login.** In a profile, gitzilla runs `gh` with `GH_CONFIG_DIR=~/.config/gitzilla/<name>/gh` (and
   without any `GH_TOKEN` / `GITHUB_TOKEN` from the environment), never with the personal login. The `prereqs` step of
-  a profile asks for that login's token (see "Set up an org Worker"); renew it the same way when it expires.
+  a profile asks for that login's token (see "Set up an org Worker"); renew it the same way when it expires. The
+  profile's hourly reconcile checks that token (`gh api user`) once a day, and every hour while it fails: when GitHub
+  rejects it (expired, revoked, or no login) you get one Mac notification a day,
+  `gitzilla (<name>): org token expired or revoked — restore can't run`, naming the renew command. Watching goes on
+  either way; a network failure only logs. The `prereqs` step also checks that your personal `gh auth status` still
+  passes after the profile's login and warns loudly (with `bin/rotate gh` / `gh auth login`) if it does not.
 - **Notifications name the profile.** Mac notifications and the restore dialog of a profile are titled
   `gitzilla (<name>)` (for example `gitzilla (org-acme): CRITICAL`), so they are told apart from the personal ones.
 - **No hook.** The global pre-push hook belongs to the personal instance: the `hook` step is skipped in a profile. Its

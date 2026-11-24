@@ -157,6 +157,8 @@ app_name_for() {
 # login uses for the same account). Never in argv, the log or any other file. A login already there is kept unless the
 # admin types replace (an expired token: gh auth status fails, so it is asked for again).
 GH_TOKEN_RE='^github_pat_[A-Za-z0-9_]{20,255}$'
+# personal_gh_ok: gh auth status for the personal login (gh's default store: GH_CONFIG_DIR unset), bounded.
+personal_gh_ok() { wd_timeout "${GITZILLA_GH_TIMEOUT:-15}" env -u GH_CONFIG_DIR "$GH" auth status >/dev/null 2>&1; }
 profile_gh_login() {
   local ans tok owner="${ORG_LOGIN:-the account this profile watches}"
   { mkdir -p "$GH_CONFIG_DIR" && chmod 700 "$GH_CONFIG_DIR"; } || die "cannot create $GH_CONFIG_DIR"
@@ -184,10 +186,22 @@ profile_gh_login() {
   if ! [[ $tok =~ $GH_TOKEN_RE ]]; then
     tok=""; die "that is not a fine-grained token (github_pat_...); rerun --from-step prereqs"
   fi
+  # the personal gh login (its own store, no GH_CONFIG_DIR) before and after: the profile login must not disturb it
+  local pers_before=0
+  personal_gh_ok && pers_before=1
   if ! printf '%s' "$tok" | "$GH" auth login --hostname github.com --with-token --insecure-storage >/dev/null 2>&1; then
     tok=""; die "gh auth login with that token failed (expired, not approved by the org, or mistyped); rerun --from-step prereqs"
   fi
   tok=""
+  if [ "$pers_before" = 1 ] && ! personal_gh_ok; then
+    say ""
+    say "!!!! WARNING: your PERSONAL gh login worked before this step and fails now. The org token must not have"
+    say "!!!! replaced it, but it looks like it did. Restore the personal login (no GITZILLA_PROFILE):"
+    say "!!!!   bin/rotate gh        (or: gh auth login)"
+    say "!!!! and check with:  gh auth status"
+    say ""
+    wd_log "install: personal gh login failing after the $GITZILLA_PROFILE gh login"
+  fi
   "$GH" auth status >/dev/null 2>&1 </dev/null || die "gh in profile $GITZILLA_PROFILE is still not logged in; rerun --from-step prereqs"
   say "gh: profile $GITZILLA_PROFILE logged in with its own read-only token (stored by gh in $GH_CONFIG_DIR)"
 }

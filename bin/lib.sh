@@ -10,7 +10,8 @@
 # Entries with a dot (repos.txt, rotation.json, ...) cannot collide: a profile name has no dot. Keep this list
 # complete when a new file is added under $GITZILLA_CONFIG_DIR or $STATE.
 WD_RESERVED_NAMES="config jq-path log mirrors incidents install-step install-set-hookspath install-secrets-rotated
-queue-cursor queue-fail-since queue-notified health-notified health-fail-since reconcile-all-at allowed_signers gh"
+queue-cursor queue-fail-since queue-notified health-notified health-fail-since reconcile-all-at allowed_signers gh
+gh-token-checked-at gh-token-notified"
 GITZILLA_PROFILE="${GITZILLA_PROFILE:-}"
 if [ -n "$GITZILLA_PROFILE" ]; then
   _wd_ok='^[a-z0-9][a-z0-9-]{0,39}$'
