@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # reconcile public|all|seed — hourly backup check. Catches pushes whose webhooks never arrived (git ls-remote vs
-# the known heads) and new SSH authentication/signing keys on the GitHub account. Compatible with macOS bash 3.2.
+# the known heads) and new SSH authentication/signing keys on the GitHub account (not in an org profile, config
+# MODE=org: an organization has no account keys). Compatible with macOS bash 3.2.
 #
 #   public  hourly: public repos + account keys (no Touch ID)
 #   all     like public, plus private repos over one ssh session; runs only if reconcile-all-at is > 24 h old
@@ -22,6 +23,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$here/lib.sh"
 LSR="${GITZILLA_GIT_LS_REMOTE:-git -c credential.helper= -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 ls-remote}"
 CURL="${GITZILLA_CURL:-curl}"
+GH="${GITZILLA_GH_CMD:-gh}"
 ZERO=0000000000000000000000000000000000000000
 STRIKE_SECS=600
 KEY_RE='^(ssh-|ecdsa-|sk-)[^ ]+ [A-Za-z0-9+/=]+'
@@ -71,6 +73,9 @@ keys_filter() { sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -E "$KE
 fetch_keys() {
   local owner
   KEYS_BOTH_OK=0; KEYS_ON=0
+  # an org profile (config MODE=org): OWNER is the organization, which has no account keys; the personal profile
+  # watches the admin's own keys. The missed-webhook check still runs.
+  if [ "${MODE:-}" = org ]; then wd_log "reconcile: org profile; account-key check skipped"; return 0; fi
   owner="$(printf '%s' "${OWNER:-}" | tr '[:upper:]' '[:lower:]')"
   [ -n "$owner" ] || { wd_log "reconcile: OWNER not set; key check skipped"; return 0; }
   if [ ! -f "$STATE/known-keys.txt" ]; then wd_log "reconcile: $STATE/known-keys.txt missing; key check skipped"; return 0; fi
@@ -207,6 +212,41 @@ cmd_seed() {
   return 0
 }
 
+# check_profile_token: profile only (`public`/`all` runs). The profile's own gh token (GH_CONFIG_DIR, lib.sh) is what
+# restore's push-permission check needs; an expired or revoked one makes every org restore skip. Checked with
+# `gh api user` (GITZILLA_GH_TIMEOUT s, default 15) at most once a day while it works, every run while it fails.
+# A 401/403, or gh not logged in (exit 4), raises one Mac notification a day ($STATE/gh-token-notified) naming the
+# renew command; a pass clears it. Network failures and timeouts are only logged (and retried next run). Never fails
+# the run: watching goes on either way.
+check_profile_token() {
+  local ck="$STATE/gh-token-checked-at" nt="$STATE/gh-token-notified" at na err rc home
+  [ -n "$GITZILLA_PROFILE" ] || return 0
+  at="$(cat "$ck" 2>/dev/null)"; case "$at" in ''|*[!0-9]*) at=0 ;; esac
+  if [ ! -e "$nt" ] && [ $((NOW - at)) -lt 86400 ]; then return 0; fi
+  err="$(mktemp)" || return 0
+  wd_timeout "${GITZILLA_GH_TIMEOUT:-15}" "$GH" api user --jq .login >/dev/null 2>"$err"; rc=$?
+  if [ "$rc" = 0 ]; then
+    echo "$NOW" | atomic_write "$ck"
+    [ -e "$nt" ] && wd_log "reconcile: profile gh token works again"
+    rm -f "$nt" "$err"; return 0
+  fi
+  case "$rc:$(cat "$err")" in
+    4:*|*"(HTTP 401)"*|*"(HTTP 403)"*) ;;
+    *) wd_log "reconcile: profile gh token check inconclusive (gh exit $rc); retried next run"; rm -f "$err"; return 0 ;;
+  esac
+  rm -f "$err"
+  echo "$NOW" | atomic_write "$ck"
+  wd_log "reconcile: profile gh token expired, revoked or missing ($GH_CONFIG_DIR)"
+  na="$(cat "$nt" 2>/dev/null)"; case "$na" in ''|*[!0-9]*) na=0 ;; esac
+  [ $((NOW - na)) -ge 86400 ] || return 0
+  home="${GITZILLA_HOME:-.}"
+  wd_notify "gitzilla: org token expired or revoked — restore can't run" \
+    "Renew it: cd $home && GITZILLA_PROFILE=$GITZILLA_PROFILE GITZILLA_INSTALL_STOP_AFTER=prereqs ./install.sh --from-step prereqs (type replace if asked)." \
+    && { echo "$NOW" | atomic_write "$nt"; return 0; }
+  [ -e "$nt" ] || echo 0 | atomic_write "$nt" # notify failed: keep checking (and notifying) every run
+  return 0
+}
+
 main() {
   local mode="${1:-}" at slug vis idx=0 priv_n=0 stamp priv_ok=1 out
   case "$mode" in public|all|seed) ;; *) echo "usage: reconcile public|all|seed" >&2; return 2 ;; esac
@@ -220,6 +260,7 @@ main() {
     case "$at" in ''|*[!0-9]*) at=0 ;; esac
     if [ $((NOW - at)) -lt 86400 ]; then wd_log "reconcile all: last full run under 24h ago; skipped"; return 0; fi
   fi
+  check_profile_token
   TMP="$(mktemp -d)" || return 1
   mkdir -p "$TMP/r"
   : > "$TMP/events.jsonl"; : > "$TMP/checked"; : > "$TMP/list"

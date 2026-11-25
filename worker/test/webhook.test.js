@@ -211,7 +211,7 @@ describe("GET /queue", () => {
     expect(p2.next).toBe(150);
     const p3 = await events(150);
     expect(p3).toEqual({ events: [], next: 150, oldest: 1 });
-  });
+  }, 20_000); // 150 webhooks through the Hub: 4-5 s on a loaded Mac, over the 5 s default
   it("reports the oldest retained seq, so a Mac can tell that events were pruned before it read them", async () => {
     expect((await events(0)).oldest).toBe(1);   // empty, nothing ever stored
     await hook("installation", { action: "deleted", installation: { account: { login: "o" } } });

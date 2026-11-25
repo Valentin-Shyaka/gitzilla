@@ -12,4 +12,8 @@ new_sqlite_classes = ["Hub"]
 
 [vars]
 NOTE_PUBKEY = ""
+MODE = "personal" # "org": member enrollment (/enroll) and admin commands (/admin)
+ORG = ""
+ADMIN_PUBKEYS = "" # org mode: newline- or comma-separated ecdsa-sha2-nistp256 key lines, at most 3
+WEB_FLOW = "orange"
 ALERT_TZ = "UTC" # install.sh deploys with --var ALERT_TZ:<the Mac's zone>

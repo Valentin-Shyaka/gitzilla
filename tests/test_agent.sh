@@ -297,6 +297,89 @@ ev 1 alice/app refs/heads/main $BASE $SIGNED warning | set_events
 poll
 assert_eq "[]" "$(jq -c '.[0].flags' "$STATE/incidents/1.json")" "clean deep_check: no flags"
 
+# --- 3a2. org profile (config MODE=org): signatures only against the profile's own allowed_signers
+cp "$GITZILLA_CONFIG_DIR/config" "$T/config.personal"
+printf 'MODE=org\nORG=alice\n' >> "$GITZILLA_CONFIG_DIR/config"
+OSIG="$GITZILLA_CONFIG_DIR/allowed_signers"
+# absent (the admin's ALLOWED_SIGNERS_FILE and git's file are valid but must not be used): no signature escalation
+rm -f "$OSIG"
+mkdir -p "$HOME/sig"; cp "$T/allowed_signers" "$HOME/sig/as"; git config --global gpg.ssh.allowedSignersFile "$HOME/sig/as"
+reset_state
+ev 1 alice/app refs/heads/main $SIGNED $UNSIGNED warning | set_events
+poll
+assert_eq warning "$(jq -r '.[0].level' "$STATE/incidents/1.json")" "org, no signers file: unsigned commit stays warning (the Worker's level stands)"
+assert_eq "no" "$(jq -c '.[0].flags' "$STATE/incidents/1.json" | grep -q unsigned && echo yes || echo no)" "org, no signers file: no unsigned flag"
+assert_eq 0 "$(nlines "$T/restore.log")" "org, no signers file: no restore dialog"
+assert_contains "$(cat "$STATE/log/gitzilla.log")" "org profile has no allowed_signers" "org, no signers file: logged"
+# empty (comments only) counts as absent
+printf '# members\n\n' > "$OSIG"
+reset_state
+ev 1 alice/app refs/heads/main $SIGNED $UNSIGNED warning | set_events
+poll
+assert_eq warning "$(jq -r '.[0].level' "$STATE/incidents/1.json")" "org, empty signers file: stays warning"
+# present: used as the personal file is today
+cp "$T/allowed_signers" "$OSIG"
+reset_state
+ev 1 alice/app refs/heads/main $SIGNED $UNSIGNED warning | set_events
+poll
+assert_eq critical "$(jq -r '.[0].level' "$STATE/incidents/1.json")" "org, signers file: unsigned commit escalated"
+assert_eq 1 "$(nlines "$T/restore.log")" "org, signers file: restore called"
+reset_state
+ev 1 alice/app refs/heads/main $BASE $SIGNED warning | set_events
+poll
+assert_eq warning "$(jq -r '.[0].level' "$STATE/incidents/1.json")" "org, signers file: signed range stays warning"
+# present but without the signer's key: the admin's own (valid) files are still never consulted
+ssh-keygen -q -t ed25519 -N '' -C other -f "$T/otherkey" >/dev/null
+echo "bob namespaces=\"git\" $(cut -d' ' -f1,2 "$T/otherkey.pub")" > "$OSIG"
+reset_state
+ev 1 alice/app refs/heads/main $BASE $SIGNED warning | set_events
+poll
+assert_contains "$(jq -c '.[0].flags' "$STATE/incidents/1.json")" unsigned "org: only the profile's file counts (admin's ALLOWED_SIGNERS_FILE / git file ignored)"
+git config --global --unset gpg.ssh.allowedSignersFile
+# org: a member's silent push is synced into the mirror (its tip is local for a later restore), with no incident
+WBR="$(git -C "$W" rev-parse --abbrev-ref HEAD)"
+git -C "$W" checkout -q -b member-silent "$BASE"
+echo m > "$W/m.txt"; git -C "$W" add m.txt; GC -C "$W" commit -q -m member-silent
+MSIL="$(git -C "$W" rev-parse HEAD)"
+reset_state
+git clone -q --mirror "$T/remotes/alice/app.git" "$STATE/mirrors/alice__app.git"
+git -C "$W" push -q "$T/remotes/alice/app.git" member-silent
+ev 1 alice/app refs/heads/member-silent $Z $MSIL silent | set_events
+poll
+assert_eq 0 "$(cat "$T/rc")" "org silent push: exit 0"
+assert_eq "$MSIL" "$(git -C "$STATE/mirrors/alice__app.git" rev-parse -q --verify "$MSIL^{commit}" 2>/dev/null)" "org silent push: the member's commit is in the mirror"
+assert_eq "no" "$(ls "$STATE/incidents" 2>/dev/null | grep -q . && echo yes || echo no)" "org silent push: no incident"
+assert_eq 0 "$(nlines "$T/notify.log")" "org silent push: no notification"
+# a repo with no mirror yet is cloned; a failed sync is only logged
+reset_state
+ev 1 alice/app refs/heads/member-silent $Z $MSIL silent | set_events
+poll
+[ -d "$STATE/mirrors/alice__app.git" ] && _ok || _bad "org silent push: mirror cloned"
+reset_state
+ev 1 alice/nope refs/heads/main $Z $MSIL silent | set_events
+poll
+assert_eq 0 "$(cat "$T/rc")" "org silent push, sync fails: exit 0"
+assert_eq 1 "$(cat "$STATE/queue-cursor")" "org silent push, sync fails: cursor moves"
+assert_contains "$(cat "$STATE/log/gitzilla.log")" "mirror sync failed for alice/nope (silent pushes)" "org silent push, sync fails: logged"
+rm -f "$OSIG"; cp "$T/config.personal" "$GITZILLA_CONFIG_DIR/config"
+# personal: a silent push does not touch the mirror (the pre-push hook copies the owner's commits in)
+reset_state
+git clone -q --mirror "$T/remotes/alice/app.git" "$STATE/mirrors/alice__app.git"
+git -C "$W" checkout -q -b personal-silent "$BASE"
+echo p > "$W/p.txt"; git -C "$W" add p.txt; GC -C "$W" commit -q -m personal-silent
+PSIL="$(git -C "$W" rev-parse HEAD)"
+git -C "$W" push -q "$T/remotes/alice/app.git" personal-silent
+ev 1 alice/app refs/heads/personal-silent $Z $PSIL silent | set_events
+poll
+assert_eq no "$(git -C "$STATE/mirrors/alice__app.git" cat-file -e "$PSIL^{commit}" 2>/dev/null && echo yes || echo no)" "personal silent push: mirror not synced (unchanged)"
+git -C "$W" push -q "$T/remotes/alice/app.git" :member-silent :personal-silent
+git -C "$W" checkout -q "$WBR"
+# MODE=org in the environment (no profile config) changes nothing for the personal instance
+reset_state
+ev 1 alice/app refs/heads/main $SIGNED $UNSIGNED warning | set_events
+MODE=org ORG=alice poll
+assert_eq critical "$(jq -r '.[0].level' "$STATE/incidents/1.json")" "personal with MODE=org exported: signature check as before"
+
 # --- 3b. mirror fetch failure -> check-failed, level unchanged; notification mentions it
 reset_state
 ev 1 alice/app refs/heads/main $BASE $SIGNED warning | set_events
@@ -432,6 +515,10 @@ assert_eq never "$(git -C "$M" config gc.pruneExpire)" "I3: agent clone sets gc.
 assert_eq always "$(git -C "$M" config core.logAllRefUpdates)" "I3: agent clone sets core.logAllRefUpdates always"
 git -C "$W" checkout -q -b noted "$BASE"; echo n > "$W/n.txt"; git -C "$W" add n.txt; GC -C "$W" commit -q -m noted
 NOTED="$(git -C "$W" rev-parse HEAD)"
+# bin/note reads only the personal layout (it ignores GITZILLA_CONFIG_DIR / GITZILLA_STATE_DIR): point it at the test dirs
+mkdir -p "$HOME/.config" "$HOME/.local/state"
+[ -e "$HOME/.config/gitzilla" ] || ln -s "$GITZILLA_CONFIG_DIR" "$HOME/.config/gitzilla"
+[ -e "$HOME/.local/state/gitzilla" ] || ln -s "$GITZILLA_STATE_DIR" "$HOME/.local/state/gitzilla"
 ( cd "$W" && printf 'refs/heads/noted %s refs/heads/noted %s\n' "$NOTED" "$Z" | bash "$WD_ROOT/bin/note" origin git@github.com:alice/app.git >/dev/null 2>&1 )
 assert_eq commit "$(git -C "$M" cat-file -t "$NOTED" 2>/dev/null)" "I3: note copied the commit into the mirror"
 # the copied objects are unreferenced; age them past git's default 2-week prune window, then gc as auto-gc would

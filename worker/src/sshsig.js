@@ -142,3 +142,21 @@ export async function verifySshSig(armoredSig, message, namespace, publicKeyLine
     return false;
   }
 }
+
+// The signer's public key line ("ecdsa-sha2-nistp256 <base64 blob>") embedded in an armored SSHSIG, or null.
+// Untrusted until verifySshSig passes with that same key: it only says which key to look up.
+export function sigPublicKey(armoredSig) {
+  try {
+    const lines = String(armoredSig).trim().split(/\r?\n/).map((l) => l.trim());
+    if (lines[0] !== BEGIN || lines[lines.length - 1] !== END) return null;
+    const raw = b64decode(lines.slice(1, -1).join(""));
+    if (!equal(raw.subarray(0, 6), te.encode("SSHSIG"))) return null;
+    const r = new Reader(raw.subarray(6));
+    if (r.u32() !== 1) return null;
+    const blob = r.bytes();
+    if (blob.length > 256) return null;
+    return `${KEY_TYPE} ${btoa(String.fromCharCode(...blob))}`;
+  } catch {
+    return null;
+  }
+}

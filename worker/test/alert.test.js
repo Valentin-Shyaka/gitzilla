@@ -21,6 +21,13 @@ import MISSEDEXTRA from "./fixtures/alert-missedextra.json";
 import MISSEDNONCE from "./fixtures/alert-missednonce.json";
 import REPORT_OK from "./fixtures/report-ok.json";
 import NOTE from "./fixtures/note-ok.json";
+import TEST from "./fixtures/alert-test.json";
+import TEST2 from "./fixtures/alert-test2.json";
+import TEST_LATER from "./fixtures/alert-test-later.json";
+import TEST_EXTRA from "./fixtures/alert-test-extra.json";
+import TEST_KEYFIELDS from "./fixtures/alert-test-keyfields.json";
+import TEST_NONCE from "./fixtures/alert-test-nonce.json";
+import TEST_NOTS from "./fixtures/alert-test-nots.json";
 
 const REVOKE = "If this wasn't you: revoke tokens at https://github.com/settings/applications";
 const TS = JSON.parse(atob(NEWKEY.payload)).ts;
@@ -149,5 +156,99 @@ describe("formatAccountAlert", () => {
     const r = formatAccountAlert({ kind: "missed-webhook", ts: TS, refs: 1, repos: 1, text: "SECRET" });
     expect(r.body).not.toContain("SECRET");
     expect(r.body.endsWith(REVOKE)).toBe(true);
+  });
+});
+
+const TOKEN = "tk_" + "a".repeat(29);
+const N1 = "+250788123442", N2 = "+14155550142";
+const cenv = { ...wenv, NTFY_CALL_TOKEN: TOKEN, NTFY_CALL_NUMBERS: `${N1},${N2}` };
+const calls = () => sent(NTFY).filter((b) => b.call);
+const pushes = () => sent(NTFY).filter((b) => !b.call);
+const KIGALI = "Time: 2100-01-01 00:00:00 UTC / 01/01/2100, 02:00:00 (Africa/Kigali)";
+
+describe("POST /alert calls", () => {
+  it("new-key places one call per number through the Hub gate; a second one within 10 min places none", async () => {
+    vi.useFakeTimers(); setClock(0);
+    expect((await post("/alert", NEWKEY, cenv)).status).toBe(204);
+    const c = calls();
+    expect(c.map((b) => b.call)).toEqual([N1, N2]);
+    expect(c[0].topic).toBe("t0pic-call");
+    expect(c[0].message).toBe("gitzilla critical alert. A new key was added to your GitHub account. " +
+      "Check Slack or the ntfy app, and revoke tokens if this was not you.");
+    await runInDurableObject(hub(), async (_h, s) => {
+      expect(await s.storage.get(`call:${N1}`)).toBe(TS * 1000);
+    });
+    expect((await post("/alert", NEWKEY_SIGNING, cenv)).status).toBe(204);
+    expect(calls()).toHaveLength(2);
+    expect(pushes()).toHaveLength(2);
+    expect(sent(SLACK)).toHaveLength(2);
+  });
+  it("missed-webhook (warning) places no call", async () => {
+    vi.useFakeTimers(); setClock(0);
+    expect((await post("/alert", MISSED, cenv)).status).toBe(204);
+    expect(calls()).toHaveLength(0);
+  });
+});
+
+describe("POST /alert kind test", () => {
+  it("red test alert to ntfy and Slack with fixed text, revoke line last, and a test call per number", async () => {
+    vi.useFakeTimers(); setClock(0);
+    expect((await post("/alert", TEST, cenv)).status).toBe(204);
+    const [n] = pushes(), [s] = sent(SLACK);
+    expect(n.title).toBe("🔴 gitzilla: test alert");
+    expect(n.priority).toBe(5);
+    expect(n.tags).toEqual(["rotating_light"]);
+    expect(n.message).toBe(["This is a test of every alert channel.", KIGALI, "", REVOKE].join("\n"));
+    expect(s.text).toBe(`${n.title}\n${n.message}`);
+    const c = calls();
+    expect(c.map((b) => b.call)).toEqual([N1, N2]);
+    expect(c[0]).toMatchObject({ topic: "t0pic-call", priority: 5, title: "🔴 gitzilla: test alert",
+      message: "gitzilla test call. Your alert channels work." });
+  });
+  it("without call settings it still reaches ntfy and Slack", async () => {
+    vi.useFakeTimers(); setClock(0);
+    expect((await alert(TEST)).status).toBe(204);
+    expect(pushes()).toHaveLength(1);
+    expect(sent(SLACK)).toHaveLength(1);
+    expect(calls()).toHaveLength(0);
+  });
+  it("test calls are gated hourly and separately from red-alert calls", async () => {
+    vi.useFakeTimers(); setClock(0);
+    expect((await post("/alert", TEST, cenv)).status).toBe(204);
+    expect(calls()).toHaveLength(2);
+    await runInDurableObject(hub(), async (_h, s) => {
+      expect(await s.storage.get(`testcall:${N1}`)).toBe(TS * 1000);
+      expect(await s.storage.get(`call:${N1}`)).toBeUndefined();
+    });
+    // a second test within the hour: push and Slack, no call
+    expect((await post("/alert", TEST2, cenv)).status).toBe(204);
+    expect(calls()).toHaveLength(2);
+    expect(pushes()).toHaveLength(2);
+    // a real red alert is not blocked by the test gate
+    expect((await post("/alert", NEWKEY, cenv)).status).toBe(204);
+    expect(calls()).toHaveLength(4);
+    // an hour later the test calls again
+    vi.setSystemTime((TS + 3600) * 1000);
+    expect((await post("/alert", TEST_LATER, cenv)).status).toBe(204);
+    expect(calls()).toHaveLength(6);
+  });
+  it("a replayed test alert is refused", async () => {
+    vi.useFakeTimers(); setClock(0);
+    expect((await alert(TEST)).status).toBe(204);
+    expect((await alert(TEST)).status).toBe(409);
+  });
+  it.each([
+    ["extra field", TEST_EXTRA], ["new-key fields", TEST_KEYFIELDS], ["bad nonce", TEST_NONCE], ["no ts", TEST_NOTS],
+  ])("rejects a malformed test alert: %s", async (_n, fx) => {
+    vi.useFakeTimers(); setClock(0);
+    expect((await post("/alert", fx, cenv)).status).toBe(400);
+    expect(f).not.toHaveBeenCalled();
+  });
+  it("formatAccountAlert renders the test kind", () => {
+    const r = formatAccountAlert({ kind: "test", ts: TS }, "UTC");
+    expect(r.title).toBe("🔴 gitzilla: test alert");
+    expect(r.priority).toBe(5);
+    expect(r.body.endsWith(REVOKE)).toBe(true);
+    expect(r.body.split(REVOKE).length).toBe(2);
   });
 });

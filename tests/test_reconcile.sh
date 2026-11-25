@@ -518,7 +518,12 @@ assert_eq 2 "$(grep -c '^IdentityAgent=' "$T/ssh.argv")" "space: one IdentityAge
 assert_eq "IdentityAgent=$T/sp ace/home/Library/Containers/com.maxgoedjen.Secretive.SecretAgent/Data/socket.ssh" "$(grep '^IdentityAgent=' "$T/ssh.argv" | head -n1)" "space: IdentityAgent intact with the space"
 
 # --- 11d. I5: reconcile alerts also go, signed, to the Worker's /alert (phone + Slack); M3: revoke line locally
-make_test_key
+# The test key exists already (section 3): a second make_test_key with stdin open must not stop at ssh-keygen's
+# "Overwrite (y/n)?" prompt (a 'n' on stdin would keep the old key; an open terminal would hang).
+fp_before="$(ssh-keygen -lf "$T/key.pub" | awk '{print $2}')"
+mk_out="$(printf 'n\n' | make_test_key 2>&1)"
+case "$mk_out" in *Overwrite*) _bad "make_test_key twice: no Overwrite prompt" ;; *) _ok ;; esac
+[ "$(ssh-keygen -lf "$T/key.pub" | awk '{print $2}')" != "$fp_before" ] && _ok || _bad "make_test_key twice: a fresh key"
 export STUB_ALERT_STATUS_FILE="$T/alert.status"; rm -f "$T/alert.status"
 start_stub
 cp "$GITZILLA_CONFIG_DIR/config" "$T/config.rec"
@@ -585,6 +590,86 @@ assert_eq "false" "$(seen_alerted 'alice/app|refs/heads/main')" "I5 refs: not al
 rm -f "$T/notify.fail" "$T/alert.status"
 stop_stub
 cp "$T/config.rec" "$GITZILLA_CONFIG_DIR/config"; unset GITZILLA_SIGN_KEY
+
+# --- 11e. org profile (config MODE=org): no account-key check (the org has no keys), the missed-webhook check stays
+cp "$GITZILLA_CONFIG_DIR/config" "$T/config.personal"
+printf 'GITZILLA_URL=http://127.0.0.1:1\nOWNER=acme\nMODE=org\nORG=acme\n' > "$GITZILLA_CONFIG_DIR/config"
+reset_state
+echo "acme/app public" > "$STATE/repos.txt"
+sethead acme/app refs/heads/main $S1
+setremote acme/app $S2 refs/heads/main
+cp "$T/k1.pub" "$STATE/known-keys.txt"; cp "$T/k2.pub" "$T/curl/auth.keys"; echo '[]' > "$T/curl/signing.json"
+runat $T0 public
+runat $((T0 + 700)) public
+assert_eq 0 "$(cat "$T/rc")" "org: exit 0"
+assert_eq 0 "$(nlines "$T/curl.log")" "org: no account-key fetch"
+assert_contains "$(cat "$STATE/log/gitzilla.log")" "org profile; account-key check skipped" "org: logs why"
+case "$(cat "$T/notify.log" 2>/dev/null)" in *"New key"*) _bad "org: no key alert" ;; *) _ok ;; esac
+assert_eq 1 "$(nincs)" "org: missed-webhook incident after two strikes"
+assert_eq "acme/app" "$(jq -r '.[0].repo' "$(lastinc)")" "org: incident for the org's repo"
+assert_contains "$(cat "$T/notify.log")" "possible missed webhook" "org: missed-webhook notification"
+cp "$T/config.personal" "$GITZILLA_CONFIG_DIR/config"
+# MODE=org exported, personal config: the account-key check still runs (lib.sh takes MODE from the config only)
+reset_state
+: > "$STATE/repos.txt"; cp "$T/k1.pub" "$STATE/known-keys.txt"; cp "$T/k1.pub" "$T/curl/auth.keys"; echo '[]' > "$T/curl/signing.json"
+MODE=org ORG=acme run public
+assert_contains "$(cat "$T/curl.log")" "https://github.com/alice.keys" "personal with MODE=org exported: account keys still checked"
+
+# --- 11b. profile: the profile's gh token is checked once a day (every run while failing); one notification a day
+cat > "$T/ghtok.sh" <<STUB
+#!/bin/sh
+echo "GH_CONFIG_DIR=\${GH_CONFIG_DIR:-} \$*" >> "$T/ghtok.log"
+case "\$(cat "$T/ghtok.mode" 2>/dev/null)" in
+  ok|"") echo acme-admin ;;
+  401) echo "gh: Bad credentials (HTTP 401)" >&2; exit 1 ;;
+  nologin) echo "To get started with GitHub CLI, please run:  gh auth login" >&2; exit 4 ;;
+  net) echo "error connecting to api.github.com" >&2; exit 1 ;;
+esac
+STUB
+chmod +x "$T/ghtok.sh"
+prun() { GITZILLA_PROFILE=org-acme GITZILLA_GH_CMD="$T/ghtok.sh" runat "$@"; }
+ghcalls() { nlines "$T/ghtok.log"; }
+tokn() { if [ -f "$T/notify.log" ]; then grep -c "org token expired or revoked" "$T/notify.log" | tr -d ' '; else echo 0; fi; }
+reset_state; : > "$STATE/repos.txt"; rm -f "$T/ghtok.log" "$T/notify.log"
+echo ok > "$T/ghtok.mode"
+prun "$T0" public
+assert_eq 0 "$(cat "$T/rc")" "token ok: exit 0"
+assert_eq "GH_CONFIG_DIR=$GITZILLA_CONFIG_DIR/gh api user --jq .login" "$(cat "$T/ghtok.log")" "token check: gh api user with the profile's GH_CONFIG_DIR"
+assert_eq 0 "$(tokn)" "token ok: no notification"
+prun $((T0 + 3600)) public
+assert_eq 1 "$(ghcalls)" "token ok: not checked again within a day"
+echo 401 > "$T/ghtok.mode"
+prun $((T0 + 86400)) public
+assert_eq 0 "$(cat "$T/rc")" "token 401: the run still succeeds"
+assert_eq 2 "$(ghcalls)" "token 401: checked after a day"
+assert_eq 1 "$(tokn)" "token 401: one notification"
+assert_contains "$(cat "$T/notify.log")" "gitzilla (org-acme): org token expired or revoked — restore can't run|" "token 401: the title names the profile"
+assert_contains "$(cat "$T/notify.log")" "GITZILLA_PROFILE=org-acme GITZILLA_INSTALL_STOP_AFTER=prereqs ./install.sh --from-step prereqs" "token 401: names the renew command"
+prun $((T0 + 86400 + 3600)) public
+assert_eq 3 "$(ghcalls)" "token failing: checked every run"
+assert_eq 1 "$(tokn)" "token failing again the same day: no second notification"
+echo nologin > "$T/ghtok.mode"
+prun $((T0 + 2 * 86400 + 60)) public
+assert_eq 2 "$(tokn)" "token failing (not logged in) a day later: notified again"
+echo net > "$T/ghtok.mode"
+prun $((T0 + 3 * 86400 + 120)) public
+assert_eq 2 "$(tokn)" "network failure: no notification"
+assert_contains "$(cat "$STATE/log/gitzilla.log")" "token check inconclusive" "network failure: logged"
+echo ok > "$T/ghtok.mode"
+prun $((T0 + 3 * 86400 + 3600)) public
+assert_eq no "$([ -e "$STATE/gh-token-notified" ] && echo yes || echo no)" "token works again: notification state cleared"
+assert_contains "$(cat "$STATE/log/gitzilla.log")" "profile gh token works again" "token works again: logged"
+n="$(ghcalls)"
+prun $((T0 + 3 * 86400 + 7200)) public
+assert_eq "$n" "$(ghcalls)" "token works again: back to once a day"
+echo 401 > "$T/ghtok.mode"
+prun $((T0 + 4 * 86400 + 7200)) public
+assert_eq 3 "$(tokn)" "token fails again after a recovery: notified"
+# personal: never checked
+rm -f "$T/ghtok.log"
+GITZILLA_GH_CMD="$T/ghtok.sh" runat $((T0 + 9 * 86400)) public
+assert_eq 0 "$(ghcalls)" "personal: no profile token check"
+rm -f "$T/ghtok.mode"
 
 # --- 12. usage
 run bogus

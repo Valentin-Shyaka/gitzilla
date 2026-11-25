@@ -25,3 +25,32 @@ export function classify(push, noted, recentUnnoted) {
 
   return { level: push.forced || burst ? "critical" : "warning", flags };
 }
+
+// Org mode. push additionally carries sender {login (lowercased), type} or null, and webflow (every commit
+// committed by GitHub's web-flow). ctx: {logins: who signed a note for this exact repo|ref|sha, enrolled: the
+// sender is a member, allowlisted: the sender is an allowlisted bot, webFlow: env.WEB_FLOW}. recentUnnoted:
+// every earlier non-silent push in the window, whoever pushed it. A note only counts when the sender signed it.
+// A forced push is never silenced by the bot or web-flow rules: the web UI never force-pushes, and a stolen
+// bot/app token must not rewrite history quietly. It is critical and counts towards a burst.
+export function classifyOrg(push, ctx, recentUnnoted) {
+  const login = push.sender?.login;
+  const edge = () => [
+    ...(push.before === ZERO ? ["created"] : []),
+    ...(push.after === ZERO ? ["deleted"] : []),
+  ];
+  if (login && (ctx.logins ?? []).includes(login)) return { level: "silent", flags: edge() };
+  const bot = push.sender?.type === "Bot" || Boolean(login && ctx.allowlisted);
+  if (!push.forced) {
+    if (bot) return { level: "silent", flags: ["bot", ...edge()] };
+    if (push.webflow && ctx.webFlow === "silent") return { level: "silent", flags: ["web-flow", ...edge()] };
+  }
+
+  const flags = [bot ? "bot" : push.webflow ? "web-flow" : login && ctx.enrolled ? "no-note" : "unenrolled"];
+  if (push.forced) flags.push("forced");
+  const recent = recentUnnoted.filter((p) => push.ts - p.ts <= BURST_WINDOW_S && p.ts <= push.ts);
+  const all = [...recent, push];
+  const burst = new Set(all.map((p) => p.repo)).size >= 3 || new Set(all.map((p) => `${p.repo}|${p.ref}`)).size >= 5;
+  if (burst) flags.push("burst");
+  flags.push(...edge());
+  return { level: push.forced || burst ? "critical" : "warning", flags };
+}

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
-import worker from "../src/index.js";
+import worker, { validReason } from "../src/index.js";
 import { formatReport } from "../src/notify.js";
 import OK from "./fixtures/report-ok.json";
 import TAMPERED from "./fixtures/report-tampered.json";
@@ -86,6 +86,35 @@ describe("POST /report", () => {
     vi.useFakeTimers(); setClock(0);
     expect((await post(UNVERIFIED)).status).toBe(204);
     expect(sent(NTFY)[0].message).toContain("owner/name refs/heads/main: restore target not verified — review manually");
+  });
+  it("allows the org restore reason 'no push permission' (exact, or with a detail) and nothing near it", () => {
+    expect(validReason("no push permission")).toBe(true);
+    expect(validReason("no push permission (gh: 404)")).toBe(true);
+    expect(validReason("no push permission!")).toBe(false);
+    expect(validReason("No push permission")).toBe(false);
+    expect(validReason("no push permission (a\nb)")).toBe(false);
+    expect(validReason("push permission")).toBe(false);
+  });
+  it("allows the org restore reason 'no org signers file' and nothing near it", () => {
+    expect(validReason("no org signers file")).toBe(true);
+    expect(validReason("no org signers file (x)")).toBe(true);
+    expect(validReason("no org signers")).toBe(false);
+    expect(validReason("no org signers file!")).toBe(false);
+  });
+  it("allows the org restore reason 'repo not visible to org token' and nothing near it", () => {
+    expect(validReason("repo not visible to org token")).toBe(true);
+    expect(validReason("repo not visible to org token (gh: HTTP 404)")).toBe(true);
+    expect(validReason("repo not visible to org token!")).toBe(false);
+    expect(validReason("repo not visible")).toBe(false);
+    expect(validReason("Repo not visible to org token")).toBe(false);
+    const { body } = formatReport({ restored: [], skipped: [{ repo: "acme/app", ref: "refs/heads/main", reason: "repo not visible to org token" }], restored_total: 0, skipped_total: 1 });
+    expect(body).toContain("acme/app refs/heads/main: repo not visible to org token");
+    expect(body.endsWith(REVOKE)).toBe(true);
+  });
+  it("renders the 'no push permission' skip in the report", () => {
+    const { body } = formatReport({ restored: [], skipped: [{ repo: "acme/app", ref: "refs/heads/main", reason: "no push permission" }], restored_total: 0, skipped_total: 1 });
+    expect(body).toContain("acme/app refs/heads/main: no push permission");
+    expect(body.endsWith(REVOKE)).toBe(true);
   });
   it("rejects an unknown reason with 400", async () => {
     vi.useFakeTimers(); setClock(0);

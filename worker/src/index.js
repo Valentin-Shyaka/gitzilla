@@ -1,6 +1,7 @@
-import { verifySshSig } from "./sshsig.js";
+import { verifySshSig, sigPublicKey } from "./sshsig.js";
 import { verifyGithubSignature } from "./hmac.js";
-import { notifyReport, notifyAccountAlert } from "./notify.js";
+import { notifyReport, notifyAccountAlert, notifyEnrollment } from "./notify.js";
+import { fingerprint, parseAdminKeys, cleanEnroll, cleanAdmin, cleanBotLogin, cleanLogin, ipBucket } from "./members.js";
 
 export { Hub } from "./hub.js";
 
@@ -17,6 +18,18 @@ function b64decode(s) {
     return null;
   }
 }
+
+// The key (one of `keys`) whose signature over raw in `namespace` verifies, or null.
+export async function verifyAny(sig, raw, namespace, keys) {
+  for (const k of keys) {
+    if (k && (await verifySshSig(sig, raw, namespace, k))) return k;
+  }
+  return null;
+}
+
+const orgMode = (env) => env.MODE === "org";
+// Keys that may sign /queue, /report and /alert: the admin keys in org mode, the note key otherwise.
+const controlKeys = (env) => (orgMode(env) ? parseAdminKeys(env.ADMIN_PUBKEYS) : [env.NOTE_PUBKEY || ""]);
 
 function validNote(n) {
   return (
@@ -40,7 +53,17 @@ async function handleNote(request, env) {
   const raw = b64decode(body.payload);
   if (!raw) return new Response("bad base64", { status: 400 });
 
-  if (!(await verifySshSig(body.sig, raw, "gitzilla-note", env.NOTE_PUBKEY || ""))) {
+  // Org mode: the signature names its key; that key must be an active member key, and the signer is the member
+  // the Hub records for it (never a login from the payload). Pending or revoked keys are unknown here.
+  let signer = null;
+  if (orgMode(env)) {
+    const fp = await fingerprint(sigPublicKey(body.sig) ?? "");
+    const m = fp ? await getHub(env).memberByFp(fp) : null;
+    if (!m || !(await verifySshSig(body.sig, raw, "gitzilla-note", m.pubkey))) {
+      return new Response("bad signature", { status: 401 });
+    }
+    signer = { login: m.login, fp };
+  } else if (!(await verifySshSig(body.sig, raw, "gitzilla-note", env.NOTE_PUBKEY || ""))) {
     return new Response("bad signature", { status: 401 });
   }
   let note;
@@ -50,10 +73,13 @@ async function handleNote(request, env) {
   const now = Date.now();
   if (Math.abs(note.ts * 1000 - now) > SKEW_MS) return new Response("ts out of range", { status: 422 });
 
-  const hub = env.HUB.get(env.HUB.idFromName("main"));
-  if (!(await hub.addNote(note.repo, note.ref, note.new_sha, note.nonce, note.ts, now))) {
-    return new Response("replayed", { status: 409 });
-  }
+  const hub = getHub(env);
+  const added = signer
+    ? await hub.addNote(note.repo, note.ref, note.new_sha, note.nonce, note.ts, now, signer)
+    : await hub.addNote(note.repo, note.ref, note.new_sha, note.nonce, note.ts, now);
+  if (added === null) return new Response("bad signature", { status: 401 }); // key revoked meanwhile
+  if (added === "full") return new Response("too many signers", { status: 409 });
+  if (!added) return new Response("replayed", { status: 409 });
   return new Response(null, { status: 204 });
 }
 
@@ -63,12 +89,15 @@ const REPORT_REASONS = [
   "ref moved since the incident", "old commit not available locally", "could not send note",
   "not flagged critical — review manually", "interleaved with your own pushes", "invalid event",
   "no change", "push failed", "restore target not verified — review manually",
+  "no push permission", // org profile: the admin's account may not push to that repo
+  "repo not visible to org token", // org profile: gh (the profile's org token) got 404/403/401 for that repo
+  "no org signers file", // org profile: no allowed_signers of its own, so no restore target can be verified
 ];
 
 const REASON_DETAIL = /^[A-Za-z0-9 ._:/-]{0,100}$/;
 const REPORT_TOTAL_MAX = 100_000;
 // Exact fixed reason, or fixed reason + " (" + detail + ")" with a restricted detail charset.
-function validReason(r) {
+export function validReason(r) {
   if (typeof r !== "string") return false;
   return REPORT_REASONS.some((p) =>
     r === p || (r.startsWith(p + " (") && r.endsWith(")") && REASON_DETAIL.test(r.slice(p.length + 2, -1))));
@@ -106,7 +135,7 @@ async function handleReport(request, env) {
   }
   const raw = b64decode(body.payload);
   if (!raw) return new Response("bad base64", { status: 400 });
-  if (!(await verifySshSig(body.sig, raw, "gitzilla-report", env.NOTE_PUBKEY || ""))) {
+  if (!(await verifyAny(body.sig, raw, "gitzilla-report", controlKeys(env)))) {
     return new Response("bad signature", { status: 401 });
   }
   let parsed;
@@ -123,7 +152,8 @@ async function handleReport(request, env) {
 }
 
 // POST /alert: account alerts from the Mac's reconcile, signed in their own namespace. Strict shape: exactly
-// these keys, fixed values; the Worker writes the message text itself (no free text from the Mac).
+// these keys, fixed values; the Worker writes the message text itself (no free text from the Mac). kind "test"
+// (bin/notify-test) is exactly {kind, ts, nonce}; its calls use the hourly test gate.
 const ALERT_SKEW_MS = 300_000;
 const ALERT_FIELDS = {
   "new-key": {
@@ -131,6 +161,7 @@ const ALERT_FIELDS = {
     fingerprint: (v) => typeof v === "string" && /^SHA256:[A-Za-z0-9+/]{43}$/.test(v),
     source: (v) => v === "auth" || v === "signing",
   },
+  test: {},
   "missed-webhook": {
     refs: (v) => Number.isInteger(v) && v >= 1 && v <= 100_000,
     repos: (v) => Number.isInteger(v) && v >= 1 && v <= 100_000,
@@ -163,7 +194,7 @@ async function handleAlert(request, env) {
   }
   const raw = b64decode(body.payload);
   if (!raw) return new Response("bad base64", { status: 400 });
-  if (!(await verifySshSig(body.sig, raw, "gitzilla-alert", env.NOTE_PUBKEY || ""))) {
+  if (!(await verifyAny(body.sig, raw, "gitzilla-alert", controlKeys(env)))) {
     return new Response("bad signature", { status: 401 });
   }
   let parsed;
@@ -173,13 +204,23 @@ async function handleAlert(request, env) {
   const now = Date.now();
   if (Math.abs(a.ts * 1000 - now) > ALERT_SKEW_MS) return new Response("ts out of range", { status: 422 });
   if (!(await getHub(env).useNonce(a.nonce, a.ts, now))) return new Response("replayed", { status: 409 });
-  try { await notifyAccountAlert(a, env); } catch (e) { console.error("alert notify failed", e); }
+  try { await notifyAccountAlert(a, env, 8000, (n) => getHub(env).callAllowed(n, Date.now(), a.kind === "test")); } catch (e) { console.error("alert notify failed", e); }
   return new Response(null, { status: 204 });
 }
 
 const json = (obj, status = 200) =>
   new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json" } });
 const getHub = (env) => env.HUB.get(env.HUB.idFromName("main"));
+
+// Org mode: who pushed (validated, lowercased login; null when missing or malformed, which classifies as
+// unenrolled) and whether every commit was made by GitHub's web-flow (the web UI).
+function orgPushFields(p, env) {
+  const login = cleanBotLogin(p.sender?.login);
+  const sender = login ? { login, type: p.sender.type === "Bot" ? "Bot" : "User" } : null;
+  const commits = Array.isArray(p.commits) ? p.commits : [];
+  const webflow = commits.length > 0 && commits.every((c) => c?.committer?.username === "web-flow");
+  return { org: true, sender, webflow, web_flow: env.WEB_FLOW === "silent" ? "silent" : "orange" };
+}
 
 async function handleWebhook(request, env) {
   const body = new Uint8Array(await request.arrayBuffer());
@@ -202,9 +243,9 @@ async function handleWebhook(request, env) {
     if (typeof repo !== "string" || typeof p.ref !== "string" || !HEX40.test(p.before) || !HEX40.test(p.after)) {
       return new Response("bad payload", { status: 400 });
     }
-    await hub.receivePush(delivery, {
-      repo: repo.toLowerCase(), ref: p.ref, before: p.before, after: p.after, forced: p.forced === true,
-    }, now);
+    const push = { repo: repo.toLowerCase(), ref: p.ref, before: p.before, after: p.after, forced: p.forced === true };
+    if (orgMode(env)) Object.assign(push, orgPushFields(p, env));
+    await hub.receivePush(delivery, push, now);
     return new Response(null, { status: 202 });
   }
   // a suspended app stops every delivery: as bad as an uninstall
@@ -234,7 +275,7 @@ async function queueAuthorized(request, env) {
   } catch { return false; }
   if (!Number.isInteger(ts) || Math.abs(ts * 1000 - Date.now()) > QUEUE_SKEW_MS) return false;
   const sig = new TextDecoder().decode(sigBytes);
-  return verifySshSig(sig, raw, "gitzilla-queue", env.NOTE_PUBKEY || "");
+  return (await verifyAny(sig, raw, "gitzilla-queue", controlKeys(env))) !== null;
 }
 
 async function handleQueue(request, env) {
@@ -242,6 +283,106 @@ async function handleQueue(request, env) {
   const raw = new URL(request.url).searchParams.get("after") ?? "0";
   if (!/^\d{1,15}$/.test(raw)) return new Response("bad after", { status: 400 });
   return json(await getHub(env).events(Number(raw)));
+}
+
+// ---- org mode (MODE = "org"): member enrollment and admin commands. Both 404 in personal mode.
+const ORG_SKEW_MS = 300_000;
+
+// Declared Content-Length over the cap: refuse before reading anything.
+const declaredTooLarge = (request) => {
+  const cl = request.headers.get("Content-Length");
+  return cl !== null && !(/^\d{1,15}$/.test(cl) && Number(cl) <= MAX_BODY);
+};
+
+// The body as bytes, reading at most max bytes (stops and returns null past that, whatever Content-Length said).
+async function readCapped(request, max) {
+  if (!request.body) return new Uint8Array(0);
+  const reader = request.body.getReader();
+  const chunks = [];
+  let n = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    n += value.byteLength;
+    if (n > max) {
+      try { await reader.cancel(); } catch { /* ignore */ }
+      return null;
+    }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(n);
+  let o = 0;
+  for (const c of chunks) { out.set(c, o); o += c.byteLength; }
+  return out;
+}
+
+// Shared envelope parsing for /enroll and /admin: {payload: base64(JSON), sig: armored SSHSIG}.
+// The MAX_BODY cap is on bytes, checked on Content-Length first and again while reading.
+async function readSigned(request) {
+  if (declaredTooLarge(request)) return { error: json({ error: "too large" }, 400) };
+  const bytes = await readCapped(request, MAX_BODY);
+  if (!bytes) return { error: json({ error: "too large" }, 400) };
+  const text = new TextDecoder().decode(bytes);
+  let body;
+  try { body = JSON.parse(text); } catch { return { error: json({ error: "bad json" }, 400) }; }
+  if (!body || typeof body.payload !== "string" || typeof body.sig !== "string") {
+    return { error: json({ error: "bad body" }, 400) };
+  }
+  const raw = b64decode(body.payload);
+  if (!raw) return { error: json({ error: "bad base64" }, 400) };
+  let parsed;
+  try { parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw)); } catch { parsed = undefined; }
+  return { raw, sig: body.sig, parsed };
+}
+
+// POST /enroll: a member asks to join. The payload is signed by the key being enrolled (proof of possession).
+// Nothing becomes trusted here: the key waits in pending until an admin approves it. Rejections send no alert.
+async function handleEnroll(request, env) {
+  if (declaredTooLarge(request)) return json({ error: "too large" }, 400);
+  const hub = getHub(env);
+  // global then per-client budget, before reading the body or any crypto, so junk requests use it up too
+  if (!(await hub.enrollRateOk(ipBucket(request.headers.get("CF-Connecting-IP")), Date.now()))) {
+    return json({ error: "rate limited" }, 429);
+  }
+  const r = await readSigned(request);
+  if (r.error) return r.error;
+  const e = cleanEnroll(r.parsed);
+  if (!e) return json({ error: "bad payload" }, 400);
+  if (!(await verifySshSig(r.sig, r.raw, "gitzilla-enroll", e.pubkey))) return json({ error: "bad signature" }, 401);
+  const now = Date.now();
+  if (Math.abs(e.ts * 1000 - now) > ORG_SKEW_MS) return json({ error: "ts out of range" }, 401);
+  const fp = await fingerprint(e.pubkey);
+  const res = await hub.enroll(e.login, e.pubkey, fp, e.nonce, e.ts, now);
+  if (res === "replay") return json({ error: "replayed" }, 401);
+  if (res === "member") return json({ error: "already a member" }, 409);
+  if (res === "full") return json({ error: "too many pending enrollments" }, 429);
+  if (res === "new") {
+    try { await notifyEnrollment({ login: e.login, fp }, env); } catch (err) { console.error("enroll notify failed", err); }
+  }
+  return json({ ok: true, fingerprint: fp }, 202);
+}
+
+// POST /admin: {cmd, args, ts, nonce} signed by one of ADMIN_PUBKEYS in namespace gitzilla-admin.
+async function handleAdmin(request, env) {
+  const r = await readSigned(request);
+  if (r.error) return r.error;
+  const key = await verifyAny(r.sig, r.raw, "gitzilla-admin", parseAdminKeys(env.ADMIN_PUBKEYS));
+  if (!key) return json({ error: "bad signature" }, 401);
+  const a = cleanAdmin(r.parsed);
+  if (a.error === "bad payload") return json({ error: a.error }, 400);
+  const now = Date.now();
+  if (Math.abs(a.ts * 1000 - now) > ORG_SKEW_MS) return json({ error: "ts out of range" }, 401);
+  const hub = getHub(env);
+  if (!(await hub.useNonce(a.nonce, a.ts, now))) return json({ error: "replayed" }, 401);
+  if (a.error) return json({ error: a.error }, 400);
+  const out = await hub.admin(a.cmd, a.args, await fingerprint(key), now);
+  return json(out.body, out.status);
+}
+
+// GET /health: {ok:true} in personal mode (unchanged). Org mode adds the mode and the org login (lowercased; null
+// when ORG is unset or not a valid login), which `install.sh --join-org` reads to know which repos the Worker covers.
+function health(env) {
+  return orgMode(env) ? { ok: true, mode: "org", org: cleanLogin(env.ORG) } : { ok: true };
 }
 
 export default {
@@ -252,7 +393,9 @@ export default {
     if (url.pathname === "/alert" && request.method === "POST") return handleAlert(request, env);
     if (url.pathname === "/webhook" && request.method === "POST") return handleWebhook(request, env);
     if (url.pathname === "/queue" && request.method === "GET") return handleQueue(request, env);
-    if (url.pathname === "/health" && request.method === "GET") return json({ ok: true });
+    if (orgMode(env) && url.pathname === "/enroll" && request.method === "POST") return handleEnroll(request, env);
+    if (orgMode(env) && url.pathname === "/admin" && request.method === "POST") return handleAdmin(request, env);
+    if (url.pathname === "/health" && request.method === "GET") return json(health(env));
     return new Response("not found", { status: 404 });
   },
 };

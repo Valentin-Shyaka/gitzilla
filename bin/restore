@@ -18,13 +18,34 @@
 # Double invocation: refs already in an existing result file are carried over and not touched again;
 # if nothing else remains there is no dialog and no push. Compatible with macOS bash 3.2.
 #
+# Org profile (config MODE=org, written by install.sh --org): before the note and the push of a ref, the admin's
+# own access to the repo is checked with `gh api repos/<repo> --jq '.permissions.push // .permissions.admin'`;
+# anything but `true` (no access, gh not logged in, network) skips every ref of that repo with "no push permission",
+# except a 404/403/401 from GitHub, which skips with "repo not visible to org token" (the profile's own read-only gh
+# login, GH_CONFIG_DIR=<profile config>/gh, does not see that repo). gh only reads: the push itself goes over SSH
+# (Touch ID), as in the personal profile.
+# A restore target that is not in the mirror is fetched once by its id (git fetch <url> <sha>, GITZILLA_FETCH_TIMEOUT
+# seconds, default 60) before the ref is skipped with "old commit not available locally" (personal profile too).
+# The personal profile does no such check. gh gets GITZILLA_GH_TIMEOUT seconds (default 15); a timeout is a skip.
+# The restore target of an org profile is verified against the profile's own $GITZILLA_CONFIG_DIR/allowed_signers
+# (the members' signing keys), never the admin's personal one; without that file (missing or empty) every ref that
+# needs a verified target is skipped with "no org signers file".
+#
 # Env overrides (tests): GITZILLA_DIALOG_CMD <message> <Restore,Details,Ignore> (prints the button, or
 # TIMEOUT to simulate give-up),
-# GITZILLA_NOTIFY_CMD, GITZILLA_REMOTE_URL_TEMPLATE, ALLOWED_SIGNERS_FILE.
+# GITZILLA_NOTIFY_CMD, GITZILLA_REMOTE_URL_TEMPLATE, ALLOWED_SIGNERS_FILE, GITZILLA_GH_CMD.
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$here/lib.sh"
+GH="${GITZILLA_GH_CMD:-gh}"
+GH_TIMEOUT="${GITZILLA_GH_TIMEOUT:-15}"
+case "$GH_TIMEOUT" in ''|*[!0-9]*) GH_TIMEOUT=15 ;; esac
+FETCH_TIMEOUT="${GITZILLA_FETCH_TIMEOUT:-60}"
+case "$FETCH_TIMEOUT" in ''|*[!0-9]*) FETCH_TIMEOUT=60 ;; esac
 REMOTE_TPL="${GITZILLA_REMOTE_URL_TEMPLATE:-git@github.com:%s.git}"
-SIGNERS="${ALLOWED_SIGNERS_FILE:-$(wd_allowed_signers)}" # gpg.ssh.allowedSignersFile, else ~/.config/git/allowed_signers
+# personal: gpg.ssh.allowedSignersFile, else ~/.config/git/allowed_signers; org profile: its own allowed_signers only
+SIGNERS="$(wd_signers_file)"
+ORG_NOSIGNERS=0
+if [ "${MODE:-}" = org ] && ! wd_org_signers_ok; then ORG_NOSIGNERS=1; fi
 ZERO=0000000000000000000000000000000000000000
 REVOKE="$WD_REVOKE"
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR
@@ -43,25 +64,21 @@ set -- "${files[@]}"
 for inc in "$@"; do :; done   # inc = the newest (last) usable file
 result="$inc.result.json"
 
-notify() { # title message
-  if [ -n "${GITZILLA_NOTIFY_CMD:-}" ]; then
-    "$GITZILLA_NOTIFY_CMD" "$1" "$2" </dev/null >/dev/null 2>&1 || wd_log "notify command failed"
-  else
-    osascript -e 'on run argv' -e 'display notification (item 2 of argv) with title (item 1 of argv)' \
-      -e 'end run' -- "$1" "$2" </dev/null >/dev/null 2>&1 || wd_log "osascript notify failed"
-  fi
-}
+# notify <title> <message>: wd_notify (the title names the profile in a profile; a failure is logged there)
+notify() { wd_notify "$1" "$2" || true; }
 
-# dialog <message> <buttons> -> prints Restore, Details, Ignore, or TIMEOUT (gave up / failure)
+# dialog <message> <buttons> -> prints Restore, Details, Ignore, or TIMEOUT (gave up / failure). The dialog title is
+# "gitzilla", or "gitzilla (<profile>)" in a profile (also passed to GITZILLA_DIALOG_CMD as its third argument).
 dialog() {
-  local out rc=0
+  local out rc=0 title
+  title="$(wd_title gitzilla)"
   if [ -n "${GITZILLA_DIALOG_CMD:-}" ]; then
-    out="$("$GITZILLA_DIALOG_CMD" "$1" "$2" </dev/null 2>/dev/null)"
+    out="$("$GITZILLA_DIALOG_CMD" "$1" "$2" "$title" </dev/null 2>/dev/null)"
   else
     out="$(osascript -e 'on run argv' \
-      -e 'set r to display dialog (item 1 of argv) with title "gitzilla" buttons (words of (item 2 of argv)) default button "Details" giving up after 600' \
+      -e 'set r to display dialog (item 1 of argv) with title (item 3 of argv) buttons (words of (item 2 of argv)) default button "Details" giving up after 600' \
       -e 'if gave up of r then return "TIMEOUT"' \
-      -e 'return button returned of r' -e 'end run' -- "$1" "$(printf '%s' "$2" | tr ',' ' ')" </dev/null 2>/dev/null)" || rc=$?
+      -e 'return button returned of r' -e 'end run' -- "$1" "$(printf '%s' "$2" | tr ',' ' ')" "$title" </dev/null 2>/dev/null)" || rc=$?
     [ "$rc" -eq 0 ] || { wd_log "dialog failed (rc $rc)"; out=""; }
   fi
   case "$out" in Restore|Details|Ignore) echo "$out" ;; *) echo TIMEOUT ;; esac
@@ -70,6 +87,35 @@ dialog() {
 tmp="$(mktemp -d)" || exit 1
 trap 'rm -rf "$tmp"' EXIT
 : > "$tmp/valid.tsv"; : > "$tmp/skipped.jsonl"; : > "$tmp/restored.jsonl"
+
+# can_push <repo>: org profile only. 0 when gh (the profile's own read-only org token, GH_CONFIG_DIR) says this account
+# may push to <repo>; 2 when GitHub answered 404, 403 or 401 (the token does not see the repo: not granted to it, or
+# expired); 1 otherwise (push false, network, timeout). One gh call per repo per run.
+can_push() {
+  local f="$tmp/perm.tsv" v
+  v="$(awk -F'\t' -v r="$1" '$1 == r {print $2; exit}' "$f" 2>/dev/null)"
+  if [ -z "$v" ]; then
+    # bounded: a stalled gh must not hold up the other refs of an incident; a timeout or error is "no"
+    v="$(wd_timeout "$GH_TIMEOUT" "$GH" api "repos/$1" --jq '.permissions.push // .permissions.admin' 2>"$tmp/gh.err")" || v=no
+    v="${v%%$'\n'*}"
+    if [ "$v" != true ]; then
+      case "$(cat "$tmp/gh.err" 2>/dev/null)" in
+        *"(HTTP 404)"*|*"(HTTP 403)"*|*"(HTTP 401)"*) v=hidden ;;
+        *) v=no ;;
+      esac
+    fi
+    printf '%s\t%s\n' "$1" "$v" >> "$f"
+  fi
+  case "$v" in true) return 0 ;; hidden) return 2 ;; *) return 1 ;; esac
+}
+
+# fetch_before <mirror> <url> <sha>: the restore target is not in the mirror (e.g. an org member's push that was
+# overwritten before the agent synced it): ask GitHub for that one commit by its id (GitHub serves an unreferenced
+# commit until it is garbage-collected). Bounded by GITZILLA_FETCH_TIMEOUT seconds (default 60). 0 when it is local now.
+fetch_before() {
+  wd_timeout "$FETCH_TIMEOUT" git -C "$1" fetch --quiet --no-tags "$2" "$3" >/dev/null 2>&1
+  git -C "$1" cat-file -e "$3^{commit}" </dev/null 2>/dev/null
+}
 
 SLUG_RE='^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
 SHA_RE='^[0-9a-f]{40}$'
@@ -161,7 +207,16 @@ while IFS="$(printf '\t')" read -r repo ref before after ts mx; do
   url="$(printf "$REMOTE_TPL" "$repo")"
   if [ ! -d "$mirror" ]; then skip "$repo" "$ref" "old commit not available locally"; continue; fi
   if [ "$before" != "$ZERO" ] && ! git -C "$mirror" cat-file -e "$before" </dev/null 2>/dev/null; then
-    skip "$repo" "$ref" "old commit not available locally"; continue
+    if fetch_before "$mirror" "$url" "$before"; then
+      wd_log "restore: fetched the old commit $before of $repo by its id"
+    else
+      skip "$repo" "$ref" "old commit not available locally"; continue
+    fi
+  fi
+  # org profile without its own signers file: a target cannot be verified (the admin's own file is never used)
+  if [ "$before" != "$ZERO" ] && [ "$ORG_NOSIGNERS" = 1 ]; then
+    wd_log "restore: org profile has no allowed_signers ($GITZILLA_CONFIG_DIR/allowed_signers); $repo $ref skipped"
+    skip "$repo" "$ref" "no org signers file"; write_result; continue
   fi
   # the target must be the owner's signed commit: a chain that starts at an attacker commit is not a restore
   if [ "$before" != "$ZERO" ] && \
@@ -176,9 +231,20 @@ while IFS="$(printf '\t')" read -r repo ref before after ts mx; do
   else
     lease="--force-with-lease=$ref:$after"; spec="$before:$ref"
   fi
+  # org profile: an admin without push access to this repo cannot restore it (and sends no note for it)
+  if [ "${MODE:-}" = org ]; then
+    can_push "$repo"; cp_rc=$?
+    if [ "$cp_rc" = 2 ]; then
+      wd_log "restore: $repo not visible to the profile's gh token ($GH_CONFIG_DIR); $ref skipped"
+      skip "$repo" "$ref" "repo not visible to org token"; write_result; continue
+    elif [ "$cp_rc" != 0 ]; then
+      wd_log "restore: no push permission for $repo; $ref skipped"
+      skip "$repo" "$ref" "no push permission"; write_result; continue
+    fi
+  fi
   # old = what is on the remote now, new = what we are about to put there
   # no note, no push: an un-noted restore would itself be classified critical
-  if ! wd_send_note "$repo" "$ref" "$after" "$before" </dev/null; then
+  if ! wd_send_note "${GITZILLA_URL:-}" "$repo" "$ref" "$after" "$before" </dev/null; then
     wd_log "restore note failed for $repo $ref: $WD_REASON"
     skip "$repo" "$ref" "could not send note${WD_REASON:+ ($WD_REASON)}"; write_result; continue
   fi

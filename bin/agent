@@ -4,13 +4,19 @@
 # to `restore --prompt`. Compatible with macOS bash 3.2.
 #
 # Env overrides (tests): GITZILLA_NOTIFY_CMD, GITZILLA_RESTORE_CMD, GITZILLA_SCAN_CMD,
-# GITZILLA_REMOTE_URL_TEMPLATE, ALLOWED_SIGNERS_FILE.
+# GITZILLA_REMOTE_URL_TEMPLATE, ALLOWED_SIGNERS_FILE (personal only: an org profile (config MODE=org) uses only its own
+# $GITZILLA_CONFIG_DIR/allowed_signers and, when that is missing or empty, does no signature check).
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$here/lib.sh"
 GITZILLA_HOME="${GITZILLA_HOME:-$(cd "$here/.." && pwd)}"
 RESTORE="${GITZILLA_RESTORE_CMD:-$GITZILLA_HOME/bin/restore}"
 SCAN="${GITZILLA_SCAN_CMD:-$GITZILLA_HOME/scanner/scan.sh}" # bundled scanner (GITZILLA_HOME from the config)
-SIGNERS="${ALLOWED_SIGNERS_FILE:-$(wd_allowed_signers)}" # gpg.ssh.allowedSignersFile, else ~/.config/git/allowed_signers
+# personal: gpg.ssh.allowedSignersFile, else ~/.config/git/allowed_signers; org profile: its own allowed_signers only
+SIGNERS="$(wd_signers_file)"
+# Org profile without a usable signers file: no signature check at all (the Worker's classification stands; a member's
+# commit is never "unsigned" just because the admin's file lacks the member's key). The payload scan still runs.
+SIG_CHECK=1
+if [ "${MODE:-}" = org ] && ! wd_org_signers_ok; then SIG_CHECK=0; fi
 REMOTE_TPL="${GITZILLA_REMOTE_URL_TEMPLATE:-git@github.com:%s.git}"
 ZERO=0000000000000000000000000000000000000000
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR
@@ -90,7 +96,10 @@ deep_check() {
   [ "$after" = "$ZERO" ] && { echo ok; return 0; }
   if ! git -C "$m" cat-file -e "$after^{commit}" 2>/dev/null; then echo "ok check-failed"; return 0; fi
   # Signatures
-  if [ "$before" != "$ZERO" ] && git -C "$m" cat-file -e "$before^{commit}" 2>/dev/null; then
+  if [ "$SIG_CHECK" = 0 ]; then
+    out=""
+    wd_log "deep check $slug $ref: org profile has no allowed_signers ($GITZILLA_CONFIG_DIR/allowed_signers); signature check skipped"
+  elif [ "$before" != "$ZERO" ] && git -C "$m" cat-file -e "$before^{commit}" 2>/dev/null; then
     out="$(git -C "$m" -c gpg.ssh.allowedSignersFile="$SIGNERS" log --format='%H %G?' "$before..$after" 2>/dev/null </dev/null)" || out="?"
   else
     out="$(unsigned_scan "$m" "$after" "$excl")" || out="?"
@@ -284,6 +293,18 @@ poll_main() {
       jq -cn --argjson seq "$seq" --arg f "$fl" '{seq:$seq,add:($f|split(" ")|map(select(length>0)))}' >> "$tmp/adds.jsonl"
     done < "$tmp/rows"
   done < "$tmp/repos"
+
+  # Org profile: a member's push reaches this Mac only through the mirror (no hook here copies it in), so the repos
+  # with only silent pushes are synced too (no deep check): their new tips are then local, and restore can put such a
+  # commit back after an attacker force-pushes over it. A failed sync is logged, never fatal.
+  if [ "${MODE:-}" = org ]; then
+    jq -r '.[] | select(.kind == "push" and .level == "silent") | .repo' "$tmp/all.json" | sort -u \
+      | while read -r repo; do
+          [ -n "$repo" ] || continue
+          grep -qxF -- "$repo" "$tmp/repos" && continue
+          sync_mirror "$repo" || wd_log "mirror sync failed for $repo (silent pushes)"
+        done
+  fi
 
   jq --slurpfile adds <(jq -s . "$tmp/adds.jsonl") '
     ($adds[0] | map({key:(.seq|tostring), value:.add}) | from_entries) as $m

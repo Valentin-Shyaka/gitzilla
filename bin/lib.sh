@@ -1,8 +1,41 @@
-# gitzilla shared helpers. Source me; defines functions/defaults only (no output, no exit).
+# gitzilla shared helpers. Source me; defines functions/defaults only (no output, no exit), except that an invalid
+# GITZILLA_PROFILE stops the caller (exit 2) before anything is read or written.
 # Compatible with macOS bash 3.2.
 
-GITZILLA_CONFIG_DIR="${GITZILLA_CONFIG_DIR:-$HOME/.config/gitzilla}"
-STATE="${GITZILLA_STATE_DIR:-$HOME/.local/state/gitzilla}"
+# Profiles: GITZILLA_PROFILE=<p> runs a separate instance (an org's, next to the personal one) with its config in
+# ~/.config/gitzilla/<p>, its state, log and mirrors in ~/.local/state/gitzilla/<p>, and its own launchd labels.
+# Unset or empty = personal: today's paths. GITZILLA_CONFIG_DIR / GITZILLA_STATE_DIR, when set, still win (the
+# launchd jobs set both). A profile may not be named like an entry bin/* or install.sh writes directly in the
+# personal config dir or state dir (WD_RESERVED_NAMES), since its directory would then be that file or directory.
+# Entries with a dot (repos.txt, rotation.json, ...) cannot collide: a profile name has no dot. Keep this list
+# complete when a new file is added under $GITZILLA_CONFIG_DIR or $STATE.
+WD_RESERVED_NAMES="config jq-path log mirrors incidents install-step install-set-hookspath install-secrets-rotated
+queue-cursor queue-fail-since queue-notified health-notified health-fail-since reconcile-all-at allowed_signers gh
+gh-token-checked-at gh-token-notified"
+GITZILLA_PROFILE="${GITZILLA_PROFILE:-}"
+if [ -n "$GITZILLA_PROFILE" ]; then
+  _wd_ok='^[a-z0-9][a-z0-9-]{0,39}$'
+  if [[ $GITZILLA_PROFILE =~ $_wd_ok ]]; then _wd_ok=1; else _wd_ok=0; fi
+  for _wd_r in $WD_RESERVED_NAMES; do [ "$GITZILLA_PROFILE" = "$_wd_r" ] && _wd_ok=0; done
+  unset _wd_r
+  if [ "$_wd_ok" != 1 ]; then
+    printf 'gitzilla: invalid GITZILLA_PROFILE: use 1-40 lower-case letters, digits or hyphens, starting with a letter or digit, and not a name gitzilla uses for its own files (%s)\n' "$(echo $WD_RESERVED_NAMES)" >&2
+    exit 2
+  fi
+  unset _wd_ok
+  GITZILLA_CONFIG_DIR="${GITZILLA_CONFIG_DIR:-$HOME/.config/gitzilla/$GITZILLA_PROFILE}"
+  STATE="${GITZILLA_STATE_DIR:-$HOME/.local/state/gitzilla/$GITZILLA_PROFILE}"
+else
+  GITZILLA_CONFIG_DIR="${GITZILLA_CONFIG_DIR:-$HOME/.config/gitzilla}"
+  STATE="${GITZILLA_STATE_DIR:-$HOME/.local/state/gitzilla}"
+fi
+# A profile has its own gh login (install.sh's prereqs step: a read-only fine-grained token whose resource owner is the
+# org), kept by gh in <profile config dir>/gh, never the personal login (a user-owned token cannot see an org's private
+# repos). The gh token variables would override that store, so a profile drops them. Personal: gh as it is.
+if [ -n "$GITZILLA_PROFILE" ]; then
+  GH_CONFIG_DIR="$GITZILLA_CONFIG_DIR/gh"; export GH_CONFIG_DIR
+  unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN GH_HOST
+fi
 SECRETIVE_SOCK="$HOME/Library/Containers/com.maxgoedjen.Secretive.SecretAgent/Data/socket.ssh"
 WD_REVOKE="If this wasn't you: revoke tokens at https://github.com/settings/applications"
 WD_REASON=""
@@ -16,8 +49,41 @@ wd_allowed_signers() {
   printf '%s\n' "${f:-$HOME/.config/git/allowed_signers}"
 }
 
+# The org-profile settings come only from the profile's config (install.sh --org writes them), never from the
+# environment: a stray exported MODE=org must not turn the personal instance into an org one.
+unset MODE ORG WORKER_NAME WEB_FLOW
 # shellcheck disable=SC1090
 [ -f "$GITZILLA_CONFIG_DIR/config" ] && . "$GITZILLA_CONFIG_DIR/config"
+
+# wd_signers_file: the allowed-signers file the signature checks (agent deep check, restore target) use. Personal:
+# ALLOWED_SIGNERS_FILE (tests), else git's (wd_allowed_signers). Org profile (MODE=org): only the profile's own
+# $GITZILLA_CONFIG_DIR/allowed_signers (the members' commit-signing keys), never the admin's personal one; it may be
+# missing or empty, which wd_org_signers_ok reports.
+wd_signers_file() {
+  if [ "${MODE:-}" = org ]; then printf '%s\n' "$GITZILLA_CONFIG_DIR/allowed_signers"
+  else printf '%s\n' "${ALLOWED_SIGNERS_FILE:-$(wd_allowed_signers)}"; fi
+}
+# wd_org_signers_ok: org profile only; 0 when the profile's allowed_signers holds at least one non-comment line.
+wd_org_signers_ok() {
+  [ -s "$GITZILLA_CONFIG_DIR/allowed_signers" ] && grep -qv '^[[:space:]]*\(#\|$\)' "$GITZILLA_CONFIG_DIR/allowed_signers" 2>/dev/null
+}
+
+# wd_timeout <seconds> <cmd...>: run cmd, kill it after <seconds>, then print what it wrote to stdout (stderr passes
+# through). Returns cmd's status (non-zero when it was killed). The output goes through a temp file, not a pipe, so a
+# $(...) caller never waits for a killed command's children (or the watcher) to let go of the pipe.
+wd_timeout() {
+  local s="$1" pid w rc f
+  shift
+  f="$(mktemp)" || return 1
+  "$@" > "$f" </dev/null &
+  pid=$!
+  ( sleep "$s"; kill "$pid" 2>/dev/null ) >/dev/null 2>&1 </dev/null &
+  w=$!
+  wait "$pid"; rc=$?
+  kill "$w" 2>/dev/null; wait "$w" 2>/dev/null
+  cat "$f"; rm -f "$f"
+  return "$rc"
+}
 
 # Hooks run from GUI git clients (GitHub Desktop, Tower, Xcode, ...) get PATH=/usr/bin:/bin:/usr/sbin:/sbin. When no jq
 # is on PATH, use the one install.sh's hook step recorded in $GITZILLA_CONFIG_DIR/jq-path.
@@ -51,13 +117,27 @@ wd_log() {
   return 0
 }
 
-# wd_notify <title> <message>: desktop notification (GITZILLA_NOTIFY_CMD overrides, for tests).
+# wd_title <title>: in a profile, "gitzilla: X" -> "gitzilla (<profile>): X" and "gitzilla" -> "gitzilla (<profile>)", so
+# an org's notifications and dialogs are told apart from the personal ones. Personal: unchanged.
+wd_title() {
+  if [ -z "$GITZILLA_PROFILE" ]; then printf '%s\n' "$1"; return 0; fi
+  case "$1" in
+    gitzilla) printf 'gitzilla (%s)\n' "$GITZILLA_PROFILE" ;;
+    gitzilla:*) printf 'gitzilla (%s):%s\n' "$GITZILLA_PROFILE" "${1#gitzilla:}" ;;
+    *) printf '%s (%s)\n' "$1" "$GITZILLA_PROFILE" ;;
+  esac
+}
+
+# wd_notify <title> <message>: desktop notification (GITZILLA_NOTIFY_CMD overrides, for tests). The title names the
+# profile (wd_title).
 wd_notify() {
+  local t
+  t="$(wd_title "$1")"
   if [ -n "${GITZILLA_NOTIFY_CMD:-}" ]; then
-    "$GITZILLA_NOTIFY_CMD" "$1" "$2" </dev/null >/dev/null 2>&1 || { wd_log "notify command failed"; return 1; }
+    "$GITZILLA_NOTIFY_CMD" "$t" "$2" </dev/null >/dev/null 2>&1 || { wd_log "notify command failed"; return 1; }
   else
     osascript -e 'on run argv' -e 'display notification (item 2 of argv) with title (item 1 of argv)' \
-      -e 'end run' -- "$1" "$2" </dev/null >/dev/null 2>&1 || { wd_log "osascript notify failed"; return 1; }
+      -e 'end run' -- "$t" "$2" </dev/null >/dev/null 2>&1 || { wd_log "osascript notify failed"; return 1; }
   fi
   return 0
 }
@@ -107,11 +187,53 @@ wd_sign() {
   return "$rc"
 }
 
-# wd_send_note <repo> <ref> <old_sha> <new_sha> -> 0 on 204; on failure sets WD_REASON, returns 1
+# ---- organizations. The personal config's ORG_WORKERS holds space-separated "<org-login>=<worker-url>" pairs
+# (install.sh --join-org writes it): pushes to that org's repos send their note to that org's Worker.
+# GitHub login, lower-cased (the Worker's LOGIN_RE); "_" for Enterprise Managed Users (<user>_<shortcode>)
+WD_LOGIN_RE='^[a-z0-9][a-z0-9_-]{0,38}$'
+WD_BOT_RE='^[a-z0-9][a-z0-9_-]{0,38}(\[bot\])?$' # an allow-listed bot login (the Worker's BOT_RE)
+WD_FP_RE='^SHA256:[A-Za-z0-9+/]{43}$'
+
+# wd_lc <s> -> lower-cased s
+wd_lc() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# wd_valid_worker_url <url>: an https origin with no path (http only for 127.0.0.1 / localhost, for tests).
+wd_valid_worker_url() {
+  local re_https='^https://[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?(:[0-9]{1,5})?$'
+  local re_local='^http://(127\.0\.0\.1|localhost)(:[0-9]{1,5})?$'
+  [[ $1 =~ $re_https ]] || [[ $1 =~ $re_local ]]
+}
+
+# wd_org_worker <org-login>: the Worker URL ORG_WORKERS holds for that org (compared lower-cased), or nothing.
+wd_org_worker() {
+  local want pair o u pairs=()
+  want="$(wd_lc "$1")"
+  [ -n "$want" ] || return 0
+  # split without globbing: a hand-edited entry with * or ? must not expand to file names
+  IFS=$' \t\n' read -r -d '' -a pairs <<< "${ORG_WORKERS:-}" || true
+  for pair in ${pairs[@]+"${pairs[@]}"}; do
+    o="$(wd_lc "${pair%%=*}")"; u="${pair#*=}"
+    [ "$o" = "$want" ] && [ "$pair" != "$u" ] && wd_valid_worker_url "$u" && { printf '%s\n' "$u"; return 0; }
+  done
+  return 0
+}
+
+# wd_envelope <namespace> <payload-file> <body-file>: sign the payload; write {payload: base64, sig} to body-file.
+# Sets WD_REASON and returns 1 on failure.
+wd_envelope() {
+  local sig
+  if ! sig="$(wd_sign "$1" "$2")"; then WD_REASON="signing failed"; return 1; fi
+  if ! jq -cn --arg p "$(base64 < "$2" | tr -d '\n')" --arg s "$sig" '{payload:$p,sig:$s}' > "$3"; then
+    WD_REASON="body build failed"; return 1
+  fi
+}
+
+# wd_send_note <worker-url> <repo> <ref> <old_sha> <new_sha> -> 0 on 204; on failure sets WD_REASON, returns 1.
+# The note goes to <worker-url>/note: the personal Worker for the owner's repos, an org's Worker for its repos.
 wd_send_note() {
-  local repo="$1" ref="$2" old="$3" new="$4" dir payload sig body code
+  local url="$1" repo="$2" ref="$3" old="$4" new="$5" dir payload sig body code
   WD_REASON=""
-  if [ -z "${GITZILLA_URL:-}" ] || { [ -z "${GITZILLA_SIGN_KEY:-}" ] && [ -z "${NOTE_PUBKEY_FILE:-}" ]; }; then
+  if [ -z "$url" ] || { [ -z "${GITZILLA_SIGN_KEY:-}" ] && [ -z "${NOTE_PUBKEY_FILE:-}" ]; }; then
     WD_REASON="not configured"; return 1
   fi
   dir="$(mktemp -d)" || { WD_REASON="no temp dir"; return 1; }
@@ -127,7 +249,7 @@ wd_send_note() {
     WD_REASON="body build failed"; rm -rf "$dir"; return 1
   fi
   code="$(curl --max-time 5 -sS -o /dev/null -w '%{http_code}' -X POST \
-          -H 'Content-Type: application/json' --data-binary @"$dir/body" "$GITZILLA_URL/note" 2>/dev/null)"
+          -H 'Content-Type: application/json' --data-binary @"$dir/body" "$url/note" 2>/dev/null)"
   rm -rf "$dir"
   if [ "$code" = "204" ]; then return 0; fi
   case "$code" in ""|000) WD_REASON="worker unreachable" ;; *) WD_REASON="worker returned $code" ;; esac
@@ -191,6 +313,7 @@ wd_send_report() {
 
 # wd_send_alert new-key <key_type> <fingerprint> <auth|signing>
 # wd_send_alert missed-webhook <refs> <repos>
+# wd_send_alert test                       (bin/notify-test: exactly {kind, ts, nonce})
 # Signed account alert to the Worker (POST /alert -> phone + Slack; the Worker writes the text). 0 on 204; on
 # failure sets WD_REASON, returns 1.
 wd_send_alert() {
@@ -207,6 +330,8 @@ wd_send_alert() {
     missed-webhook)
       jq -cn --argjson r "$2" --argjson p "$3" --argjson ts "$(date +%s)" --arg nonce "$(openssl rand -hex 16)" \
         '{kind:"missed-webhook",ts:$ts,nonce:$nonce,refs:$r,repos:$p}' ;;
+    test)
+      jq -cn --argjson ts "$(date +%s)" --arg nonce "$(openssl rand -hex 16)" '{kind:"test",ts:$ts,nonce:$nonce}' ;;
     *) false ;;
   esac 2>/dev/null | tr -d '\n' > "$dir/payload"
   if [ ! -s "$dir/payload" ]; then WD_REASON="payload build failed"; rm -rf "$dir"; return 1; fi

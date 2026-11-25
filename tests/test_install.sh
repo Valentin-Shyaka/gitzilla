@@ -21,11 +21,23 @@ export GITZILLA_NODE_PATH_FILE="$T/node-path" # never write scanner/node-path in
 cat > "$S/gh" <<STUB
 #!/bin/sh
 echo "\$*" >> "$T/gh.log"
+echo "GH_CONFIG_DIR=\${GH_CONFIG_DIR:-} GH_TOKEN=\${GH_TOKEN:-} | \$*" >> "$T/gh.env"
 case "\$1 \$2" in
-  "auth status") [ -f "$T/gh.noauth" ] && exit 1; exit 0 ;;
+  "auth status") [ -f "$T/gh.noauth" ] && exit 1
+                 # the personal login (gh's default store), broken by a login that clobbered it
+                 [ -z "\${GH_CONFIG_DIR:-}" ] && [ -f "$T/gh.personal.broken" ] && exit 1
+                 # a profile's own store (GH_CONFIG_DIR): logged in once "auth login" wrote it
+                 case "\${GH_CONFIG_DIR:-}" in *gitzilla*) [ -f "\$GH_CONFIG_DIR/hosts.yml" ] || exit 1 ;; esac
+                 exit 0 ;;
+  "auth login") tok="\$(cat)"; printf '%s' "\$tok" > "$T/gh.stdin"
+                [ -f "$T/gh.loginfail" ] && exit 1
+                [ -f "$T/gh.clobber" ] && touch "$T/gh.personal.broken"
+                mkdir -p "\$GH_CONFIG_DIR"; echo "oauth_token: (stub)" > "\$GH_CONFIG_DIR/hosts.yml"; exit 0 ;;
   "api user") if [ -f "$T/gh.login" ]; then cat "$T/gh.login"; else echo Alice; fi ;;
   "repo list") cat "$T/gh.repos" ;;
   "repo view") [ -f "$T/gh.norepo" ] && exit 1; exit 0 ;;
+  "api repos/"*) if [ -f "$T/gh.404" ] && grep -qx "\$2" "$T/gh.404"; then echo "gh: Not Found (HTTP 404)" >&2; exit 1; fi
+                if [ -f "$T/gh.perm" ]; then cat "$T/gh.perm"; else echo true; fi ;;
   "repo create") [ -f "$T/gh.createfail" ] && exit 1; rm -f "$T/gh.norepo"; exit 0 ;;
 esac
 STUB
@@ -38,7 +50,10 @@ cat > "$S/npx" <<STUB
 echo "npx \$*" >> "$T/npx.log"
 case "\$2" in
   login) ;;
-  deploy) echo "Uploaded gitzilla"; echo "Deployed gitzilla triggers"; [ -f "$T/deploy.nourl" ] || echo "  https://gitzilla.alice.workers.dev" ;;
+  deploy) echo "Uploaded gitzilla"; echo "Deployed gitzilla triggers"
+          if [ ! -f "$T/deploy.nourl" ]; then
+            case " \$* " in *" --name gitzilla-acme "*) echo "  https://gitzilla-acme.alice.workers.dev" ;; *) echo "  https://gitzilla.alice.workers.dev" ;; esac
+          fi ;;
   secret) cat > "$T/secrets/\$4" ;;
   logout) [ -f "$T/tokens.stay" ] || rm -f "\$HOME/.wrangler/config/default.toml"; [ -f "$T/logout.fail" ] && exit 1 ;;
 esac
@@ -80,7 +95,7 @@ echo "\$url" >> "$T/curl.log"
 case "\$url" in
   https://github.com/alice.keys) f="$T/curl/auth.keys" ;;
   "https://api.github.com/users/alice/ssh_signing_keys?per_page=100") f="$T/curl/signing.json" ;;
-  https://gitzilla.alice.workers.dev/queue*)
+  https://gitzilla.alice.workers.dev/queue*|https://gitzilla-acme.alice.workers.dev/queue*)
     echo "\$auth" >> "$T/queue.auth"; echo "\$url" >> "$T/queue.urls"
     [ -f "$T/curl/queue.json" ] || { printf 404; exit 0; }
     n=\$(( \$(wc -l < "$T/queue.urls") )); a="\${url##*after=}"
@@ -165,6 +180,16 @@ assert_contains "$(out)" "prereqs note-key worker github-app hook repos mirrors 
 assert_eq "" "$(step_file)" "unknown step: no state written"
 run --from-step
 assert_eq 2 "$(rc)" "--from-step without a name: exit 2"
+run --bogus
+assert_eq 2 "$(rc)" "unknown argument: exit 2"
+assert_contains "$(out)" "install.sh --org <org-login> [--from-step <name>]" "usage names --org"
+assert_contains "$(out)" "install.sh --join-org <https-worker-url>" "usage names --join-org"
+run --from-step
+assert_contains "$(out)" "install.sh --org <org-login>" "--from-step usage names --org"
+assert_contains "$(out)" "install.sh --join-org" "--from-step usage names --join-org"
+run --help
+assert_eq 0 "$(rc)" "--help: exit 0"
+assert_contains "$(out)" "install.sh --org <org-login>" "--help names --org"
 
 # --- 2. prereqs
 reset
@@ -307,6 +332,10 @@ assert_contains "$(out)" "KEEP" "worker rerun asks"
 assert_eq 0 "$(nmatch 'secret' "$T/npx.log")" "worker keep: no secret put"
 assert_contains "$(cat "$T/npx.log")" "deploy --var NOTE_PUBKEY:" "worker keep: still redeploys with NOTE_PUBKEY"
 assert_eq 0 "$([ -e "$STATE/install-secrets-rotated" ] && echo 1 || echo 0)" "worker keep: no rotated marker"
+printf 'ORG_WORKERS=%q\n' "acme=https://gz.acme.workers.dev beta=https://gz.beta.workers.dev" >> "$GITZILLA_CONFIG_DIR/config"
+GITZILLA_INSTALL_STOP_AFTER=worker runin '\n' --from-step worker
+assert_eq "acme=https://gz.acme.workers.dev beta=https://gz.beta.workers.dev" "$( . "$GITZILLA_CONFIG_DIR/config"; printf '%s' "$ORG_WORKERS")" "worker rerun keeps the orgs joined with --join-org"
+assert_eq 1 "$(grep -c '^ORG_WORKERS=' "$GITZILLA_CONFIG_DIR/config" | tr -d ' ')" "worker rerun: one ORG_WORKERS line"
 : > "$T/npx.log"
 GITZILLA_INSTALL_STOP_AFTER=worker runin 'r\n' --from-step worker
 assert_eq 0 "$(nmatch 'secret' "$T/npx.log")" "worker: typing just 'r' keeps"
@@ -348,6 +377,154 @@ GITZILLA_INSTALL_STOP_AFTER=worker runin 'http://hooks.slack.com/services/x\n' -
 assert_eq 1 "$(rc)" "worker: a non-https Slack URL fails"
 assert_contains "$(out)" "must start with https://" "worker: says why"
 assert_eq 0 "$(nmatch 'secret put' "$T/npx.log")" "worker: no secret put when the Slack URL is rejected"
+# red-alert calls: numbers + ntfy token, both hidden, piped on stdin, never in argv / output / files
+CN1="+250788123442"; CN2="+14155550142"; CTOK="tk_AbCdEfGhIjKlMnOpQrStUvWxYz012"
+NUM_PROMPT="Phone numbers for red-alert calls, comma-separated +E164 (ntfy Pro; Enter to skip) (input hidden): "
+TOK_PROMPT="ntfy access token (tk_...) (input hidden): "
+no_call_secret_anywhere() { # msg
+  local h
+  h="$(grep -rlF -e "$CTOK" -e "$CN1" -e "$CN2" -e "${CN1#+}" "$HOME" "$STATE" "$GITZILLA_CONFIG_DIR" "$T/npx.log" "$T/npm.log" "$T/out" 2>/dev/null)"
+  assert_eq "" "$h" "$1"
+}
+reset
+mkkey notekey ecdsa; cp "$T/keys/notekey.pub" "$GITZILLA_CONFIG_DIR/push-note.pub"
+GITZILLA_INSTALL_STOP_AFTER=worker runin "$SLACK\n$CN1, $CN2\n$CTOK\n" --from-step worker
+assert_eq 0 "$(rc)" "calls: worker ok with numbers and token"
+assert_contains "$(out)" "$NUM_PROMPT" "calls: asks for the numbers (hidden)"
+assert_contains "$(out)" "$TOK_PROMPT" "calls: asks for the token (hidden)"
+assert_eq "$CN1,$CN2" "$(cat "$T/secrets/NTFY_CALL_NUMBERS")" "calls: numbers piped to secret put NTFY_CALL_NUMBERS"
+assert_eq "$CTOK" "$(cat "$T/secrets/NTFY_CALL_TOKEN")" "calls: token piped to secret put NTFY_CALL_TOKEN"
+assert_eq 5 "$(nmatch 'secret put' "$T/npx.log")" "calls: five secrets put"
+assert_eq 1 "$(nmatch 'secret put NTFY_CALL_NUMBERS' "$T/npx.log")" "calls: NTFY_CALL_NUMBERS put once"
+assert_eq 1 "$(nmatch 'secret put NTFY_CALL_TOKEN' "$T/npx.log")" "calls: NTFY_CALL_TOKEN put once"
+no_call_secret_anywhere "calls: numbers and token never in argv log, output, config or state"
+assert_eq 1 "$(nmatch 'logout' "$T/npx.log")" "calls: wrangler logout still runs"
+# rotate mode asks too
+printf 'rotate\n\n%s\n%s\n' "$CN1" "$CTOK" > "$T/in.rotate"; : > "$T/npx.log"; rm -rf "$T/secrets"; mkdir -p "$T/secrets"
+GITZILLA_INSTALL_STOP_AFTER=worker bash "$INSTALL" --from-step worker < "$T/in.rotate" >"$T/out" 2>&1; echo $? > "$T/rc"
+assert_eq 0 "$(rc)" "calls: rotate ok"
+assert_eq "$CN1" "$(cat "$T/secrets/NTFY_CALL_NUMBERS")" "calls: rotate puts the numbers"
+assert_eq 4 "$(nmatch 'secret put' "$T/npx.log")" "calls: rotate without Slack puts four secrets"
+no_call_secret_anywhere "calls: rotate leaks nothing"
+# keep mode: no call prompt, no secret
+: > "$T/npx.log"
+GITZILLA_INSTALL_STOP_AFTER=worker runin '\n' --from-step worker
+case "$(out)" in *"$NUM_PROMPT"*) _bad "calls: keep mode must not ask for numbers" ;; *) _ok ;; esac
+assert_eq 0 "$(nmatch 'NTFY_CALL' "$T/npx.log")" "calls: keep mode puts no call secret"
+# skip: Enter at the numbers prompt -> no token prompt, no call secrets
+reset
+mkkey notekey ecdsa; cp "$T/keys/notekey.pub" "$GITZILLA_CONFIG_DIR/push-note.pub"
+GITZILLA_INSTALL_STOP_AFTER=worker runin "$SLACK\n\n" --from-step worker
+assert_eq 0 "$(rc)" "calls: skip ok"
+assert_contains "$(out)" "$NUM_PROMPT" "calls: skip still asks for numbers"
+case "$(out)" in *"$TOK_PROMPT"*) _bad "calls: no token prompt without numbers" ;; *) _ok ;; esac
+assert_eq 0 "$(nmatch 'NTFY_CALL' "$T/npx.log")" "calls: skip puts no call secret"
+assert_eq 3 "$(nmatch 'secret put' "$T/npx.log")" "calls: skip puts the other three"
+assert_contains "$(out)" "Calls skipped" "calls: says calls were skipped"
+# invalid inputs die before any secret put, and never echo the value
+for bad in "0788123442" "+0123456789" "+1234" "+1234567890123456" "$CN1,,$CN2" "$CN1;$CN2" \
+           "+14155550101,+14155550102,+14155550103,+14155550104,+14155550105,+14155550106"; do
+  reset
+  mkkey notekey ecdsa; cp "$T/keys/notekey.pub" "$GITZILLA_CONFIG_DIR/push-note.pub"
+  GITZILLA_INSTALL_STOP_AFTER=worker runin "$SLACK\n$bad\n$CTOK\n" --from-step worker
+  assert_eq 1 "$(rc)" "calls: invalid numbers '$bad' fail"
+  assert_eq 0 "$(nmatch 'secret put' "$T/npx.log")" "calls: no secret put for '$bad'"
+  case "$(out)" in *"${bad#+}"*) _bad "calls: invalid input '$bad' echoed" ;; *) _ok ;; esac
+  assert_eq "" "$(step_file)" "calls: step not recorded for '$bad'"
+done
+assert_contains "$(out)" "at most 5" "calls: too many numbers says the limit"
+reset
+mkkey notekey ecdsa; cp "$T/keys/notekey.pub" "$GITZILLA_CONFIG_DIR/push-note.pub"
+GITZILLA_INSTALL_STOP_AFTER=worker runin "$SLACK\n0788\n" --from-step worker
+assert_eq 1 "$(rc)" "calls: a local-format number fails"
+assert_contains "$(out)" "+E164" "calls: invalid number message says +E164"
+for badtok in "tk_short" "tk_AbCdEfGhIjKlMnOpQrStUvWxYz0123" "xx_AbCdEfGhIjKlMnOpQrStUvWxYz012" "tk_AbCdEfGhIjKlMnOpQrStUvWxY-012" ""; do
+  reset
+  mkkey notekey ecdsa; cp "$T/keys/notekey.pub" "$GITZILLA_CONFIG_DIR/push-note.pub"
+  GITZILLA_INSTALL_STOP_AFTER=worker runin "$SLACK\n$CN1\n$badtok\n" --from-step worker
+  assert_eq 1 "$(rc)" "calls: invalid token '$badtok' fails"
+  assert_contains "$(out)" "ntfy access token" "calls: says the token is invalid ('$badtok')"
+  assert_eq 0 "$(nmatch 'secret put' "$T/npx.log")" "calls: no secret put for token '$badtok'"
+  case "$badtok" in ?*) case "$(out)" in *"$badtok"*) _bad "calls: token '$badtok' echoed" ;; *) _ok ;; esac ;; esac
+  no_call_secret_anywhere "calls: nothing leaked on a bad token"
+done
+# a mistyped number or token is asked again (up to 3 tries): the one-time secrets were already printed
+NOT_SAVED="not saved"
+reset
+mkkey notekey ecdsa; cp "$T/keys/notekey.pub" "$GITZILLA_CONFIG_DIR/push-note.pub"
+GITZILLA_INSTALL_STOP_AFTER=worker runin "$SLACK\n0788123442\n$CN1\n$CTOK\n" --from-step worker
+assert_eq 0 "$(rc)" "calls retry: a mistyped number then a good one succeeds"
+assert_eq 2 "$(out | grep -o 'Phone numbers for red-alert calls' | wc -l | tr -d ' ')" "calls retry: numbers asked twice"
+assert_contains "$(out)" "+E164" "calls retry: says why the number was refused"
+assert_eq "$CN1" "$(cat "$T/secrets/NTFY_CALL_NUMBERS")" "calls retry: the good numbers are put"
+case "$(out)" in *0788123442*) _bad "calls retry: mistyped number echoed" ;; *) _ok ;; esac
+reset
+mkkey notekey ecdsa; cp "$T/keys/notekey.pub" "$GITZILLA_CONFIG_DIR/push-note.pub"
+GITZILLA_INSTALL_STOP_AFTER=worker runin "$SLACK\n$CN1\ntk_short\n$CTOK\n" --from-step worker
+assert_eq 0 "$(rc)" "calls retry: a mistyped token then a good one succeeds"
+assert_eq 2 "$(out | grep -o 'ntfy access token (tk_' | wc -l | tr -d ' ')" "calls retry: token asked twice"
+assert_eq 1 "$(out | grep -o 'Phone numbers for red-alert calls' | wc -l | tr -d ' ')" "calls retry: numbers not asked again for a bad token"
+assert_eq "$CTOK" "$(cat "$T/secrets/NTFY_CALL_TOKEN")" "calls retry: the good token is put"
+no_call_secret_anywhere "calls retry: nothing leaked"
+reset
+mkkey notekey ecdsa; cp "$T/keys/notekey.pub" "$GITZILLA_CONFIG_DIR/push-note.pub"
+GITZILLA_INSTALL_STOP_AFTER=worker runin "$SLACK\n0788\n+1234\n$CN1;$CN2\n$CN1\n$CTOK\n" --from-step worker
+assert_eq 1 "$(rc)" "calls retry: three mistyped numbers give up"
+assert_eq 3 "$(out | grep -o 'Phone numbers for red-alert calls' | wc -l | tr -d ' ')" "calls retry: at most 3 tries"
+assert_eq 0 "$(nmatch 'secret put' "$T/npx.log")" "calls retry: no secret put after giving up"
+assert_contains "$(out)" "$NOT_SAVED" "calls retry: says the secrets shown are not saved"
+assert_contains "$(out)" "--from-step worker" "calls retry: says to rerun the worker step"
+assert_contains "$(out)" "type rotate" "calls retry: says to type rotate"
+assert_eq "" "$(step_file)" "calls retry: step not recorded"
+reset
+mkkey notekey ecdsa; cp "$T/keys/notekey.pub" "$GITZILLA_CONFIG_DIR/push-note.pub"
+GITZILLA_INSTALL_STOP_AFTER=worker runin "$SLACK\n$CN1\ntk_a\ntk_b\ntk_c\n$CTOK\n" --from-step worker
+assert_eq 1 "$(rc)" "calls retry: three mistyped tokens give up"
+assert_eq 3 "$(out | grep -o 'ntfy access token (tk_' | wc -l | tr -d ' ')" "calls retry: token at most 3 tries"
+assert_contains "$(out)" "$NOT_SAVED" "calls retry: token give-up says the secrets are not saved"
+assert_contains "$(out)" "type rotate" "calls retry: token give-up says to type rotate"
+assert_eq 0 "$(nmatch 'secret put' "$T/npx.log")" "calls retry: no secret put after token give-up"
+# end of input after a mistyped value: the same message, no hang
+reset
+mkkey notekey ecdsa; cp "$T/keys/notekey.pub" "$GITZILLA_CONFIG_DIR/push-note.pub"
+GITZILLA_INSTALL_STOP_AFTER=worker runin "$SLACK\n0788\n" --from-step worker
+assert_eq 1 "$(rc)" "calls retry: end of input after a mistyped number fails"
+assert_contains "$(out)" "$NOT_SAVED" "calls retry: end of input says the secrets are not saved"
+# Slack URL: same retry
+reset
+mkkey notekey ecdsa; cp "$T/keys/notekey.pub" "$GITZILLA_CONFIG_DIR/push-note.pub"
+GITZILLA_INSTALL_STOP_AFTER=worker runin "http://x\n$SLACK\n\n" --from-step worker
+assert_eq 0 "$(rc)" "slack retry: a non-https URL then a good one succeeds"
+assert_eq "$SLACK" "$(cat "$T/secrets/SLACK_WEBHOOK_URL")" "slack retry: the good URL is put"
+# calls skipped on rotate: older NTFY_CALL_* secrets may still be in the Worker, so do not claim calls are off
+CALLS_KEPT="Call settings unchanged in the Worker; to remove them: npx wrangler secret delete NTFY_CALL_NUMBERS / NTFY_CALL_TOKEN"
+reset
+mkkey notekey ecdsa; cp "$T/keys/notekey.pub" "$GITZILLA_CONFIG_DIR/push-note.pub"
+GITZILLA_INSTALL_STOP_AFTER=worker runin "$SLACK\n\n" --from-step worker
+case "$(out)" in *"$CALLS_KEPT"*) _bad "calls skipped (fresh): no 'unchanged' message" ;; *) _ok ;; esac
+: > "$T/npx.log"
+GITZILLA_INSTALL_STOP_AFTER=worker runin "rotate\n$SLACK\n\n" --from-step worker
+assert_eq 0 "$(rc)" "calls skipped (rotate): ok"
+assert_contains "$(out)" "$CALLS_KEPT" "calls skipped (rotate): says the call settings are unchanged and how to remove them"
+case "$(out)" in *"do not ring the phone"*) _bad "calls skipped (rotate): must not claim calls are off" ;; *) _ok ;; esac
+assert_eq 0 "$(nmatch 'NTFY_CALL' "$T/npx.log")" "calls skipped (rotate): no call secret put or deleted"
+# Slack skipped on rotate: an older SLACK_WEBHOOK_URL may still be in the Worker, so do not claim Slack is off
+SLACK_KEPT="Slack setting unchanged in the Worker; to remove it: npx wrangler secret delete SLACK_WEBHOOK_URL"
+reset
+mkkey notekey ecdsa; cp "$T/keys/notekey.pub" "$GITZILLA_CONFIG_DIR/push-note.pub"
+GITZILLA_INSTALL_STOP_AFTER=worker runin "$SLACK\n\n" --from-step worker
+case "$(out)" in *"$SLACK_KEPT"*) _bad "slack (fresh, set): no 'unchanged' message" ;; *) _ok ;; esac
+: > "$T/npx.log"
+GITZILLA_INSTALL_STOP_AFTER=worker runin "rotate\n\n\n" --from-step worker
+assert_eq 0 "$(rc)" "slack skipped (rotate): ok"
+assert_contains "$(out)" "$SLACK_KEPT" "slack skipped (rotate): says the Slack setting is unchanged and how to remove it"
+case "$(out)" in *"phone (ntfy) only"*) _bad "slack skipped (rotate): must not claim alerts go to the phone only" ;; *) _ok ;; esac
+assert_eq 0 "$(nmatch 'SLACK_WEBHOOK_URL' "$T/npx.log")" "slack skipped (rotate): no Slack secret put or deleted"
+reset
+mkkey notekey ecdsa; cp "$T/keys/notekey.pub" "$GITZILLA_CONFIG_DIR/push-note.pub"
+GITZILLA_INSTALL_STOP_AFTER=worker runin '\n\n' --from-step worker
+case "$(out)" in *"$SLACK_KEPT"*) _bad "slack skipped (fresh): no 'unchanged' message" ;; *) _ok ;; esac
+assert_contains "$(out)" "Slack skipped: alerts go to the phone (ntfy) only" "slack skipped (fresh): says Slack is off"
 # alert time zone: GITZILLA_ALERT_TZ wins, the config value is kept on a rerun, no usable zone -> UTC
 reset
 mkkey notekey ecdsa; cp "$T/keys/notekey.pub" "$GITZILLA_CONFIG_DIR/push-note.pub"
@@ -984,6 +1161,41 @@ GITZILLA_INSTALL_STOP_AFTER=known-keys run --from-step known-keys
 assert_eq 0 "$(rc)" "known-keys: existing file skipped"
 assert_contains "$(cat "$STATE/known-keys.txt")" "marker" "known-keys: existing file untouched"
 
+# --- 9b. self-test row 3: test alert to every channel
+ROW3="Send a test alert to every channel (rings the phone if calls are set up)?"
+cat > "$S/notify-test" <<STUB
+#!/bin/sh
+echo run >> "$T/notify-test.log"
+[ -f "$T/nt.fail" ] && { echo "test alert not sent: worker returned 401" >&2; exit 1; }
+echo "test alert sent"
+STUB
+chmod +x "$S/notify-test"
+export GITZILLA_NOTIFY_TEST_CMD="$S/notify-test"
+reset; write_config
+runin 'y\ny\ny\ny\n' --from-step self-test
+assert_eq 0 "$(rc)" "row3: self-test ok"
+assert_contains "$(out)" "$ROW3" "row3: asks to send a test alert"
+assert_eq 1 "$(nmatch run "$T/notify-test.log")" "row3: runs notify-test once"
+assert_contains "$(out)" "test alert sent" "row3: shows the notify-test result"
+assert_contains "$(out)" "every channel" "row3: asks whether every channel received it"
+assert_contains "$(cat "$STATE/install-selftest.log")" "row3 pass" "row3: pass recorded"
+assert_contains "$(out)" "self-test passed" "row3: all rows passed"
+reset; write_config
+runin 'y\ny\ny\nn\n' --from-step self-test
+assert_contains "$(cat "$STATE/install-selftest.log")" "row3 FAIL" "row3: a channel missing -> FAIL"
+reset; write_config; : > "$T/nt.fail"
+runin 'y\ny\ny\ny\n' --from-step self-test
+assert_eq 0 "$(rc)" "row3: a failing notify-test is not fatal"
+assert_contains "$(out)" "worker returned 401" "row3: shows why the test alert failed"
+assert_contains "$(cat "$STATE/install-selftest.log")" "row3 FAIL" "row3: send failure recorded"
+rm -f "$T/nt.fail"
+reset; write_config
+runin 'y\ny\nn\n' --from-step self-test
+assert_eq 0 "$(nmatch run "$T/notify-test.log")" "row3: declined -> notify-test not run"
+assert_contains "$(cat "$STATE/install-selftest.log")" "row3 skipped" "row3: declined -> skipped"
+assert_contains "$(out)" "self-test passed" "row3: skipping row 3 still passes"
+unset GITZILLA_NOTIFY_TEST_CMD
+
 # --- 10. launchd + first-rotation + self-test; rerun idempotent
 reset
 write_config
@@ -1044,6 +1256,7 @@ assert_eq "gh" "$(cat "$T/rotate.log")" "chain: first-rotation runs rotate gh"
 assert_contains "$(cat "$STATE/install-selftest.log")" "row2 FAIL" "self-test: failure recorded"
 assert_contains "$(cat "$STATE/install-selftest.log")" "row1 pass" "self-test: pass recorded"
 assert_contains "$(out)" "Row 2 result: an orange (🟠) alert reached your phone within 30 seconds?" "M11: self-test row 2 targets the phone within 30 s"
+assert_contains "$(cat "$STATE/install-selftest.log")" "row3 skipped" "self-test: no answer -> row 3 skipped"
 # finished install: plain rerun does nothing
 run
 assert_eq 0 "$(rc)" "rerun after completion: exit 0"
@@ -1054,5 +1267,278 @@ GITZILLA_INSTALL_STOP_AFTER=repos run
 assert_eq 0 "$(rc)" "resume ok"
 assert_contains "$(out)" "== step: repos" "resume starts after the recorded step"
 case "$(out)" in *"== step: hook"*) _bad "resume must not rerun hook" ;; *) _ok ;; esac
+
+# --- 11. org install (--org): profile org-<login>, Worker gitzilla-<login>, org steps; the personal files untouched.
+# Runs use the real profile layout under the test HOME (no GITZILLA_CONFIG_DIR / GITZILLA_STATE_DIR).
+OC="$HOME/.config/gitzilla/org-acme"; OS="$HOME/.local/state/gitzilla/org-acme"
+PCF="$HOME/.config/gitzilla"; PSD="$HOME/.local/state/gitzilla"
+orun() { env -u GITZILLA_CONFIG_DIR -u GITZILLA_STATE_DIR bash "$INSTALL" "$@" >"$T/out" 2>&1 </dev/null; echo $? > "$T/rc"; }
+oruni() { local in="$1"; shift; printf "$in" | env -u GITZILLA_CONFIG_DIR -u GITZILLA_STATE_DIR bash "$INSTALL" "$@" >"$T/out" 2>&1; echo $? > "$T/rc"; }
+# personal_snap: every personal file (not the org profile's), with contents
+personal_snap() {
+  ( cd "$HOME" && find .config/gitzilla .local/state/gitzilla Library/LaunchAgents -path '*/org-acme' -prune -o -type f -print 2>/dev/null \
+      | grep -v 'io.github.gitzilla.org-acme' | sort | while read -r f; do printf '%s %s\n' "$f" "$(md5 -q "$f")"; done )
+}
+org_reset() {
+  reset
+  rm -f "$T/gh.env"
+  mkdir -p "$PCF" "$PSD/log" "$OC" "$HOME/Library/LaunchAgents"
+  printf 'OWNER=Alice\nGITZILLA_URL=https://gitzilla.alice.workers.dev\nNOTE_PUBKEY_FILE=%s\n' "$PCF/push-note.pub" > "$PCF/config"
+  echo personal-pub > "$PCF/push-note.pub"; echo self-test > "$PSD/install-step"; echo 7 > "$PSD/queue-cursor"
+  echo personal > "$HOME/Library/LaunchAgents/io.github.gitzilla.agent.plist"
+  personal_snap > "$T/personal.before"
+}
+personal_same() { personal_snap > "$T/personal.after"; assert_eq "$(cat "$T/personal.before")" "$(cat "$T/personal.after")" "$1: personal config, state and jobs untouched"; }
+TOKEN="tk_$(printf 'a%.0s' $(seq 29))"
+
+# argument checks: nothing is written
+org_reset
+orun --org
+assert_eq 2 "$(rc)" "--org without a login: exit 2"
+assert_contains "$(out)" "install.sh --org <org-login>" "--org without a login: usage"
+orun --org -acme
+assert_eq 2 "$(rc)" "--org with a login starting with a hyphen: exit 2"
+orun --org "acme corp"
+assert_eq 2 "$(rc)" "--org with a space: exit 2"
+orun --org "$(printf 'a%.0s' $(seq 37))"
+assert_eq 2 "$(rc)" "--org with a 37-char login: exit 2 (profile name over 40)"
+assert_contains "$(out)" "may have at most 40 characters" "--org too long: says why"
+GITZILLA_PROFILE=other orun --org acme
+assert_eq 2 "$(rc)" "--org with another GITZILLA_PROFILE: exit 2"
+orun --org Acme --from-step hook
+assert_eq 2 "$(rc)" "--org: hook is not an org step"
+assert_contains "$(out)" "Valid steps: prereqs note-key worker github-app repos mirrors launchd self-test" "--org: the org steps (no hook, known-keys, first-rotation)"
+assert_eq no "$([ -e "$OS" ] || [ -e "$PSD/org-acme" ] && echo yes || echo no)" "--org refusals: no profile state created"
+personal_same "--org refusals"
+
+# worker step: --name gitzilla-acme on every deploy and secret call, MODE/ORG/ADMIN_PUBKEYS vars, org config
+org_reset
+mkkey adminkey ecdsa
+sed 's/ [^ ]*$/ admin key, with a comma/' "$T/keys/adminkey.pub" > "$OC/push-note.pub" # a comment must never reach ADMIN_PUBKEYS
+ADMIN="$(cut -d' ' -f1,2 "$T/keys/adminkey.pub")"
+: > "$T/npx.log"; rm -f "$T/gh.log"
+GITZILLA_INSTALL_STOP_AFTER=worker oruni "$SLACK\n+14155550100,+442071838750\n$TOKEN\n" --org Acme --from-step worker
+assert_eq 0 "$(rc)" "org worker: ok ($(tail -n1 "$T/out"))"
+assert_eq worker "$(cat "$OS/install-step" 2>/dev/null)" "org worker: progress in the org profile's state"
+assert_eq 1 "$(grep -c ' deploy ' "$T/npx.log" | tr -d ' ')" "org worker: one deploy"
+assert_contains "$(grep ' deploy ' "$T/npx.log")" "deploy --name gitzilla-acme --var ALERT_TZ:Europe/Paris --var MODE:org --var ORG:acme --var WEB_FLOW:orange --var ADMIN_PUBKEYS:$ADMIN" "org worker: deploy vars (org lower-cased, web-flow orange by default, admin key without its comment)"
+case "$(grep ' deploy ' "$T/npx.log")" in *"ADMIN_PUBKEYS:$ADMIN "*|*comma*) _bad "org worker: ADMIN_PUBKEYS carries only the key" ;; *) _ok ;; esac
+assert_eq 5 "$(grep -c ' secret put ' "$T/npx.log" | tr -d ' ')" "org worker: five secrets put"
+for s in WEBHOOK_SECRET NTFY_TOPIC SLACK_WEBHOOK_URL NTFY_CALL_NUMBERS NTFY_CALL_TOKEN; do
+  assert_eq 1 "$(grep -c "secret put $s --name gitzilla-acme$" "$T/npx.log" | tr -d ' ')" "org worker: $s put into gitzilla-acme"
+done
+assert_eq "$SLACK" "$(cat "$T/secrets/SLACK_WEBHOOK_URL")" "org worker: Slack URL on stdin"
+assert_eq "+14155550100,+442071838750" "$(cat "$T/secrets/NTFY_CALL_NUMBERS")" "org worker: call numbers on stdin"
+assert_eq "$TOKEN" "$(cat "$T/secrets/NTFY_CALL_TOKEN")" "org worker: call token on stdin"
+OWSEC="$(cat "$T/secrets/WEBHOOK_SECRET")"; ONTFY="$(cat "$T/secrets/NTFY_TOPIC")"
+hit="$(grep -lE "$OWSEC|$ONTFY|SLACKSECRETVALUE|4155550100|$TOKEN" "$T/npx.log" "$T/npm.log" 2>/dev/null)"
+assert_eq "" "$hit" "org worker: no secret in any wrangler argv"
+hit="$(grep -rlE "$OWSEC|$ONTFY|SLACKSECRETVALUE|4155550100|$TOKEN" "$HOME" 2>/dev/null)"
+assert_eq "" "$hit" "org worker: no secret in any file under HOME"
+assert_eq "" "$(grep -E ' (deploy|secret) ' "$T/npx.log" | grep -Ev -- '--name gitzilla-acme( |$)' )" "org worker: no deploy or secret call without --name gitzilla-acme"
+assert_eq 0 "$(nmatch 'api user' "$T/gh.log")" "org worker: OWNER is the org, not the gh login"
+oc="$(cat "$OC/config")"
+for l in "OWNER=acme" "GITZILLA_URL=https://gitzilla-acme.alice.workers.dev" "NOTE_PUBKEY_FILE=$OC/push-note.pub" "APP_NAME=gitzilla-acme" \
+         "MODE=org" "ORG=acme" "WORKER_NAME=gitzilla-acme" "DRILL_REPO=gitzilla-drill" "WEB_FLOW=orange"; do
+  assert_contains "$oc" "$l" "org worker: config $l"
+done
+assert_eq 600 "$(stat -f %Lp "$OC/config")" "org worker: config mode 600"
+assert_contains "$(out)" "./install.sh --join-org https://gitzilla-acme.alice.workers.dev" "org worker: tells members (and the admin) how to join"
+personal_same "org worker"
+assert_contains "$(out)" "No $OC/allowed_signers yet" "org worker: says the org signers file is missing"
+assert_contains "$(out)" '<login> namespaces="git" <key type> <base64 key>' "org worker: says how to populate it"
+# the --name check itself: a lookalike Worker name does not pass it
+printf 'npx wrangler secret put X --name gitzilla-acme-evil\nnpx wrangler deploy --name gitzilla-acmex\n' > "$T/fake-npx.log"
+assert_eq 2 "$(grep -E ' (deploy|secret) ' "$T/fake-npx.log" | grep -Ev -- '--name gitzilla-acme( |$)' | grep -c .)" "the --name check rejects lookalike Worker names"
+# exported GITZILLA_CONFIG_DIR / GITZILLA_STATE_DIR (here: the personal ones) are ignored by --org
+: > "$T/npx.log"
+GITZILLA_CONFIG_DIR="$PCF" GITZILLA_STATE_DIR="$PSD" GITZILLA_INSTALL_STOP_AFTER=worker \
+  bash "$INSTALL" --org acme --from-step worker < /dev/null >"$T/out" 2>&1; echo $? > "$T/rc"
+assert_eq 0 "$(rc)" "org worker with exported personal dirs: ok (keep)"
+assert_contains "$(out)" "--org ignores the exported GITZILLA_CONFIG_DIR / GITZILLA_STATE_DIR" "org worker with exported dirs: says they were ignored"
+assert_contains "$(out)" "KEEP" "org worker with exported dirs: found the org profile's config (keep/rotate)"
+assert_contains "$(cat "$OC/config")" "MODE=org" "org worker with exported dirs: wrote the org profile's config"
+personal_same "org worker with exported personal dirs"
+# rerun by profile name (config MODE=org): keep -> redeploy with --name; rotate without Slack -> --name hints
+: > "$T/npx.log"
+GITZILLA_PROFILE=org-acme GITZILLA_INSTALL_STOP_AFTER=worker oruni '\n' --from-step worker
+assert_eq 0 "$(rc)" "org worker rerun by profile name: ok"
+assert_contains "$(out)" "KEEP" "org worker rerun: asks keep/rotate"
+assert_eq 0 "$(grep -c ' secret ' "$T/npx.log" | tr -d ' ')" "org worker keep: no secret put"
+assert_contains "$(cat "$T/npx.log")" "deploy --name gitzilla-acme --var ALERT_TZ:Europe/Paris --var MODE:org" "org worker keep: redeploys the org Worker"
+GITZILLA_WEB_FLOW=bogus GITZILLA_PROFILE=org-acme GITZILLA_INSTALL_STOP_AFTER=worker oruni '\n' --from-step worker
+assert_eq 1 "$(rc)" "org worker: an invalid GITZILLA_WEB_FLOW is refused"
+assert_contains "$(out)" "GITZILLA_WEB_FLOW must be orange or silent" "org worker: says the web-flow values"
+: > "$T/npx.log"
+GITZILLA_WEB_FLOW=silent GITZILLA_PROFILE=org-acme GITZILLA_INSTALL_STOP_AFTER=worker oruni '\n' --from-step worker
+assert_contains "$(cat "$T/npx.log")" "--var WEB_FLOW:silent --var ADMIN_PUBKEYS:" "org worker: GITZILLA_WEB_FLOW=silent deployed"
+assert_contains "$(cat "$OC/config")" "WEB_FLOW=silent" "org worker: web-flow setting saved"
+: > "$T/npx.log"
+GITZILLA_PROFILE=org-acme GITZILLA_INSTALL_STOP_AFTER=worker oruni '\n' --from-step worker
+assert_contains "$(cat "$T/npx.log")" "--var WEB_FLOW:silent --var ADMIN_PUBKEYS:" "org worker: a rerun keeps the saved web-flow setting"
+GITZILLA_PROFILE=org-acme GITZILLA_INSTALL_STOP_AFTER=worker oruni 'rotate\n\n\n' --from-step worker
+assert_eq 0 "$(rc)" "org worker rotate: ok"
+assert_contains "$(out)" "npx wrangler secret delete SLACK_WEBHOOK_URL --name gitzilla-acme" "org worker rotate: Slack removal hint names the org Worker"
+assert_contains "$(out)" "secret delete NTFY_CALL_NUMBERS --name gitzilla-acme / NTFY_CALL_TOKEN --name gitzilla-acme" "org worker rotate: call removal hint names the org Worker"
+assert_eq 2 "$(grep -c ' secret put ' "$T/npx.log" | tr -d ' ')" "org worker rotate: webhook secret and topic put"
+assert_eq "" "$(grep -E ' (deploy|secret) ' "$T/npx.log" | grep -Ev -- '--name gitzilla-acme( |$)')" "org worker reruns: every deploy and secret call has --name gitzilla-acme"
+assert_eq 1 "$(grep -c '^MODE=org$' "$OC/config" | tr -d ' ')" "org worker reruns: one MODE line"
+personal_same "org worker reruns"
+# the admin key must be one ecdsa-sha2-nistp256 line: otherwise nothing is deployed (the Worker would trust no admin)
+for bad in ed25519 twolines garbage; do
+  org_reset; : > "$T/npx.log"; rm -f "$T/npm.log"
+  case "$bad" in
+    ed25519) mkkey edkey ed25519; cp "$T/keys/edkey.pub" "$OC/push-note.pub" ;;
+    twolines) mkkey adminkey ecdsa; cat "$T/keys/adminkey.pub" "$T/keys/adminkey.pub" > "$OC/push-note.pub" ;;
+    garbage) printf 'ecdsa-sha2-nistp256 AAAAnotakey=\n' > "$OC/push-note.pub" ;;
+  esac
+  GITZILLA_INSTALL_STOP_AFTER=worker oruni "$SLACK\n" --org acme --from-step worker
+  assert_eq 1 "$(rc)" "org worker, $bad admin key: refused"
+  assert_contains "$(out)" "must be exactly one ecdsa-sha2-nistp256 (Secretive) public key line" "org worker, $bad admin key: says why"
+  assert_eq "" "$(cat "$T/npx.log")" "org worker, $bad admin key: no wrangler call"
+  assert_eq no "$([ -e "$OC/config" ] && echo yes || echo no)" "org worker, $bad admin key: no config"
+  case "$(out)" in *WEBHOOK_SECRET*|*"input hidden"*) _bad "org worker, $bad admin key: refused before any secret is shown" ;; *) _ok ;; esac
+done
+# a plain profile (no --org, no MODE=org config) still refuses at the worker step
+org_reset; mkkey adminkey ecdsa; mkdir -p "$PCF/plain"; cp "$T/keys/adminkey.pub" "$PCF/plain/push-note.pub"; : > "$T/npx.log"
+GITZILLA_PROFILE=plain GITZILLA_INSTALL_STOP_AFTER=worker orun --from-step worker
+assert_eq 1 "$(rc)" "plain profile: worker step refuses"
+assert_contains "$(out)" "the worker step is not available in a profile yet" "plain profile: says why"
+assert_eq "" "$(cat "$T/npx.log")" "plain profile: no wrangler call"
+
+# github-app: the org's app settings, the drill repo in the org only after a yes
+org_reset; mk_sign_key; mkdir -p "$HOME/Downloads"
+printf 'OWNER=acme\nGITZILLA_URL=https://gitzilla-acme.alice.workers.dev\nNOTE_PUBKEY_FILE=%s\nAPP_NAME=gitzilla-acme\nDRILL_REPO=gitzilla-drill\nMODE=org\nORG=acme\nWORKER_NAME=gitzilla-acme\n' "$OC/push-note.pub" > "$OC/config"
+touch "$T/gh.norepo"; rm -f "$T/gh.log" "$T/open.log"
+GITZILLA_INSTALL_STOP_AFTER=github-app oruni '\n\n' --org acme --from-step github-app
+assert_eq 1 "$(rc)" "org github-app: no drill repo -> stops"
+assert_contains "$(out)" "Create it on GitHub (the profile's gh token is read-only and cannot): owner acme, name gitzilla-drill, Private," "org github-app: the admin creates the drill repo on GitHub"
+assert_contains "$(cat "$T/open.log")" "https://github.com/organizations/acme/repositories/new" "org github-app: opens the org's new-repo page"
+assert_contains "$(out)" "is not visible to the profile's gh token" "org github-app: still missing -> says why"
+assert_eq 0 "$(grep -c 'repo create' "$T/gh.log" | tr -d ' ')" "org github-app: gh never creates a repo (read-only token)"
+assert_contains "$(out)" "https://github.com/organizations/acme/settings/apps/new" "org github-app: the org's new-app page"
+assert_contains "$(cat "$T/open.log")" "https://github.com/organizations/acme/settings/apps/new" "org github-app: opens the org's new-app page"
+assert_contains "$(out)" "GitHub App name   : gitzilla-acme" "org github-app: app name gitzilla-<org>"
+assert_contains "$(out)" "Homepage URL      : https://github.com/acme" "org github-app: homepage is the org"
+assert_contains "$(out)" "Webhook URL       : https://gitzilla-acme.alice.workers.dev/webhook" "org github-app: the org Worker's webhook"
+assert_contains "$(out)" "Only on this account (the acme organization)" "org github-app: installable on the org only"
+assert_contains "$(out)" "install the app on the organization acme" "org github-app: install on the organization"
+assert_contains "$(out)" "All repositories" "org github-app: all repos"
+echo '[{"seq":3,"repo":"acme/gitzilla-drill","ref":"refs/heads/main"}]' > "$T/curl/late.json"; echo 1 > "$T/curl/late.after"; echo '[]' > "$T/curl/queue.json"
+rm -f "$T/queue.urls"
+rm -f "$T/gh.norepo" "$T/gh.log"
+GITZILLA_INSTALL_STOP_AFTER=github-app oruni '\n' --org acme --from-step github-app
+assert_eq 0 "$(rc)" "org github-app: ok once the drill repo exists ($(tail -n1 "$T/out"))"
+assert_eq 0 "$(grep -c 'repo create' "$T/gh.log" | tr -d ' ')" "org github-app: no gh repo create"
+assert_contains "$(out)" "./install.sh --join-org https://gitzilla-acme.alice.workers.dev" "org github-app: the orange alert is expected until the admin joined"
+assert_eq 3 "$(cat "$OS/queue-cursor" 2>/dev/null)" "org github-app: cursor in the org profile"
+assert_contains "$(cat "$T/queue.urls")" "https://gitzilla-acme.alice.workers.dev/queue?after=" "org github-app: reads the org Worker's queue"
+personal_same "org github-app"
+
+# repos, mirrors, launchd, self-test: the org's repos; no hook, known-keys or first-rotation
+org_reset
+printf 'OWNER=acme\nGITZILLA_URL=https://gitzilla-acme.alice.workers.dev\nNOTE_PUBKEY_FILE=%s\nAPP_NAME=gitzilla-acme\nDRILL_REPO=gitzilla-drill\nMODE=org\nORG=acme\nWORKER_NAME=gitzilla-acme\n' "$OC/push-note.pub" > "$OC/config"
+echo '[{"nameWithOwner":"Acme/App","visibility":"PRIVATE"},{"nameWithOwner":"acme/site","visibility":"PUBLIC"},{"nameWithOwner":"alice/x","visibility":"PUBLIC"}]' > "$T/gh.repos"
+mkbare acme/app; mkbare acme/site
+rm -f "$T/gh.log" "$T/launchctl.log" "$T/rotate.log"
+oruni 'y\ny\nn\n' --org acme --from-step repos
+assert_eq 0 "$(rc)" "org chain from repos: ok ($(tail -n1 "$T/out"))"
+assert_contains "$(cat "$T/gh.log")" "repo list acme --limit 1000 --json nameWithOwner,visibility" "org repos: gh repo list <org>"
+assert_contains "$(cat "$T/gh.log")" "api repos/acme/app --jq .permissions.push // .permissions.admin" "org repos: push access sampled"
+assert_contains "$(out)" "push access checked on a sample of repos: ok" "org repos: sample ok"
+assert_eq "acme/app private
+acme/site public" "$(cat "$OS/repos.txt")" "org repos: the org's repos only, in the profile"
+[ -d "$OS/mirrors/acme__app.git" ] && [ -d "$OS/mirrors/acme__site.git" ] && _ok || _bad "org mirrors: in the profile"
+assert_eq "== step: repos|== step: mirrors|== step: launchd|== step: self-test" "$(grep '^== step:' "$T/out" | paste -sd'|' -)" "org chain: repos mirrors launchd self-test, nothing else"
+assert_eq self-test "$(cat "$OS/install-step")" "org chain: last step recorded in the profile"
+assert_contains "$(out)" "push from a Mac that joined the org with ./install.sh --join-org" "org self-test: pushes come from a joined Mac"
+assert_eq no "$([ -e "$T/rotate.log" ] && echo yes || echo no)" "org chain: no rotation"
+assert_eq "" "$(grep -E '^(bootout|bootstrap)' "$T/launchctl.log" | grep -v 'io\.github\.gitzilla\.org-acme\.' )" "org launchd: only org-acme labels"
+assert_eq 2 "$(grep -c '^bootstrap ' "$T/launchctl.log" | tr -d ' ')" "org launchd: agent and reconcile"
+assert_eq "" "$(git config --global --get core.hooksPath)" "org chain: no hook"
+personal_same "org chain"
+echo false > "$T/gh.perm"
+GITZILLA_INSTALL_STOP_AFTER=repos oruni '' --org acme --from-step repos
+assert_eq 0 "$(rc)" "org repos without push: still ok (a warning)"
+assert_contains "$(out)" "WARNING: your account cannot push to: acme/app acme/site" "org repos without push: lists the repos"
+assert_contains "$(out)" '"no push permission"' "org repos without push: says what restore will do"
+rm -f "$T/gh.perm"
+# a repo the profile's token cannot see (404): its own warning and restore reason, not "cannot push"
+echo "repos/acme/site" > "$T/gh.404"
+GITZILLA_INSTALL_STOP_AFTER=repos oruni '' --org acme --from-step repos
+assert_eq 0 "$(rc)" "org repos, a repo hidden from the token: still ok (a warning)"
+assert_contains "$(out)" "WARNING: the profile's gh token cannot see: acme/site" "org repos 404: names the repo"
+assert_contains "$(out)" '"repo not visible to org' "org repos 404: says what restore will do"
+case "$(out)" in *"cannot push to"*|*"sample of repos: ok"*) _bad "org repos 404: not reported as push access" ;; *) _ok ;; esac
+rm -f "$T/gh.404"
+# every gh call of the org install runs with the profile's own gh store
+assert_eq "" "$(grep -v "^GH_CONFIG_DIR=$OC/gh GH_TOKEN= |" "$T/gh.env")" "org: every gh call uses GH_CONFIG_DIR=<profile config>/gh"
+
+# prereqs in the org profile: its own read-only gh login; the token goes to gh on stdin only
+org_reset; mk_ghauth; mkdir -p "$HOME/.config/git"; : > "$HOME/.config/git/allowed_signers"
+PAT="github_pat_$(printf 'Z%.0s' $(seq 60))"
+rm -f "$T/gh.log" "$T/gh.env" "$T/gh.stdin" "$T/open.log"
+GH_TOKEN=personal-env-token GITZILLA_INSTALL_STOP_AFTER=prereqs oruni "$PAT\n" --org acme --from-step prereqs
+assert_eq 0 "$(rc)" "org prereqs: ok ($(tail -n1 "$T/out"))"
+assert_contains "$(out)" "Resource owner    : acme   (the organization, NOT your user)" "org prereqs: the token is owned by the org"
+assert_contains "$(out)" "Repository > Contents: Read-only" "org prereqs: Contents read-only"
+assert_contains "$(out)" "Repository > Metadata: Read-only" "org prereqs: Metadata read-only"
+assert_contains "$(out)" "Grant no write permission of any kind" "org prereqs: no write permission"
+assert_contains "$(out)" "input hidden" "org prereqs: hidden input"
+assert_contains "$(cat "$T/open.log")" "https://github.com/settings/personal-access-tokens/new" "org prereqs: opens the token page"
+assert_eq "$PAT" "$(cat "$T/gh.stdin")" "org prereqs: the token reaches gh on stdin"
+assert_contains "$(cat "$T/gh.env")" "GH_CONFIG_DIR=$OC/gh GH_TOKEN= | auth login --hostname github.com --with-token --insecure-storage" "org prereqs: gh auth login into the profile's store, no inherited token"
+assert_eq "" "$(grep -v "^GH_CONFIG_DIR=$OC/gh GH_TOKEN= |" "$T/gh.env" | grep -vx 'GH_CONFIG_DIR= GH_TOKEN= | auth status')" "org prereqs: every gh call but the personal status checks uses the profile's store"
+assert_eq "auth status|auth login|auth status" "$(sed -n 's/^GH_CONFIG_DIR= GH_TOKEN= | \(auth status\)$/\1/p; s/^GH_CONFIG_DIR=[^ ]*gh GH_TOKEN= | \(auth login\).*/\1/p' "$T/gh.env" | paste -sd'|' -)" "org prereqs: personal gh auth status checked before and after the profile login"
+case "$(out)" in *"PERSONAL gh login"*) _bad "org prereqs: no personal-login warning when it still works" ;; *) _ok ;; esac
+assert_eq "" "$(grep -l "$PAT" "$T/gh.log" "$T/gh.env" "$T/out" "$T/open.log" 2>/dev/null)" "org prereqs: the token is in no argv and no output"
+assert_eq "" "$(grep -rl "$PAT" "$HOME" 2>/dev/null)" "org prereqs: the token is in no file under HOME (the stub's gh store holds none)"
+assert_eq 700 "$(stat -f %Lp "$OC/gh")" "org prereqs: the profile's gh dir is mode 700"
+personal_same "org prereqs"
+# rerun: the login is kept (no token asked) unless replace is typed
+rm -f "$T/gh.stdin"
+GITZILLA_INSTALL_STOP_AFTER=prereqs oruni "\n" --org acme --from-step prereqs
+assert_eq 0 "$(rc)" "org prereqs rerun: ok"
+assert_contains "$(out)" "has its own login" "org prereqs rerun: keeps the login"
+assert_eq no "$([ -e "$T/gh.stdin" ] && echo yes || echo no)" "org prereqs rerun: no new login"
+GITZILLA_INSTALL_STOP_AFTER=prereqs oruni "replace\n$PAT\n" --org acme --from-step prereqs
+assert_eq "$PAT" "$(cat "$T/gh.stdin" 2>/dev/null)" "org prereqs replace: new token on stdin"
+# refusals: not a fine-grained token, or gh refuses it
+rm -rf "$OC/gh"; rm -f "$T/gh.stdin"
+GITZILLA_INSTALL_STOP_AFTER=prereqs oruni "ghp_classictoken123456789012345678901234\n" --org acme --from-step prereqs
+assert_eq 1 "$(rc)" "org prereqs: a classic token is refused"
+assert_contains "$(out)" "not a fine-grained token" "org prereqs: says why"
+assert_eq no "$([ -e "$T/gh.stdin" ] && echo yes || echo no)" "org prereqs: a refused token never reaches gh"
+case "$(out)" in *ghp_classictoken*) _bad "org prereqs: the refused token is not echoed" ;; *) _ok ;; esac
+touch "$T/gh.loginfail"
+GITZILLA_INSTALL_STOP_AFTER=prereqs oruni "$PAT\n" --org acme --from-step prereqs
+assert_eq 1 "$(rc)" "org prereqs: gh login failure stops"
+assert_contains "$(out)" "gh auth login with that token failed" "org prereqs: gh login failure says why"
+rm -f "$T/gh.loginfail"
+# the profile login breaks the personal one (a keychain clash): loud warning with the way back
+rm -rf "$OC/gh"; touch "$T/gh.clobber"; rm -f "$T/gh.personal.broken"
+GITZILLA_INSTALL_STOP_AFTER=prereqs oruni "$PAT\n" --org acme --from-step prereqs
+assert_eq 0 "$(rc)" "org prereqs, personal login broken: the step itself completes"
+assert_contains "$(out)" "WARNING: your PERSONAL gh login worked before this step and fails now" "org prereqs, personal login broken: loud warning"
+assert_contains "$(out)" "bin/rotate gh        (or: gh auth login)" "org prereqs, personal login broken: says how to restore it"
+# personal login already failing before: no warning (nothing changed by this step)
+rm -rf "$OC/gh"
+GITZILLA_INSTALL_STOP_AFTER=prereqs oruni "$PAT\n" --org acme --from-step prereqs
+case "$(out)" in *"PERSONAL gh login"*) _bad "org prereqs: no warning when the personal login was already failing" ;; *) _ok ;; esac
+rm -f "$T/gh.clobber" "$T/gh.personal.broken"
+# personal prereqs: gh's own login, no GH_CONFIG_DIR of ours
+rm -f "$T/gh.env"
+GITZILLA_INSTALL_STOP_AFTER=prereqs run --from-step prereqs
+assert_eq 0 "$(rc)" "personal prereqs: ok"
+assert_eq "GH_CONFIG_DIR= GH_TOKEN= | auth status" "$(cat "$T/gh.env")" "personal prereqs: gh auth status only, no profile store"
+
+# the org install's last words: the admin must join and approve themselves
+org_reset
+printf 'OWNER=acme\nGITZILLA_URL=https://gitzilla-acme.alice.workers.dev\nNOTE_PUBKEY_FILE=%s\nAPP_NAME=gitzilla-acme\nDRILL_REPO=gitzilla-drill\nMODE=org\nORG=acme\nWORKER_NAME=gitzilla-acme\n' "$OC/push-note.pub" > "$OC/config"
+oruni 'n\nn\nn\n' --org acme --from-step self-test
+assert_eq 0 "$(rc)" "org self-test: ok"
+assert_contains "$(out)" "join your own organization and approve your own key" "org final output: join and approve yourself"
+assert_contains "$(out)" "./install.sh --join-org https://gitzilla-acme.alice.workers.dev" "org final output: the join command"
+assert_contains "$(out)" "GITZILLA_PROFILE=org-acme bin/org approve <your-login>" "org final output: the approve command"
 
 finish
